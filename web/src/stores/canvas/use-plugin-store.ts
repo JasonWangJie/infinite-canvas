@@ -38,6 +38,7 @@ export const usePluginStore = create<PluginStore>()(
             remove: (id) => set((state) => ({ plugins: state.plugins.filter((item) => item.id !== id) })),
         }),
         {
+            skipHydration: true,
             name: "infinite-canvas:plugin_store",
             storage: createJSONStorage(() => localForageStorage),
         },

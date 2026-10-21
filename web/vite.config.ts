@@ -41,9 +41,19 @@ function localPluginsManifest(): Plugin {
 export default defineConfig({
     base: process.env.VITE_BASE || "/",
     plugins: [react(), localPluginsManifest()],
+    server: {
+        proxy: {
+            "/api": { target: process.env.CANVAS_DEV_BACKEND || "http://127.0.0.1:3001", changeOrigin: false },
+            "/auth": { target: process.env.CANVAS_DEV_BACKEND || "http://127.0.0.1:3001", changeOrigin: false },
+        },
+    },
     resolve: {
+        dedupe: ["react", "react-dom", "dompurify", "marked"],
         alias: {
             "@": resolve(webDir, "src"),
+            "@infinite-canvas/plugin-sdk": resolve(webDir, "../plugins/canvas/sdk/src"),
+            dompurify: resolve(webDir, "node_modules/dompurify/dist/purify.es.mjs"),
+            marked: resolve(webDir, "node_modules/marked/lib/marked.esm.js"),
         },
     },
     define: {

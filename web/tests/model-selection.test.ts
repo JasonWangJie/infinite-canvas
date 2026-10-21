@@ -1,21 +1,17 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, test } from "bun:test";
 import type { AiConfig, ModelCapability } from "../src/stores/use-config-store";
 import type { CanvasNodeData } from "../src/types/canvas";
 
-// Config and i18n use browser storage during module initialization.
-const values = new Map<string, string>();
-const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
-Object.defineProperty(globalThis, "localStorage", {
-    configurable: true,
-    value: {
-        getItem: (key: string) => values.get(key) ?? null,
-        setItem: (key: string, value: string) => values.set(key, value),
-        removeItem: (key: string) => values.delete(key),
-    },
+const client = await import("../src/services/api/canvas-client");
+const originalFetch = globalThis.fetch;
+beforeEach(async () => {
+    client.endCanvasSession();
+    localStorage.clear();
+    globalThis.fetch = (() => Promise.resolve(Response.json({ user: { id: 1, subject: `ics_${"a".repeat(32)}`, username: "test" }, csrf_token: "test-csrf", session_tag: "test-session", expires_at: Math.floor(Date.now() / 1000) + 60 }))) as typeof fetch;
+    await client.readCanvasSession();
 });
 afterAll(() => {
-    if (originalStorage) Object.defineProperty(globalThis, "localStorage", originalStorage);
-    else Reflect.deleteProperty(globalThis, "localStorage");
+    globalThis.fetch = originalFetch;
 });
 
 const { defaultConfig, resolveModelForCapability, useConfigStore } = await import("../src/stores/use-config-store");
@@ -84,13 +80,15 @@ test("switching generation capability still selects a model of the new capabilit
     expect(resolveModelForCapability(config, "replacement::image-a", "video")).toBe("replacement::video-b");
 });
 
-test("changing only the key on the same provider preserves the saved model and task", () => {
+test("legacy browser credentials do not change authorized model selection or task ownership", () => {
     const node = videoNode("replacement::video-a");
     const selected = buildGenerationConfig({ ...config, channels: [{ ...config.channels[0], apiKey: "rotated-key" }] }, node, "video");
     expect(selected.model).toBe("replacement::video-a");
     expect(ready(selected, selected.model)).toBe(true);
     expect(node.metadata?.videoTaskId).toBe("original-task");
-    expect(ready({ ...selected, channels: [{ ...config.channels[0], apiKey: "" }] }, selected.model)).toBe(false);
+    expect(ready({ ...selected, channels: [{ ...config.channels[0], apiKey: "" }] }, selected.model)).toBe(true);
+    client.endCanvasSession();
+    expect(ready(selected, selected.model)).toBe(false);
 });
 
 test("unavailable explicit selections are preserved for every generation capability", () => {

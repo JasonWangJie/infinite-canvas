@@ -1,39 +1,110 @@
-import type { ReactNode } from "react";
-import { useEffect, useRef } from "react";
-import { App } from "antd";
+import { type ReactNode, useEffect, useState } from "react";
+import { Alert, Button, Result, Spin } from "antd";
+import { canvasJson, currentSession, endCanvasSession, notifyCanvasLogout, readCanvasSession, sessionEpoch } from "@/services/api/canvas-client";
 import { useTranslation } from "react-i18next";
 
-import { useConfigStore } from "@/stores/use-config-store";
-import { usePromptSourceScheduler } from "@/hooks/use-prompt-source-scheduler";
+let bootstrap: Promise<void> | undefined;
+function initialize() {
+    bootstrap ||= readCanvasSession().then(async (session) => {
+        const { hydrateCanvasSession } = await import("@/services/canvas-bootstrap");
+        await hydrateCanvasSession(session);
+    });
+    return bootstrap;
+}
 
 export function ClientRootInit({ children }: { children: ReactNode }) {
-    const { message } = App.useApp();
     const { t } = useTranslation();
-    const handledConfigParams = useRef(false);
-    const importChannelCredentials = useConfigStore((state) => state.importChannelCredentials);
-    const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
-
-    usePromptSourceScheduler();
-
+    const [ready, setReady] = useState(false);
+    const [error, setError] = useState("");
+    const [storageError, setStorageError] = useState("");
     useEffect(() => {
-        if (handledConfigParams.current) return;
-        const searchParams = new URLSearchParams(window.location.search);
-        const baseUrl = searchParams.get("baseUrl") || searchParams.get("baseurl");
-        const apiKey = searchParams.get("apiKey") || searchParams.get("apikey");
-        if (!baseUrl && !apiKey) return;
-        handledConfigParams.current = true;
-        searchParams.delete("baseUrl");
-        searchParams.delete("baseurl");
-        searchParams.delete("apiKey");
-        searchParams.delete("apikey");
-        window.history.replaceState(null, "", `${window.location.pathname}${searchParams.size ? `?${searchParams}` : ""}${window.location.hash}`);
-        const result = importChannelCredentials({ baseUrl, apiKey });
-        openConfigDialog(false, "channels");
-        if (result.status === "created") message.success(t("config.importedChannelCreated", { name: result.channelName }));
-        else if (result.status === "updated") message.success(t("config.importedChannelUpdated", { name: result.channelName }));
-        else if (result.status === "missing-base-url") message.error(t("config.importedChannelBaseUrlRequired"));
-        else message.error(t("config.importedChannelBaseUrlInvalid"));
-    }, [importChannelCredentials, message, openConfigDialog, t]);
+        let alive = true;
+        for (const key of ["infinite-canvas:ai_config_store", "canvas-agent-token", "canvas-agent-url"]) localStorage.removeItem(key);
+        void initialize()
+            .then(() => {
+                if (alive && currentSession()) setReady(true);
+            })
+            .catch((reason) => {
+                if (alive) setError(reason instanceof Error ? reason.message : t("managed.authorizationFailed"));
+            });
+        const expired = (event: Event) => {
+            setReady(false);
+            setError((event as CustomEvent<string>).detail || t("managed.sessionExpired"));
+        };
+        const saveError = (event: Event) => setStorageError((event as CustomEvent<string>).detail);
+        const recheck = () => {
+            if (!currentSession() || document.visibilityState === "hidden") return;
+            const epoch = sessionEpoch();
+            void readCanvasSession().catch((reason) => {
+                if (epoch === sessionEpoch()) endCanvasSession(reason instanceof Error ? reason.message : undefined);
+            });
+        };
+        let checkingActivity = false;
+        const activity = () => {
+            if (!currentSession() || checkingActivity) return;
+            checkingActivity = true;
+            const epoch = sessionEpoch();
+            void readCanvasSession(true)
+                .catch((reason) => {
+                    if (epoch === sessionEpoch()) endCanvasSession(reason instanceof Error ? reason.message : undefined);
+                })
+                .finally(() => {
+                    checkingActivity = false;
+                });
+        };
+        window.addEventListener("canvas-session-ended", expired);
+        window.addEventListener("canvas-storage-error", saveError);
+        window.addEventListener("focus", recheck);
+        document.addEventListener("visibilitychange", recheck);
+        window.addEventListener("pointerdown", activity, { passive: true });
+        window.addEventListener("keydown", activity);
+        return () => {
+            alive = false;
+            window.removeEventListener("canvas-session-ended", expired);
+            window.removeEventListener("canvas-storage-error", saveError);
+            window.removeEventListener("focus", recheck);
+            document.removeEventListener("visibilitychange", recheck);
+            window.removeEventListener("pointerdown", activity);
+            window.removeEventListener("keydown", activity);
+        };
+    }, [t]);
+    useEffect(() => {
+        if (!ready) return;
+        const timer = window.setTimeout(() => endCanvasSession(), Math.max(0, (currentSession()?.expires_at || 0) * 1000 - Date.now()));
+        return () => window.clearTimeout(timer);
+    }, [ready]);
+    if (error)
+        return (
+            <div className="flex min-h-dvh items-center justify-center bg-background">
+                <Result
+                    status="403"
+                    title={t("managed.authorizationRequired")}
+                    subTitle={error}
+                    extra={
+                        <Button type="primary" href="/auth/start">
+                            {t("managed.authorize")}
+                        </Button>
+                    }
+                />
+            </div>
+        );
+    if (!ready)
+        return (
+            <div className="flex min-h-dvh items-center justify-center bg-background">
+                <Spin description={t("managed.checking")} />
+            </div>
+        );
+    return (
+        <>
+            {storageError ? <Alert type="error" showIcon title={t("managed.saveFailed")} description={storageError} action={<Button onClick={() => window.location.reload()}>{t("managed.reload")}</Button>} /> : null}
+            {children}
+        </>
+    );
+}
 
-    return <>{children}</>;
+export async function logoutCanvas() {
+    const tag = currentSession()?.session_tag;
+    await canvasJson<void>("/api/logout", { method: "POST" });
+    if (tag) notifyCanvasLogout(tag);
+    endCanvasSession();
 }

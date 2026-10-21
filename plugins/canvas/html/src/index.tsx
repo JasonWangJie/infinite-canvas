@@ -92,8 +92,8 @@ function HtmlContent({ ctx }: CanvasNodeContentProps) {
         <div data-canvas-no-zoom style={{ position: "relative", height: "100%", width: "100%" }}>
             <iframe
                 title="html-preview"
-                sandbox="allow-scripts allow-forms"
-                srcDoc={html}
+                sandbox=""
+                srcDoc={`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'">${html}`}
                 style={{ height: "100%", width: "100%", border: 0, borderRadius: 16, background: "#fff", display: "block" }}
             />
         </div>

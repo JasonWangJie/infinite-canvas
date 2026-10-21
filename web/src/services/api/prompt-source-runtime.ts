@@ -1,5 +1,6 @@
 import i18n from "@/i18n";
 import type { PromptSource } from "./prompt-source-presets";
+import { canvasFetch } from "./canvas-client";
 
 export type RawPrompt = {
     id: string;
@@ -23,7 +24,8 @@ export type RawPrompt = {
 type RunOptions = { signal?: AbortSignal };
 
 async function fetchSource(source: PromptSource, options?: RunOptions) {
-    const response = await fetch(source.url, { cache: "no-store", signal: options?.signal });
+    if (!source.builtIn || !/^\/api\/prompt-catalog\/[a-z0-9-]+$/.test(source.url)) throw new Error("受管画布只使用服务端批准的提示词来源");
+    const response = await canvasFetch(source.url, { signal: options?.signal });
     if (!response.ok) throw new Error(i18n.t("config.promptSources.runtime.requestFailed", { status: response.status }));
     return response.json();
 }
@@ -92,7 +94,12 @@ function stringValue(value: unknown) {
 }
 
 function stringArray(value: unknown) {
-    return Array.isArray(value) ? value.map(stringValue).map((item) => item.trim()).filter(Boolean) : [];
+    return Array.isArray(value)
+        ? value
+              .map(stringValue)
+              .map((item) => item.trim())
+              .filter(Boolean)
+        : [];
 }
 
 function optionalString(value: unknown) {
@@ -108,7 +115,7 @@ function optionalNumber(value: unknown) {
 function absoluteUrl(baseUrl: string, path: string) {
     if (!path) return "";
     try {
-        return new URL(path, baseUrl).toString();
+        return new URL(path, new URL(baseUrl, window.location.origin)).toString();
     } catch {
         return path;
     }

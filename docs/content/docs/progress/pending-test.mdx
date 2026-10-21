@@ -5,6 +5,21 @@ description: Implemented changes that still need manual verification
 
 # Pending Tests
 
+## New API 受管画布变更
+
+- 授权检查完成后才加载用户画布、素材、配置、插件状态和工作台生成记录。浏览器仅持有 HttpOnly 会话 Cookie；CSRF 仅在内存中，跨标签只共享不能用于认证的公开会话标记。退出、身份切换或授权失效会清除私有内存、待保存队列并取消请求；旧标签携带的会话标记不能操作新登录账户。
+- 模型列表读取当前用户网关权限；选择器支持搜索，并按网关端点元数据选择 Responses、Chat Completions、Gemini 文本/图片或 OpenAI 兼容图片/视频接口。所有 AI 请求固定走同源 `/api/ai/`，浏览器配置中不开放 API Key、任意服务地址、本地代理或调用脚本。
+- 画布、素材、工作台记录及插件数据通过 BFF 服务端按稳定用户身份隔离；文档以 revision 校验保存，冲突停止写入并提示重载。ZIP 导入为文件分配新资源 ID、重映射引用，保留未知节点字段与连线；缺少资源时拒绝导入。
+- 仅打包加载 SVG、Markdown、便签和隔离 HTML 四种可信节点。SVG 与 Markdown 经 DOMPurify 净化；HTML 使用无脚本 sandbox 与内嵌限制策略；远程插件、`new Function` 模型脚本、本机 Agent 和 WebDAV 在受管模式不可用。原始节点/工作流结构与未知插件占位保留。
+- 提示词目录经服务端固定来源清单读取，封面与参考图使用当前用户的私有同源地址，不提供浏览器任意 URL 抓取。
+- 已运行 `cd web && bun install && bun run test`，保留原有回归并新增授权、会话切换、晚到响应、并发记录、保存冲突、协议适配、ZIP 资源映射、SVG/Markdown 注入回归；当前共 31 项测试、92 个断言通过。`bun run typecheck` 与 `bun run build` 通过，构建仍有大 chunk 和静态/动态导入同一 store 的提示。
+- 本地浏览器 mock 已走查未授权门禁、授权后的画布列表、新建画布、文本节点、重载后持久化、模型搜索、受管设置、可信 SVG 节点预览、退出后两标签同步门禁及重新授权。ZIP 导出已点击但自动化未取得下载完成事件，因此导出文件的浏览器验收仍待确认。这里的 mock 未调用真实 New API，也未验证实际扣费。
+- 待人工确认：真实 HTTPS 单点授权与 Cookie 策略、双用户数据/文件隔离、完整 ZIP 导入导出、跨标签退出和身份切换、图片编辑与视频恢复、实际渠道计费与日志、Docker 升级回退。删除素材或画布只修改用户业务记录，当前不自动回收可能仍被其他项目引用的文件。
+
+## 上游历史验收清单
+
+以下保留上游已有测试，涉及浏览器 Key、直连、本地代理、本机 Agent、WebDAV、远程插件或 IndexedDB 业务数据的条目仅适用于原始独立版，不代表受管画布仍开放这些能力。
+
 The current release needs manual verification in these areas:
 
 - Saved model selection: save a canvas node with a model, then remove its provider or remove that model while another video model remains the default. Generation, retry and pending-video recovery should keep the unavailable model selected and open configuration instead of sending a request to the default or first provider. Re-selecting a valid model should allow generation. Changing only the API key on the same provider should preserve the model; switching a config node from a valid image model to video should still use the video default.

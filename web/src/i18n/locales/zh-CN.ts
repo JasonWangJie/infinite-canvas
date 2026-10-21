@@ -1,4 +1,28 @@
 export default {
+    managed: {
+        connected: "已连接 New API",
+        account: "当前账户：{{name}}。模型调用使用该账户额度；授权与网关配置由服务端管理。",
+        refreshModels: "刷新可用模型",
+        modelsUpdated: "模型列表已更新",
+        loadFailed: "加载失败",
+        systemPrompt: "系统提示词",
+        reasoning: "推理强度",
+        autoFocus: "选择节点时自动定位",
+        logout: "退出画布授权",
+        logoutFailed: "退出失败",
+        settings: "画布设置",
+        trustedPlugins: "只运行随版本构建的可信插件；未知插件节点保留数据但不执行",
+        authorizationRequired: "AI 无限画布需要授权",
+        authorize: "通过 New API 授权",
+        checking: "正在验证授权并加载画布",
+        saveFailed: "更改尚未保存",
+        reload: "重新加载",
+        authorizationFailed: "授权失败",
+        sessionExpired: "授权已失效，请从 New API 重新进入画布",
+        noModels: "当前账户没有可用模型，请检查网关权限",
+        noCapability: "没有匹配此能力的可用模型",
+    },
+
     meta: {
         title: "无限画布",
         description: "一个无限画布创作工具",

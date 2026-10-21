@@ -8,6 +8,7 @@ docs/node_modules
 docs/out
 web/.next
 web/node_modules
+canvas-server/node_modules
 web/out
 *.log
 .env*

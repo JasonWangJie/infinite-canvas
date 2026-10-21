@@ -1,5 +1,5 @@
 // SVG 节点:编辑与渲染 SVG,透明背景直接融入画布;无自身内容时可取上游文本节点里的 SVG 源码。
-import { definePlugin, useEffect, useRef, useState } from "@infinite-canvas/plugin-sdk";
+import { definePlugin, sanitizeSvg, useEffect, useRef, useState } from "@infinite-canvas/plugin-sdk";
 import type { CanvasNodeContentProps } from "@infinite-canvas/plugin-sdk";
 
 function SvgContent({ ctx }: CanvasNodeContentProps) {
@@ -67,7 +67,7 @@ function SvgContent({ ctx }: CanvasNodeContentProps) {
                 />
             ) : svg ? (
                 // pointerEvents:none 让整块可拖动移动,双击/拖拽都命中外层节点
-                <div style={{ height: "100%", width: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 12, boxSizing: "border-box", pointerEvents: "none" }} dangerouslySetInnerHTML={{ __html: svg }} />
+                <div style={{ height: "100%", width: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 12, boxSizing: "border-box", pointerEvents: "none" }} dangerouslySetInnerHTML={{ __html: sanitizeSvg(svg) }} />
             ) : (
                 <div style={{ height: "100%", width: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, boxSizing: "border-box", color: ctx.theme.node.placeholder, fontSize: 13, textAlign: "center", pointerEvents: "none" }}>双击编辑,粘贴 SVG 源码</div>
             )}

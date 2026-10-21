@@ -103,6 +103,7 @@ export const useAssetStore = create<AssetStore>()(
             },
         }),
         {
+            skipHydration: true,
             name: ASSET_STORE_KEY,
             storage: assetStorage,
             partialize: (state) => ({ assets: state.assets }) as StorageValue<AssetStore>["state"],

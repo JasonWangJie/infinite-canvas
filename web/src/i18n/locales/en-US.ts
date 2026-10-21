@@ -1,4 +1,28 @@
 export default {
+    managed: {
+        connected: "Connected to New API",
+        account: "Account: {{name}}. Requests use this account’s quota. Authorization and gateway settings are managed by the server.",
+        refreshModels: "Refresh available models",
+        modelsUpdated: "Model list updated",
+        loadFailed: "Unable to load",
+        systemPrompt: "System prompt",
+        reasoning: "Reasoning effort",
+        autoFocus: "Focus selected nodes",
+        logout: "Sign out of canvas",
+        logoutFailed: "Sign out failed",
+        settings: "Canvas settings",
+        trustedPlugins: "Only bundled trusted plugins can run. Unknown plugin nodes retain their data without executing code.",
+        authorizationRequired: "Authorization required",
+        authorize: "Authorize with New API",
+        checking: "Verifying authorization and loading canvas",
+        saveFailed: "Changes have not been saved",
+        reload: "Reload",
+        authorizationFailed: "Authorization failed",
+        sessionExpired: "Authorization expired. Open canvas from New API again.",
+        noModels: "No models are available for this account. Check gateway permissions.",
+        noCapability: "No available models match this capability",
+    },
+
     meta: {
         title: "Infinite Canvas",
         description: "An infinite canvas creation tool",

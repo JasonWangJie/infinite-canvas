@@ -13,5 +13,9 @@
         "@infinite-canvas/plugin-sdk": "file:../sdk",
         "@types/react": "19.1.12",
         "typescript": "^5"
+    },
+    "dependencies": {
+        "dompurify": "3.4.17",
+        "marked": "18.1.1"
     }
 }

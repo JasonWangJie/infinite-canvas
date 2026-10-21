@@ -14,7 +14,12 @@
         "jsx": "react-jsx",
         "incremental": true,
         "paths": {
-            "@/*": ["./src/*"]
+            "@/*": ["./src/*"],
+            "@infinite-canvas/plugin-sdk": ["../plugins/canvas/sdk/src/index.ts"],
+            "react": ["./node_modules/@types/react"],
+            "dompurify": ["./node_modules/dompurify"],
+            "marked": ["./node_modules/marked"],
+            "react/*": ["./node_modules/@types/react/*"]
         }
     },
     "include": ["vite.config.ts", "src/**/*.ts", "src/**/*.tsx"],

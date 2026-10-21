@@ -20,5 +20,9 @@
         "@types/react": "19.1.12",
         "esbuild": "^0.25.0",
         "typescript": "^5"
+    },
+    "dependencies": {
+        "dompurify": "3.4.17",
+        "marked": "18.1.1"
     }
 }

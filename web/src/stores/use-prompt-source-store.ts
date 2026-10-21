@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
 
 import { DEFAULT_PROMPT_SOURCES, createPromptSource, type PromptSource } from "@/services/api/prompt-source-presets";
 
@@ -35,9 +35,7 @@ export const usePromptSourceStore = create<PromptSourceStore>()(
             addSource: () => createPromptSource(),
             saveSource: (source) =>
                 set((state) => ({
-                    sources: state.sources.some((item) => item.id === source.id)
-                        ? state.sources.map((item) => (item.id === source.id && !item.builtIn ? createPromptSource(source) : item))
-                        : [...state.sources, createPromptSource(source)],
+                    sources: state.sources.some((item) => item.id === source.id) ? state.sources.map((item) => (item.id === source.id && !item.builtIn ? createPromptSource(source) : item)) : [...state.sources, createPromptSource(source)],
                 })),
             removeSource: (id) => set((state) => ({ sources: state.sources.filter((item) => item.id !== id || item.builtIn) })),
             toggleSource: (id, enabled) => set((state) => ({ sources: state.sources.map((item) => (item.id === id ? { ...item, enabled } : item)) })),
@@ -45,6 +43,8 @@ export const usePromptSourceStore = create<PromptSourceStore>()(
         }),
         {
             name: PROMPT_SOURCE_STORE_KEY,
+            skipHydration: true,
+            storage: createJSONStorage(() => ({ getItem: () => null, setItem: () => {}, removeItem: () => {} })),
             partialize: (state) => ({ sources: state.sources, schedule: state.schedule }),
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<PromptSourceStore>;

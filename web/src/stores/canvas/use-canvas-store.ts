@@ -3,6 +3,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
+import { onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
@@ -44,6 +45,11 @@ const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
+onSessionEnd(() => {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    queuedPersistState = null;
+});
 
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
@@ -58,7 +64,9 @@ const canvasStorage: PersistStorage<CanvasStore> = {
         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
         queuedPersistState = nextState;
         if (saveTimer) clearTimeout(saveTimer);
+        const epoch = sessionEpoch();
         saveTimer = setTimeout(() => {
+            if (epoch !== sessionEpoch()) return;
             saveTimer = null;
             void localForageStorage.setItem(name, JSON.stringify(value));
         }, 400);
@@ -94,6 +102,7 @@ export const useCanvasStore = create<CanvasStore>()(
             importProject: (source) => {
                 const now = new Date().toISOString();
                 const project: CanvasProject = {
+                    ...source,
                     id: nanoid(),
                     title: source.title || i18n.t("canvas.project.imported"),
                     createdAt: source.createdAt || now,
@@ -131,6 +140,7 @@ export const useCanvasStore = create<CanvasStore>()(
                 })),
         }),
         {
+            skipHydration: true,
             name: CANVAS_STORE_KEY,
             storage: canvasStorage,
             partialize: (state) =>

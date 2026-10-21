@@ -5,5 +5,16 @@ description: Planned follow-up work
 
 # TODO
 
+## New API 受管画布
+
+- 在真实 New API 测试环境完成文本、图片生成/多参考图编辑、异步视频的渠道兼容、用户扣费与日志核对，覆盖余额不足、分组与模型权限变化、用户禁用和网关退出撤销。
+- 完成 HTTPS Docker 双站点授权、重启恢复、独立升级/回退，以及真实浏览器多标签切换、并发保存冲突、导入导出完整资源包的验收。
+- 未列入可信清单的上游插件需要逐个审计并打包依赖后才能开放；当前仅开放 SVG、Markdown、便签、隔离 HTML 四种节点，保留其他节点数据与占位显示。
+- 持久化素材不由单个页面自动清扫，避免误删其他画布、历史记录或标签页正在使用的文件；后续如需自动回收，应实现服务端引用检查后再删除。
+
+## 上游独立版后续计划
+
+以下本机 Agent 事项保留为上游方向；受管画布目前不开放本机 Agent、WebDAV、任意模型脚本或远程插件安装。
+
 - Replace the Claude Code CLI adapter with a Claude Agent SDK adapter and improve the tool queue, following the [Local Agent Integration Plan](/docs/progress/local-agent-integration-plan).
 - Add Skill installation from web search, Skill resource-file management, and controlled local-memory persistence.

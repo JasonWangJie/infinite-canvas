@@ -5,4 +5,5 @@
 
 export * from "./types";
 export { definePlugin } from "./define-plugin";
+export { sanitizeSvg, renderSafeMarkdown } from "./sanitize";
 export { getReact, getRuntime, useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef, useReducer, useContext, useId } from "./runtime";

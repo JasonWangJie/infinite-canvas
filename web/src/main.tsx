@@ -7,17 +7,16 @@ import { RouterProvider } from "react-router-dom";
 
 import { AppProviders } from "@/components/layout/app-providers";
 import "@/i18n";
-import { initAnalytics } from "@/lib/analytics";
-import { router } from "@/router";
-
-initAnalytics();
+const ProtectedRouter = React.lazy(() => import("@/router").then(({ router }) => ({ default: () => <RouterProvider router={router} /> })));
 
 document.body.style.fontFamily = '"SF Pro Display","SF Pro Text","PingFang SC","Microsoft YaHei","Helvetica Neue",sans-serif';
 
 createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
         <AppProviders>
-            <RouterProvider router={router} />
+            <React.Suspense fallback={null}>
+                <ProtectedRouter />
+            </React.Suspense>
         </AppProviders>
     </React.StrictMode>,
 );

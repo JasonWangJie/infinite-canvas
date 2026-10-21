@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useState } from "react";
+import { Input } from "antd";
 import { Cpu } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -22,7 +23,12 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
     const { t } = useTranslation();
     const pickerId = useId();
     const [open, setOpen] = useState(false);
-    const options = useMemo(() => Array.from(new Set([...(config.channelMode === "local" && !capability ? [value] : []), ...selectableModelsByCapability(config, capability)].filter((model): model is string => Boolean(model)))), [capability, config, value]);
+    const [search, setSearch] = useState("");
+    const options = useMemo(
+        () => Array.from(new Set([...(config.channelMode === "local" && !capability ? [value] : []), ...selectableModelsByCapability(config, capability)].filter((model): model is string => Boolean(model)))),
+        [capability, config, value],
+    );
+    const visibleOptions = options.filter((option) => modelOptionLabel(config, option).toLowerCase().includes(search.toLowerCase()));
     const current = value || "";
     const pickerPlaceholder = placeholder || t("settingsPanels.model.select");
 
@@ -41,6 +47,7 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
             onOpenChange={(nextOpen) => {
                 if (nextOpen && !options.length && config.channelMode === "local") onMissingConfig?.();
                 if (nextOpen) window.dispatchEvent(new CustomEvent("model-picker-open", { detail: pickerId }));
+                setSearch("");
                 setOpen(nextOpen);
             }}
             onValueChange={onChange}
@@ -69,8 +76,9 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
                 onPointerDown={(event) => event.stopPropagation()}
                 onMouseDown={(event) => event.stopPropagation()}
             >
-                {options.length ? (
-                    options.map((model) => (
+                <Input aria-label={t("config.modelSelect.search")} placeholder={t("config.modelSelect.search")} value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => event.stopPropagation()} className="mb-1" />
+                {visibleOptions.length ? (
+                    visibleOptions.map((model) => (
                         <SelectItem key={model} value={model} textValue={modelOptionLabel(config, model)}>
                             <ModelLabel config={config} model={model} />
                         </SelectItem>
@@ -85,10 +93,8 @@ export function ModelPicker({ config, value, onChange, capability, className, fu
     );
 }
 
-function emptyModelLabel(config: AiConfig, capability?: ModelCapability) {
-    const label = capability ? i18n.t(`settingsPanels.model.capabilities.${capability}`) : "";
-    if (capability && config.models.length) return i18n.t("settingsPanels.model.assign", { capability: label });
-    return config.models.length ? i18n.t("settingsPanels.model.noMatch", { capability: label }) : i18n.t("settingsPanels.model.addFirst");
+function emptyModelLabel(config: AiConfig, _capability?: ModelCapability) {
+    return i18n.t(config.models.length ? "managed.noCapability" : "managed.noModels");
 }
 
 function ModelLabel({ config, model }: { config: AiConfig; model: string }) {

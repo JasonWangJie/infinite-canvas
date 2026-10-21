@@ -10,7 +10,7 @@ export type PromptSource = {
 };
 
 export const PROMPT_REGISTRY_HOMEPAGE = "https://github.com/yukkcat/image-prompts";
-const PROMPT_REGISTRY_SOURCE_BASE = "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist/sources";
+const PROMPT_REGISTRY_SOURCE_BASE = "/api/prompt-catalog";
 
 export function createPromptSource(source?: Partial<PromptSource>): PromptSource {
     return {
@@ -34,5 +34,5 @@ export const DEFAULT_PROMPT_SOURCES: PromptSource[] = [
 ];
 
 function registrySource(id: string, name: string, homepage: string): PromptSource {
-    return { id, name, url: `${PROMPT_REGISTRY_SOURCE_BASE}/${id}.json`, homepage, enabled: true, builtIn: true };
+    return { id, name, url: `${PROMPT_REGISTRY_SOURCE_BASE}/${id}`, homepage, enabled: true, builtIn: true };
 }

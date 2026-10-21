@@ -1,0 +1,43 @@
+services:
+  app:
+    image: infinite-canvas:managed-local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      # Explicit deployment choice: align this with the gateway's accepted
+      # generation/streaming duration; no new arbitrary default is introduced.
+      CANVAS_PROXY_READ_TIMEOUT: ${CANVAS_PROXY_READ_TIMEOUT:?Set the proxy timeout to match the New API gateway}
+      NGINX_ENVSUBST_FILTER: CANVAS_PROXY_READ_TIMEOUT
+    volumes:
+      - ./canvas-server/nginx-managed.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      canvas-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  canvas-server:
+    image: infinite-canvas-server:managed-local
+    build:
+      context: .
+      dockerfile: canvas-server/Dockerfile
+    environment:
+      CANVAS_ORIGIN: ${CANVAS_ORIGIN:?Set the exact public HTTPS Canvas origin}
+      NEW_API_URL: ${NEW_API_URL:?Set the private reachable New API base URL}
+      NEW_API_PUBLIC_URL: ${NEW_API_PUBLIC_URL:?Set the browser-facing New API base URL}
+      NEW_API_CLIENT_ID: ${NEW_API_CLIENT_ID:-infinite-canvas}
+      NEW_API_CLIENT_SECRET: ${NEW_API_CLIENT_SECRET:?Set the same application secret as New API}
+      CANVAS_SESSION_ENCRYPTION_KEY: ${CANVAS_SESSION_ENCRYPTION_KEY:?Set a base64 encoded 32 byte random encryption key}
+      DATA_DIR: /data
+    expose:
+      - "3001"
+    volumes:
+      - canvas_private_data:/data
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+
+volumes:
+  canvas_private_data:
