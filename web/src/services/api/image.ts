@@ -1,4 +1,4 @@
-import { csrfHeaders, canvasFetch } from "@/services/api/canvas-client";
+import { csrfHeaders, canvasFetch, sessionEpoch } from "@/services/api/canvas-client";
 import axios from "axios";
 
 import i18n from "@/i18n";
@@ -8,6 +8,7 @@ import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
+import { readImageTaskRecords, saveImageTaskRecord, updateImageTaskRecord, type ImageTaskBatch, type ImageTaskRecord } from "@/services/image-task-records";
 import { imageSizePresets, inferMediaScale } from "@/lib/media-size";
 import type { ReferenceImage } from "@/types/image";
 
@@ -90,6 +91,10 @@ type GeminiPayload = {
 };
 type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string };
 type RequestOptions = { signal?: AbortSignal };
+type ImageRequestOptions = RequestOptions & { onPartial?: (batch: ImageTaskBatch) => void };
+type ImageResult = { id: string; dataUrl: string };
+type ImageBatchOutcome = { total: number; index: number } & ({ images: ImageResult[]; error?: never } | { error: Error; images?: never });
+type RetainImageBatch = (outcome: ImageBatchOutcome) => Promise<void>;
 
 const IMAGE_QUALITY_VALUES = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_IMAGE_SHORT_SIDE = 1024;
@@ -101,6 +106,8 @@ const IMAGE_MAX_RATIO = 3;
 const IMAGE_OUTPUT_FORMAT = "png";
 // 与 image-storage 的下载超时保持一致，避免接口挂起时节点一直停在生成中。
 const IMAGE_REQUEST_TIMEOUT_MS = 10 * 60_000;
+
+export class ImageGenerationUncertainError extends Error {}
 
 const GEMINI_SUPPORTED_RATIOS = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
 
@@ -214,7 +221,7 @@ function resolveImageSource(item: Record<string, unknown>) {
     return null;
 }
 
-function parseImagePayload(payload: ImageApiResponse) {
+export function parseImagePayload(payload: ImageApiResponse) {
     if (typeof payload.code === "number" && payload.code !== 0) {
         throw new Error(payload.msg || apiText("requestFailed"));
     }
@@ -274,6 +281,13 @@ function readAxiosError(error: unknown, fallback: string) {
     }
     if (error instanceof DOMException && error.name === "AbortError") return apiText("requestCanceled");
     return error instanceof Error ? readApiErrorMessage(error.message) || error.message : fallback;
+}
+
+function normalizeImageGenerationError(error: unknown) {
+    if (error instanceof ImageGenerationUncertainError) return error;
+    const message = readAxiosError(error, apiText("requestFailed"));
+    if (axios.isAxiosError(error) && (!error.response || ["EXECUTION_UNKNOWN", "RESULT_SAVE_FAILED", "GATEWAY_PROTOCOL_ERROR", "GATEWAY_REDIRECT_REJECTED"].includes(error.response.data?.error?.code))) return new ImageGenerationUncertainError(message);
+    return new Error(message);
 }
 
 function readStatusError(status: number | undefined, fallback: string) {
@@ -636,9 +650,27 @@ function parseGeminiToolResponse(payload: GeminiPayload): ToolResponseResult {
     return { content, toolCalls };
 }
 
-async function requestGeminiImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
-    const requests = Array.from({ length: count }, () => requestGeminiImagesOnce(config, prompt, references, options));
-    return (await Promise.all(requests)).flat();
+async function requestGeminiImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, retain: RetainImageBatch, options?: RequestOptions) {
+    if (count === 1) return requestGeminiImagesOnce(config, prompt, references, options);
+    const images: ImageResult[] = [];
+    const failures: Error[] = [];
+    // Keep the existing concurrency. Persist each response before the slowest sibling ends.
+    await Promise.allSettled(Array.from({ length: count }, async (_, index) => {
+        let received: ImageResult[];
+        try {
+            received = await requestGeminiImagesOnce(config, prompt, references, options);
+        } catch (error) {
+            const failure = normalizeImageGenerationError(error);
+            failures.push(failure);
+            await retain({ total: count, index, error: failure });
+            return;
+        }
+        // This order is also the persisted order: indices already viewed must never move.
+        images.push(...received);
+        await retain({ total: count, index, images: received });
+    }));
+    if (images.length) return images;
+    throw failures.find((error) => error instanceof ImageGenerationUncertainError) || failures[0] || new Error(apiText("requestFailed"));
 }
 
 async function requestGeminiImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
@@ -673,7 +705,134 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
     return images;
 }
 
-export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
+export async function requestAsyncImageGeneration(config: AiConfig, prompt: string, references: ReferenceImage[], intentId: string) {
+    const epoch = sessionEpoch();
+    const records = await readImageTaskRecords();
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    // The same user intent never re-submits a paid request after a lost response.
+    if (records[intentId]?.task_id) return records[intentId].task_id!;
+    if (records[intentId]) throw new ImageGenerationUncertainError(i18n.t("managed.imageTaskUnknown"));
+    let record: ImageTaskRecord = { id: intentId, task_id: null, status: "submitting", created_at: Math.floor(Date.now() / 1000), value: { model: config.model || config.imageModel, endpoint: references.length ? "/v1/images/edits_async" : "/v1/images/generations_async" } };
+    await saveImageTaskRecord(record, true);
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    try {
+        const task = await submitAsyncImageGeneration(config, prompt, references, intentId);
+        if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+        record = { ...record, task_id: task.taskId, status: "pending", value: { ...record.value, retryAfter: task.retryAfter } };
+        await saveImageTaskRecord(record);
+        return task.taskId;
+    } catch (error) {
+        if (epoch === sessionEpoch()) {
+            record = { ...record, status: record.task_id ? "pending" : error instanceof ImageGenerationUncertainError ? "execution_unknown" : "failed" };
+            await saveImageTaskRecord(record).catch(() => {});
+            if (record.task_id) throw new ImageGenerationUncertainError(i18n.t("browserStorage.taskSaveFailed"));
+        }
+        throw error;
+    }
+}
+
+async function submitAsyncImageGeneration(config: AiConfig, prompt: string, references: ReferenceImage[], intentId: string) {
+    const epoch = sessionEpoch();
+    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    if (requestConfig.apiFormat !== "openai") throw new Error(i18n.t("managed.asyncImageModelRequired"));
+    const quality = normalizeQuality(config.quality);
+    const size = resolveRequestSize(config.size);
+    const background = normalizeBackground(config.background);
+    const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    if (epoch !== sessionEpoch()) throw new Error("登录会话已改变");
+    const response = await canvasFetch(aiApiUrl(requestConfig, images.length ? "/images/edits_async" : "/images/generations_async"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": intentId },
+        body: JSON.stringify({
+            model: requestConfig.model,
+            prompt: withSystemPrompt(requestConfig, buildImageReferencePromptText(prompt, references)),
+            n: Math.max(1, Math.min(10, Math.floor(Number(config.count) || 1))),
+            ...(quality ? { quality } : {}),
+            ...(size ? { size } : {}),
+            ...(background ? { background } : {}),
+            ...(images.length ? { image: images } : {}),
+            output_format: IMAGE_OUTPUT_FORMAT,
+        }),
+    }).catch(() => {
+        throw new ImageGenerationUncertainError(i18n.t("managed.imageTaskUnknown"));
+    });
+    const body = await response.json().catch(() => {
+        throw new ImageGenerationUncertainError(i18n.t("managed.imageTaskUnknown"));
+    });
+    if (!response.ok) {
+        if (response.status >= 500) throw new ImageGenerationUncertainError(`${readApiErrorMessage(body)} ${i18n.t("managed.imageTaskUnknown")}`.trim());
+        throw new Error(readApiErrorMessage(body) || apiText("requestFailed"));
+    }
+    if (response.status !== 202 || typeof body?.task_id !== "string" || !/^[A-Za-z0-9_-]+$/.test(body.task_id)) throw new ImageGenerationUncertainError(i18n.t("managed.imageTaskUnknown"));
+    const seconds = Number(response.headers.get("Retry-After"));
+    return { taskId: body.task_id as string, retryAfter: Number.isFinite(seconds) && seconds > 0 ? seconds : undefined };
+}
+
+export function requestGeneration(config: AiConfig, prompt: string, options?: ImageRequestOptions) {
+    return trackImageGeneration(config, "/v1/images/generations", (retain) => runGeneration(config, prompt, retain, options), options);
+}
+
+export function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], options?: ImageRequestOptions) {
+    return trackImageGeneration(config, "/v1/images/edits", (retain) => runEdit(config, prompt, references, retain, options), options);
+}
+
+async function trackImageGeneration(config: AiConfig, endpoint: string, generate: (retain: RetainImageBatch) => Promise<ImageResult[]>, options?: ImageRequestOptions) {
+    const epoch = sessionEpoch();
+    const record: ImageTaskRecord = { id: nanoid(), task_id: null, status: "pending", created_at: Math.floor(Date.now() / 1000), value: { model: config.model || config.imageModel, endpoint } };
+    await saveImageTaskRecord(record, true);
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    let batch: ImageTaskBatch = { total: 0, completed: 0, failed: 0, unknown: 0 };
+    let batchSaveFailed = false;
+    let received = false;
+    let images: ImageResult[];
+    const retain: RetainImageBatch = async (outcome) => {
+        if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+        received ||= Boolean(outcome.images?.length);
+        const unknown = outcome.error instanceof ImageGenerationUncertainError;
+        batch = { total: outcome.total, completed: batch.completed + 1, failed: batch.failed + Number(Boolean(outcome.error) && !unknown), unknown: batch.unknown + Number(unknown) };
+        const progress = batch;
+        try {
+            await updateImageTaskRecord(record.id, (current) => {
+                const result = current.value.result;
+                const data = [...(result?.data || []), ...(outcome.images || []).map((image) => ({ url: image.dataUrl }))];
+                const errorMessage = [result?.error_message, outcome.error ? `#${outcome.index + 1}: ${outcome.error.message}` : undefined].filter(Boolean).join("\n");
+                let status = "running";
+                if (progress.completed >= progress.total) {
+                    if (data.length) status = progress.failed || progress.unknown ? "partial" : "succeeded";
+                    else status = progress.unknown ? "execution_unknown" : "failed";
+                }
+                return { ...current, status, value: { ...current.value, batch: progress, result: { ...result, data, ...(errorMessage ? { error_message: errorMessage } : {}) } } };
+            });
+        } catch (error) {
+            if (epoch !== sessionEpoch()) throw error;
+            // Other requests may already have been charged; retain all their later responses too.
+            batchSaveFailed = true;
+        }
+    };
+    try {
+        images = await generate(retain);
+        if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+        received ||= images.length > 0;
+        if (batchSaveFailed) throw new ImageGenerationUncertainError(i18n.t("managed.imageBatchSaveFailed"));
+        if (!batch.total) {
+            // Retain the received result locally before decoding/storing individual images.
+            await updateImageTaskRecord(record.id, (current) => ({ ...current, status: "succeeded", value: { ...current.value, result: { data: images.map((image) => ({ url: image.dataUrl })) } } }));
+        }
+    } catch (error) {
+        if (epoch === sessionEpoch()) {
+            if (!batch.total || batchSaveFailed) {
+                await updateImageTaskRecord(record.id, (current) => ({ ...current, status: received || batchSaveFailed ? "storage_failed" : error instanceof ImageGenerationUncertainError ? "execution_unknown" : "failed" })).catch(() => {});
+            }
+            if (batchSaveFailed) throw new ImageGenerationUncertainError(i18n.t("managed.imageBatchSaveFailed"));
+            if (received) throw new ImageGenerationUncertainError(i18n.t("browserStorage.resultSaveFailed"));
+        }
+        throw error;
+    }
+    if (batch.failed || batch.unknown) options?.onPartial?.(batch);
+    return images;
+}
+
+async function runGeneration(config: AiConfig, prompt: string, retain: RetainImageBatch, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const script = resolveModelScript(config, config.model || config.imageModel);
@@ -698,9 +857,9 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     }
     if (requestConfig.apiFormat === "gemini") {
         try {
-            return await requestGeminiImages(requestConfig, prompt, [], n, options);
+            return await requestGeminiImages(requestConfig, prompt, [], n, retain, options);
         } catch (error) {
-            throw new Error(readAxiosError(error, apiText("requestFailed")));
+            throw normalizeImageGenerationError(error);
         }
     }
     const quality = normalizeQuality(config.quality);
@@ -729,11 +888,11 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
         const images = await parseImagePayload(response.data);
         return images;
     } catch (error) {
-        throw new Error(readAxiosError(error, apiText("requestFailed")));
+        throw normalizeImageGenerationError(error);
     }
 }
 
-export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
+async function runEdit(config: AiConfig, prompt: string, references: ReferenceImage[], retain: RetainImageBatch, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const requestPrompt = buildImageReferencePromptText(prompt, references);
@@ -760,9 +919,9 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     }
     if (requestConfig.apiFormat === "gemini") {
         try {
-            return await requestGeminiImages(requestConfig, requestPrompt, references, n, options);
+            return await requestGeminiImages(requestConfig, requestPrompt, references, n, retain, options);
         } catch (error) {
-            throw new Error(readAxiosError(error, apiText("requestFailed")));
+            throw normalizeImageGenerationError(error);
         }
     }
 
@@ -796,7 +955,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         const images = await parseImagePayload(response.data);
         return images;
     } catch (error) {
-        throw new Error(readAxiosError(error, apiText("requestFailed")));
+        throw normalizeImageGenerationError(error);
     }
 }
 

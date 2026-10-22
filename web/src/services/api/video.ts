@@ -1,4 +1,4 @@
-import { csrfHeaders, readPrivateBlob } from "@/services/api/canvas-client";
+import { csrfHeaders, readPrivateBlob, sessionEpoch } from "@/services/api/canvas-client";
 import axios from "axios";
 
 import i18n from "@/i18n";
@@ -21,6 +21,7 @@ const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiE
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
 export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
 export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
+export class VideoGenerationUncertainError extends Error {}
 
 function aiApiUrl(config: AiConfig, path: string) {
     return buildApiUrl(config.baseUrl, path);
@@ -83,6 +84,7 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const epoch = sessionEpoch();
     const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
     const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
@@ -117,12 +119,19 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     }
     videos.forEach((file) => body.append("video[]", file));
     audios.forEach((file) => body.append("audio[]", file));
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    options?.signal?.throwIfAborted();
     try {
         const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config), signal: options?.signal })).data);
-        if (!created.id) throw new Error(apiText("noVideoTaskId"));
+        if (typeof created.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(created.id)) throw new Error(apiText("noVideoTaskId"));
         return { id: created.id, provider: "openai", model };
     } catch (error) {
-        throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        const message = readAxiosError(error, apiText("videoTaskCreateFailed"));
+        // A lost response, timeout, server error or malformed success may hide an
+        // accepted paid task. Do not offer the failed-task resubmission action.
+        if (status && status >= 400 && status < 500 && status !== 408) throw new Error(message);
+        throw new VideoGenerationUncertainError(`${message} ${i18n.t("managed.imageTaskUnknown")}`);
     }
 }
 
@@ -209,7 +218,7 @@ function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
 }
 
 function videoResultUrl(payload: VideoResponse) {
-    return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && (isPublicMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
+    return [payload.video_url, payload.result_url, payload.url, payload.content?.video_url, payload.content?.url].find((url) => typeof url === "string" && (isManagedMediaUrl(url) || /\.mp4(\?|#|$)/i.test(url)));
 }
 
 function readApiErrorMessage(value: unknown): string {
@@ -261,8 +270,8 @@ async function assertVideoBlob(blob: Blob) {
     if (payload.error?.message) throw new Error(readApiErrorMessage(payload.error.message) || payload.error.message);
 }
 
-function isPublicMediaUrl(value: string) {
-    return /^\/api\/files\//.test(value || "");
+function isManagedMediaUrl(value: string) {
+    return /^\/api\/(?:result-media\/[A-Za-z0-9_-]+|ai\/v1\/videos\/[A-Za-z0-9_-]+\/content)$/.test(value || "");
 }
 
 function delay(ms: number, signal?: AbortSignal) {

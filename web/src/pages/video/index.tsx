@@ -1,90 +1,77 @@
 import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, LoaderCircle, Plus, SlidersHorizontal, Sparkles, Trash2, Upload, VideoIcon } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore, type DragEvent } from "react";
-import { App, Button, Checkbox, Drawer, Empty, Input, Modal, Tag, Typography } from "antd";
-import { createRecordStore } from "@/services/canvas-data";
+import { App, Button, Checkbox, Drawer, Empty, Input, Modal, Select, Tag, Typography } from "antd";
 import { nanoid } from "nanoid";
 import { saveAs } from "file-saver";
+import { useLocation } from "react-router-dom";
+import { useWorkbenchHistoryFilter } from "@/hooks/use-workbench-history-filter";
+import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
+import { readTaskCenterDocument } from "@/services/task-center";
 import { useTranslation } from "react-i18next";
 
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { ModelPicker } from "@/components/model-picker";
+import { ResultToCanvasButton } from "@/components/result-to-canvas-button";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { VideoSettingsPanel, normalizeVideoResolutionValue, normalizeVideoSizeValue, videoModeLabel, videoSizeLabel } from "@/components/video-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { clampVideoSeconds } from "@/lib/media-size";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { deleteStoredMedia, resolveMediaUrl } from "@/services/file-storage";
+import { resolveMediaUrl } from "@/services/file-storage";
 import { resolveImageUrl, ensureImagePreview, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
-import { createVideoGenerationTask, pollVideoGenerationTask, storeGeneratedVideo, type VideoGenerationTask } from "@/services/api/video";
-import { useAssetStore } from "@/stores/use-asset-store";
+import { createVideoGenerationTask, VideoGenerationUncertainError, type VideoGenerationTask } from "@/services/api/video";
+import { assertAssetSaveReady, useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { boolConfig, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
-
-type GeneratedVideo = {
-    id: string;
-    url: string;
-    storageKey: string;
-    durationMs: number;
-    width: number;
-    height: number;
-    bytes: number;
-    mimeType: string;
-};
+import { sessionEpoch } from "@/services/api/canvas-client";
+import { deleteVideoGenerationLogs, logStore, resumeVideoGeneration, serializeLog, updateExistingVideoLog, type GeneratedVideo, type GenerationLog, type GenerationLogConfig } from "./generation-log";
 
 type GenerationResult = {
     id: string;
-    status: "pending" | "success" | "failed";
+    status: GenerationLog["status"];
+    log?: GenerationLog;
     video?: GeneratedVideo;
     error?: string;
 };
-
-type GenerationLog = {
-    id: string;
-    createdAt: number;
-    title: string;
-    prompt: string;
-    time: string;
-    model: string;
-    config: GenerationLogConfig;
-    references: ReferenceImage[];
-    durationMs: number;
-    size: string;
-    resolution: string;
-    seconds: string;
-    status: "pending" | "success" | "failed";
-    task?: VideoGenerationTask;
-    video?: GeneratedVideo;
-    error?: string;
-};
-
-type GenerationLogConfig = Pick<AiConfig, "model" | "videoModel" | "size" | "vquality" | "videoSeconds" | "videoGenerateAudio" | "videoWatermark" | "videoMode">;
 
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
-
-const LOG_STORE_KEY = "infinite-canvas:video_generation_logs";
-const logStore = createRecordStore("video-workbench");
 
 export default function VideoPage() {
     const { message } = App.useApp();
     const { t } = useTranslation();
+    const location = useLocation();
+    const locationSearch = useRef(location.search);
+    locationSearch.current = location.search;
+    const linkedLogId = new URLSearchParams(location.search).get("log");
+    const navigationRef = useRef("");
+    const mounted = useRef(false);
+    const latestLoad = useRef(0);
+    const loadedSearch = useRef<string | null>(null);
+    const interactionVersion = useRef(0);
+    const [logsLoaded, setLogsLoaded] = useState(false);
+    const [navigationError, setNavigationError] = useState("");
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const activeLogIdsRef = useRef<Set<string>>(new Set());
+    const savingAssetIds = useRef(new Set<string>());
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
-    const addAsset = useAssetStore((state) => state.addAsset);
+    const addAssetsAndSave = useAssetStore((state) => state.addAssetsAndSave);
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
     const [results, setResults] = useState<GenerationResult[]>([]);
     const [logs, setLogs] = useState<GenerationLog[]>([]);
     const [running, setRunning] = useState(false);
+    const runningRef = useRef(running);
+    runningRef.current = running;
+    const visibleLogs = useWorkbenchHistoryFilter("video", logs);
     const [logsOpen, setLogsOpen] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
@@ -112,8 +99,20 @@ export default function VideoPage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs();
-    }, []);
+        mounted.current = true;
+        loadedSearch.current = null;
+        setLogsLoaded(false);
+        setNavigationError("");
+        void refreshLogs(!linkedLogId).catch((error) => {
+            if (mounted.current) setNavigationError(error instanceof Error ? error.message : String(error));
+        });
+        return () => { mounted.current = false; latestLoad.current += 1; };
+    }, [location.search]);
+
+    useEffect(() => {
+        const visible = new Set(visibleLogs.map((log) => log.id));
+        setSelectedLogIds((ids) => ids.every((id) => visible.has(id)) ? ids : ids.filter((id) => visible.has(id)));
+    }, [visibleLogs]);
 
     const addReferences = async (files?: FileList | null) => {
         const selectedFiles = Array.from(files || []);
@@ -169,6 +168,8 @@ export default function VideoPage() {
         }
     };
     const generate = async () => {
+        if (runningRef.current) return;
+        const epoch = sessionEpoch();
         const agentTaskId = agentTaskIdRef.current;
         agentTaskIdRef.current = undefined;
         const snapshot = buildRequestSnapshot();
@@ -176,6 +177,8 @@ export default function VideoPage() {
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("videoWorkbench.invalidParams") });
             return;
         }
+        interactionVersion.current += 1;
+        runningRef.current = true;
         setElapsedMs(0);
         setRunning(true);
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
@@ -183,18 +186,41 @@ export default function VideoPage() {
         setResults([{ id: nanoid(), status: "pending" }]);
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
+        // Persist an uncertain intent before submission: a reload while the POST
+        // is in flight must never turn the same intent into a new paid request.
+        let createdLog: GenerationLog = { ...buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: 0, status: "unknown", error: t("managed.imageTaskUnknown") }), agentTaskId };
         try {
+            await logStore.setItem(createdLog.id, serializeLog(createdLog));
+            if (epoch !== sessionEpoch()) return;
+            if (mounted.current) setLogs((items) => [createdLog, ...items]);
             const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references);
-            const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: 0, status: "pending", task });
-            await saveLog(log, false);
+            if (epoch !== sessionEpoch()) return;
+            const log: GenerationLog = { ...createdLog, status: "pending", error: undefined, task };
+            createdLog = log;
+            if (mounted.current) setLogs((items) => items.map((item) => item.id === log.id ? log : item));
+            if (!await updateExistingVideoLog(log)) throw new Error(t("taskCenter.recordRemoved"));
+            if (epoch !== sessionEpoch()) return;
             void pollGenerationLog(log, snapshot.config, agentTaskId);
         } catch (error) {
+            if (epoch !== sessionEpoch()) return;
             const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
-            setResults([{ id: nanoid(), status: "failed", error: errorMessage }]);
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
-            await saveLog(buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: performance.now() - batchStartedAt, status: "failed", error: errorMessage }));
-            message.error(errorMessage);
-            setRunning(false);
+            const failedLog: GenerationLog = { ...createdLog, status: createdLog.task ? "paused" : error instanceof VideoGenerationUncertainError ? "unknown" : "failed", durationMs: performance.now() - batchStartedAt, error: errorMessage };
+            if (mounted.current) {
+                setResults([{ id: failedLog.id, status: failedLog.status, log: failedLog, error: errorMessage }]);
+                setLogs((items) => items.some((item) => item.id === failedLog.id) ? items.map((item) => item.id === failedLog.id ? failedLog : item) : [failedLog, ...items]);
+            }
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: failedLog.status === "failed" ? "failed" : "running", successCount: 0, failCount: failedLog.status === "failed" ? 1 : 0, error: errorMessage });
+            try {
+                await saveLog(failedLog);
+            } catch (storageError) {
+                if (mounted.current && epoch === sessionEpoch()) message.warning(storageError instanceof Error ? storageError.message : String(storageError));
+            } finally {
+                if (mounted.current && epoch === sessionEpoch()) {
+                    message.error(errorMessage);
+                    runningRef.current = false;
+                    setRunning(false);
+                }
+            }
         }
     };
 
@@ -234,7 +260,12 @@ export default function VideoPage() {
         return { text, config: buildVideoConfig(effectiveConfig, model), references: [...references] };
     };
 
-    const retryResult = () => {
+    const retryResult = (result: GenerationResult) => {
+        if (result.status === "unknown") return;
+        if (result.status === "paused" && result.log?.task) {
+            void pollGenerationLog(result.log);
+            return;
+        }
         void generate();
     };
 
@@ -242,17 +273,27 @@ export default function VideoPage() {
         saveAs(video.url, "video.mp4");
     };
 
-    const saveResultToAssets = (video: GeneratedVideo) => {
-        addAsset({
-            kind: "video",
-            title: t("videoWorkbench.resultTitle"),
-            coverUrl: "",
-            tags: [],
-            source: t("videoWorkbench.source"),
-            data: { url: video.url, storageKey: video.storageKey, width: video.width, height: video.height, bytes: video.bytes, mimeType: video.mimeType },
-            metadata: { source: "video-page", prompt },
-        });
-        message.success(t("common.addedToAssets"));
+    const saveResultToAssets = async (video: GeneratedVideo) => {
+        const epoch = sessionEpoch(), key = `${epoch}:${video.id}`;
+        if (savingAssetIds.current.has(key)) return;
+        savingAssetIds.current.add(key);
+        try {
+            assertAssetSaveReady(epoch);
+            await addAssetsAndSave([{
+                kind: "video",
+                title: t("videoWorkbench.resultTitle"),
+                coverUrl: "",
+                tags: [],
+                source: t("videoWorkbench.source"),
+                data: { url: video.url, storageKey: video.storageKey, width: video.width, height: video.height, bytes: video.bytes, mimeType: video.mimeType },
+                metadata: { source: "video-page", prompt },
+            }], epoch);
+            if (epoch === sessionEpoch()) message.success(t("common.addedToAssets"));
+        } catch (error) {
+            if (epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : t("assets.formSaveUnconfirmed"));
+        } finally {
+            savingAssetIds.current.delete(key);
+        }
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
@@ -266,6 +307,8 @@ export default function VideoPage() {
     };
 
     const createSession = () => {
+        if (runningRef.current) return;
+        interactionVersion.current += 1;
         setPrompt("");
         setReferences([]);
         setResults([]);
@@ -275,79 +318,79 @@ export default function VideoPage() {
         setPreviewLog(null);
     };
 
-    const deleteSelectedLogs = () => {
-        const mediaKeys = logs
-            .filter((log) => selectedLogIds.includes(log.id))
-            .map((log) => log.video?.storageKey)
-            .filter((key): key is string => Boolean(key));
-        void Promise.all([deleteStoredMedia(mediaKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(() => refreshLogs());
-        if (previewLog && selectedLogIds.includes(previewLog.id)) {
-            setPreviewLog(null);
-            setResults([]);
+    const deleteSelectedLogs = async () => {
+        const epoch = sessionEpoch();
+        const ids = visibleLogs.filter((log) => selectedLogIds.includes(log.id)).map((log) => log.id);
+        if (!ids.length) return;
+        try {
+            await deleteVideoGenerationLogs(ids);
+            if (!mounted.current || epoch !== sessionEpoch()) return;
+            await refreshLogs(false);
+            if (previewLog && ids.includes(previewLog.id)) {
+                setPreviewLog(null);
+                setResults([]);
+            }
+            setSelectedLogIds([]);
+            setDeleteConfirmOpen(false);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : t("workbench.generationFailed"));
         }
-        setSelectedLogIds([]);
-        setDeleteConfirmOpen(false);
     };
 
-    const saveLog = async (log: GenerationLog, resumePending = true) => {
-        await logStore.setItem(log.id, serializeLog(log));
-        await refreshLogs(resumePending);
+    const saveLog = async (log: GenerationLog, resumePending = false) => {
+        await updateExistingVideoLog(log);
+        if (mounted.current) await refreshLogs(resumePending);
     };
 
-    const refreshLogs = async (resumePending = true) => {
+    const refreshLogs = async (resumePending = false) => {
+        const epoch = sessionEpoch();
+        const load = ++latestLoad.current;
+        const search = locationSearch.current;
         const nextLogs = await readStoredLogs();
+        if (!mounted.current || epoch !== sessionEpoch() || load !== latestLoad.current || search !== locationSearch.current) return [];
+        loadedSearch.current = search;
         setLogs(nextLogs);
-        if (resumePending) resumePendingLogs(nextLogs);
+        setLogsLoaded(true);
+        if (resumePending && !runningRef.current) resumePendingLogs(nextLogs);
         return nextLogs;
     };
 
     const resumePendingLogs = (items: GenerationLog[]) => {
         for (const log of items) {
-            if (log.status === "pending" && log.task) void pollGenerationLog(log);
+            if ((log.status === "pending" || log.status === "paused") && log.task) void pollGenerationLog(log);
         }
     };
 
     const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string) => {
         if (!log.task || activeLogIdsRef.current.has(log.id)) return;
+        const epoch = sessionEpoch();
+        const linkedAgentTaskId = agentTaskId || log.agentTaskId;
         activeLogIdsRef.current.add(log.id);
-        setRunning(true);
-        setStartedAt((value) => value || performance.now());
-        setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
+        if (mounted.current) {
+            runningRef.current = true;
+            setRunning(true);
+            setStartedAt((value) => value || performance.now());
+            setResults([{ id: log.id, status: "pending", log }]);
+        }
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
         try {
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
-                if (state.status === "completed") {
-                    const stored = await storeGeneratedVideo(state.result);
-                    const nextVideo: GeneratedVideo = {
-                        id: nanoid(),
-                        url: stored.url,
-                        storageKey: stored.storageKey,
-                        durationMs: Date.now() - log.createdAt,
-                        width: stored.width || 1280,
-                        height: stored.height || 720,
-                        bytes: stored.bytes,
-                        mimeType: stored.mimeType,
-                    };
-                    setResults([{ id: nextVideo.id, status: "success", video: nextVideo }]);
-                    if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
-                    await saveLog({ ...log, status: "success", durationMs: nextVideo.durationMs, video: nextVideo, error: undefined });
-                    message.success(t("videoWorkbench.generated"));
-                    return;
-                }
-                if (state.status === "failed") throw new Error(state.error);
-                if (attempt === 119) throw new Error(t("videoWorkbench.timeout"));
-                await delay(2500);
-            }
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
-            setResults([{ id: log.id, status: "failed", error: errorMessage }]);
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
-            await saveLog({ ...log, status: "failed", durationMs: Date.now() - log.createdAt, error: errorMessage });
-            message.error(errorMessage);
+            const next = await resumeVideoGeneration(log, configOverride || taskConfig);
+            if (!mounted.current || epoch !== sessionEpoch()) return;
+            setResults([{ id: next.id, status: next.status, video: next.video, error: next.error, log: next }]);
+            setLogs((items) => items.map((item) => (item.id === next.id ? next : item)));
+            if (linkedAgentTaskId)
+                updateAgentTask(linkedAgentTaskId, {
+                    status: next.status === "success" ? "succeeded" : next.status === "failed" ? "failed" : "running",
+                    successCount: next.status === "success" ? 1 : 0,
+                    failCount: next.status === "failed" ? 1 : 0,
+                    error: next.error,
+                });
+            if (next.status === "success") message.success(t("videoWorkbench.generated"));
+            else if (next.error) message.warning(next.error);
         } finally {
             activeLogIdsRef.current.delete(log.id);
-            if (!activeLogIdsRef.current.size) {
+            if (mounted.current && epoch === sessionEpoch() && !activeLogIdsRef.current.size) {
+                runningRef.current = false;
                 setRunning(false);
                 setStartedAt(0);
             }
@@ -355,6 +398,8 @@ export default function VideoPage() {
     };
 
     const previewGenerationLog = (log: GenerationLog) => {
+        if (runningRef.current) return;
+        interactionVersion.current += 1;
         setPreviewLog(log);
         setLogsOpen(false);
         setPrompt(log.prompt);
@@ -366,15 +411,31 @@ export default function VideoPage() {
         if (log.config.videoGenerateAudio) updateConfig("videoGenerateAudio", log.config.videoGenerateAudio);
         if (log.config.videoWatermark) updateConfig("videoWatermark", log.config.videoWatermark);
         if (log.config.videoMode) updateConfig("videoMode", log.config.videoMode);
-        setResults(log.status === "pending" ? [{ id: log.id, status: "pending" }] : log.video ? [{ id: log.video.id, status: "success", video: log.video }] : [{ id: log.id, status: "failed", error: log.error || t("workbench.generationFailed") }]);
+        setResults([{ id: log.id, status: log.status, log, video: log.video, error: log.error }]);
     };
+
+    useEffect(() => {
+        const key = `${location.key}:${linkedLogId || ""}`;
+        if (!linkedLogId || !logsLoaded || loadedSearch.current !== location.search || running || navigationRef.current === key) return;
+        navigationRef.current = key;
+        const log = logs.find((item) => item.id === linkedLogId);
+        if (log) {
+            setNavigationError("");
+            void previewGenerationLog(log);
+        } else {
+            setNavigationError(t("workbench.historySourceMissing"));
+        }
+    }, [location.key, location.search, linkedLogId, logsLoaded, logs, running, t]);
 
     return (
         <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
+            {navigationError ? <p role="alert" className="px-4 pt-3 text-sm text-destructive">{navigationError}</p> : null}
+            {linkedLogId && running && navigationRef.current !== `${location.key}:${linkedLogId}` ? <p role="status" className="px-4 pt-3 text-sm text-muted-foreground">{t("workbench.historyWaitForGeneration")}</p> : null}
             <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-3 lg:grid-cols-[300px_minmax(0,1fr)] lg:overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)]">
                 <aside className="thin-scrollbar hidden min-h-0 overflow-y-auto rounded-lg border border-stone-200 bg-card p-4 shadow-sm dark:border-stone-800 lg:block">
                     <LogPanel
                         logs={logs}
+                        disabled={running}
                         selectedLogIds={selectedLogIds}
                         activeLogId={previewLog?.id}
                         onSelectedLogIdsChange={setSelectedLogIds}
@@ -487,8 +548,8 @@ export default function VideoPage() {
                                 {results.map((result) =>
                                     result.status === "success" && result.video ? (
                                         <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} />
-                                    ) : result.status === "failed" ? (
-                                        <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} />
+                                    ) : result.status === "failed" || result.status === "paused" || result.status === "unknown" ? (
+                                        <FailedVideoCard key={result.id} paused={result.status === "paused"} unknown={result.status === "unknown"} error={result.error || t(result.status === "unknown" ? "managed.imageTaskUnknown" : "workbench.generationFailed")} disabled={running} onRetry={() => retryResult(result)} />
                                     ) : (
                                         <PendingVideoCard key={result.id} />
                                     ),
@@ -517,6 +578,7 @@ export default function VideoPage() {
             <Drawer title={t("workbench.logs")} placement="bottom" size="large" open={logsOpen} onClose={() => setLogsOpen(false)}>
                 <LogPanel
                     logs={logs}
+                    disabled={running}
                     selectedLogIds={selectedLogIds}
                     activeLogId={previewLog?.id}
                     onSelectedLogIdsChange={setSelectedLogIds}
@@ -534,6 +596,7 @@ export default function VideoPage() {
             <AssetPickerModal open={assetPickerOpen} defaultTab="my-assets" onInsert={(payload) => void insertPickedAsset(payload)} onClose={() => setAssetPickerOpen(false)} />
             <Modal title={t("workbench.deleteLogs")} open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={deleteSelectedLogs} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
                 {t("workbench.deleteLogsConfirm", { count: selectedLogIds.length })}
+                <p className="mt-2 text-sm text-stone-500">{t("videoWorkbench.deleteLogsHint")}</p>
             </Modal>
         </div>
     );
@@ -569,7 +632,8 @@ function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedV
                     <span>{formatBytes(video.bytes)}</span>
                     <span>{formatDuration(video.durationMs)}</span>
                 </div>
-                <div className="flex shrink-0 gap-1">
+                <div className="flex flex-wrap gap-1">
+                    <ResultToCanvasButton result={{ ...video, kind: "video", title: t("videoWorkbench.resultTitle") }} />
                     <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => onSaveAsset(video)}>
                         {t("common.addToAssets")}
                     </Button>
@@ -594,27 +658,30 @@ function PendingVideoCard() {
     );
 }
 
-function FailedVideoCard({ error, onRetry }: { error: string; onRetry: () => void }) {
+function FailedVideoCard({ error, onRetry, paused, unknown, disabled }: { error: string; onRetry: () => void; paused: boolean; unknown: boolean; disabled: boolean }) {
     const { t } = useTranslation();
+    const attention = paused || unknown;
     return (
-        <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
+        <div className={`overflow-hidden rounded-lg border ${attention ? "border-stone-200 bg-background dark:border-stone-800" : "border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20"}`}>
             <div className="flex aspect-video flex-col items-center justify-center gap-3 p-5 text-center">
-                <div className="text-sm font-medium text-red-600 dark:text-red-300">{t("workbench.failed")}</div>
-                <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs !text-red-500 dark:!text-red-300">
+                <div className={`text-sm font-medium ${attention ? "text-stone-600 dark:text-stone-300" : "text-red-600 dark:text-red-300"}`}>{t(unknown ? "managed.taskPending" : paused ? "videoWorkbench.paused" : "workbench.failed")}</div>
+                <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs">
                     {error}
                 </Typography.Paragraph>
+                {paused ? <p className="text-xs text-stone-500">{t("videoWorkbench.resumeHint")}</p> : null}
             </div>
-            <div className="flex justify-end border-t border-red-200 p-3 dark:border-red-950">
-                <Button size="small" danger onClick={onRetry}>
-                    {t("workbench.retry")}
+            {!unknown ? <div className={`flex justify-end border-t p-3 ${paused ? "border-stone-200 dark:border-stone-800" : "border-red-200 dark:border-red-950"}`}>
+                <Button size="small" danger={!paused} disabled={disabled} onClick={onRetry}>
+                    {t(paused ? "videoWorkbench.resume" : "videoWorkbench.regenerate")}
                 </Button>
-            </div>
+            </div> : null}
         </div>
     );
 }
 
 function LogPanel({
     logs,
+    disabled,
     selectedLogIds,
     activeLogId,
     onSelectedLogIdsChange,
@@ -623,6 +690,7 @@ function LogPanel({
     onPreviewLog,
 }: {
     logs: GenerationLog[];
+    disabled: boolean;
     selectedLogIds: string[];
     activeLogId?: string;
     onSelectedLogIdsChange: (ids: string[]) => void;
@@ -631,38 +699,56 @@ function LogPanel({
     onPreviewLog: (log: GenerationLog) => void;
 }) {
     const { t } = useTranslation();
-    const allSelected = Boolean(logs.length) && selectedLogIds.length === logs.length;
-    const toggleAll = () => onSelectedLogIdsChange(allSelected ? [] : logs.map((log) => log.id));
+    const visibleLogs = useWorkbenchHistoryFilter("video", logs);
+    const filter = useWorkbenchHistoryFilterStore((state) => state.video);
+    const updateFilter = useWorkbenchHistoryFilterStore((state) => state.update);
+    const allSelected = Boolean(visibleLogs.length) && visibleLogs.every((log) => selectedLogIds.includes(log.id));
+    const toggleAll = () => onSelectedLogIdsChange(allSelected ? [] : visibleLogs.map((log) => log.id));
 
     return (
         <>
             <div className="mb-3 flex items-center justify-between gap-3">
                 <h2 className="text-base font-semibold">{t("workbench.logs")}</h2>
-                <Tag className="m-0">{logs.length}</Tag>
+                <Tag className="m-0">{visibleLogs.length} / {logs.length}</Tag>
+            </div>
+            <div className="mb-3 space-y-2">
+                <Input allowClear value={filter.query} aria-label={t("workbench.historySearch")} placeholder={t("workbench.historySearch")} onChange={(event) => updateFilter("video", { query: event.target.value })} />
+                <div className="flex gap-2">
+                    <Select className="min-w-0 flex-1" aria-label={t("workbench.historyStatus")} value={filter.status} onChange={(status) => updateFilter("video", { status })} options={[
+                        { value: "all", label: t("workbench.historyAllStatuses") },
+                        { value: "success", label: t("workbench.success") },
+                        { value: "failed", label: t("workbench.failed") },
+                        { value: "pending", label: t("workbench.generating") },
+                        { value: "paused", label: t("videoWorkbench.paused") },
+                        { value: "unknown", label: t("managed.taskPending") },
+                    ]} />
+                    <Button disabled={!filter.query && filter.status === "all"} onClick={() => updateFilter("video", { query: "", status: "all" })}>{t("workbench.historyClearFilters")}</Button>
+                </div>
             </div>
             <div className="mb-4 flex flex-wrap gap-2">
-                <Button size="small" icon={<Plus className="size-3.5" />} onClick={onCreateSession}>
+                <Button size="small" icon={<Plus className="size-3.5" />} disabled={disabled} onClick={onCreateSession}>
                     {t("workbench.new")}
                 </Button>
-                <Button size="small" icon={<CheckSquare className="size-3.5" />} disabled={!logs.length} onClick={toggleAll}>
+                <Button size="small" icon={<CheckSquare className="size-3.5" />} disabled={!visibleLogs.length} onClick={toggleAll}>
                     {allSelected ? t("common.cancel") : t("workbench.selectAll")}
                 </Button>
                 <Button size="small" danger icon={<Trash2 className="size-3.5" />} disabled={!selectedLogIds.length} onClick={onDeleteSelected}>
                     {t("common.delete")}
                 </Button>
             </div>
+            {selectedLogIds.length ? <p role="status" className="mb-3 text-xs text-muted-foreground">{t("workbench.historySelectedCount", { count: selectedLogIds.length })}</p> : null}
             <div className="space-y-3">
-                {logs.map((log) => (
+                {visibleLogs.map((log) => (
                     <LogCard
                         key={log.id}
                         log={log}
                         selected={selectedLogIds.includes(log.id)}
                         active={activeLogId === log.id}
                         onSelectedChange={(checked) => onSelectedLogIdsChange(checked ? [...selectedLogIds, log.id] : selectedLogIds.filter((id) => id !== log.id))}
-                        onClick={() => onPreviewLog(log)}
+                        onClick={() => { if (!disabled) onPreviewLog(log); }}
                     />
                 ))}
-                {!logs.length ? <div className="flex min-h-48 items-center justify-center rounded-lg border border-dashed border-stone-300 text-center text-sm text-stone-500 dark:border-stone-700">{t("workbench.noLogs")}</div> : null}
+                {!visibleLogs.length ? <div className="flex min-h-48 items-center justify-center rounded-lg border border-dashed border-stone-300 text-center text-sm text-stone-500 dark:border-stone-700">{t(logs.length ? "workbench.historyNoMatches" : "workbench.noLogs")}</div> : null}
             </div>
         </>
     );
@@ -687,8 +773,8 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                     </div>
                 </div>
                 <div className="grid justify-items-end gap-2">
-                    <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color={log.status === "success" ? "blue" : log.status === "pending" ? "processing" : "red"}>
-                        {t(`workbench.${log.status === "success" ? "success" : log.status === "pending" ? "generating" : "failed"}`)}
+                    <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color={log.status === "success" ? "blue" : log.status === "pending" ? "processing" : log.status === "paused" || log.status === "unknown" ? "warning" : "red"}>
+                        {t(log.status === "unknown" ? "managed.taskPending" : log.status === "paused" ? "videoWorkbench.paused" : `workbench.${log.status === "success" ? "success" : log.status === "pending" ? "generating" : "failed"}`)}
                     </Tag>
                     <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="green">
                         {formatDuration(log.durationMs)}
@@ -700,16 +786,9 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
 }
 
 async function readStoredLogs() {
-    if (typeof window === "undefined") return [];
-    try {
-        const logs: GenerationLog[] = [];
-        await logStore.iterate<GenerationLog, void>((value) => {
-            logs.push(value);
-        });
-        return (await Promise.all(logs.map(normalizeLog))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    } catch {
-        return [];
-    }
+    const stored = await readTaskCenterDocument("video-workbench");
+    const logs = stored && typeof stored === "object" && !Array.isArray(stored) ? Object.values(stored) as GenerationLog[] : [];
+    return (await Promise.all(logs.map(normalizeLog))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
 async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
@@ -736,16 +815,9 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         seconds: log.seconds || config.videoSeconds || "",
         status: log.status || "success",
         task: log.task,
+        agentTaskId: log.agentTaskId,
         video,
         error: log.error,
-    };
-}
-
-function serializeLog(log: GenerationLog): GenerationLog {
-    return {
-        ...log,
-        references: log.references.map((item) => ({ ...item, dataUrl: item.storageKey ? "" : item.dataUrl })),
-        video: log.video?.storageKey ? { ...log.video, url: "" } : log.video,
     };
 }
 
@@ -856,8 +928,4 @@ function normalizeVideoSize(value: string) {
 
 function normalizeResolution(value: string) {
     return normalizeVideoResolutionValue(value);
-}
-
-function delay(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,15 +1,13 @@
 import { useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { App, Button } from "antd";
+import { Alert, App, Button, Progress } from "antd";
 import { Download, FileUp, Plus } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { readZip } from "@/lib/zip";
-import { importPackageFiles, remapPackageResources } from "@/services/package-import";
 import { CanvasDeleteProjectsDialog } from "@/components/canvas/canvas-delete-projects-dialog";
 import { CanvasProjectCard } from "@/components/canvas/canvas-project-card";
-import type { CanvasExportFile } from "@/types/canvas-export";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useCanvasImportStore } from "@/stores/canvas/use-canvas-import-store";
 import { useCanvasUiStore } from "@/stores/canvas/use-canvas-ui-store";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
 
@@ -23,7 +21,10 @@ export default function CanvasPage() {
     const hydrated = useCanvasStore((state) => state.hydrated);
     const projects = useCanvasStore((state) => state.projects);
     const createProject = useCanvasStore((state) => state.createProject);
-    const importProject = useCanvasStore((state) => state.importProject);
+    const canvasImport = useCanvasImportStore();
+    const importLocked = ["working", "saving", "save-error"].includes(canvasImport.status);
+    const phaseLabels = { reading: "assetImport.reading", validating: "canvasImport.validating", uploading: "assetImport.uploading" };
+    const importLabel = canvasImport.status === "working" ? phaseLabels[canvasImport.progress?.phase || "reading"] : canvasImport.status === "save-error" ? "canvasImport.saveError" : canvasImport.status === "error" ? "canvas.importFailed" : `canvasImport.${canvasImport.status}`;
     const selectedIds = useCanvasUiStore((state) => state.selectedProjectIds);
     const setDeleteIds = useCanvasUiStore((state) => state.setDeleteProjectIds);
 
@@ -32,28 +33,6 @@ export default function CanvasPage() {
         navigate(`/canvas/${id}`);
     };
     const createAndEnter = () => enterProject(createProject(t("canvas.defaultTitle", { count: projects.length + 1 })));
-    const importCanvas = async (file?: File) => {
-        if (!file) return;
-        try {
-            const zip = await readZip(file);
-            const projectFile = zip.get("projects.json");
-            if (!projectFile) throw new Error("missing projects.json");
-            const data = JSON.parse(await projectFile.text()) as CanvasExportFile;
-            if (data.app !== "infinite-canvas" || data.version !== 3 || !Array.isArray(data.projects)) throw new Error("不支持的画布文件");
-            const mapping = await importPackageFiles(
-                data.projects.flatMap((project) => project.files),
-                zip,
-            );
-            const projects = data.projects.map((item) => remapPackageResources(item.project, mapping));
-            projects.forEach(importProject);
-            message.success(t("canvas.imported", { count: data.projects.length }));
-        } catch {
-            message.error(t("canvas.importFailed"));
-        } finally {
-            if (inputRef.current) inputRef.current.value = "";
-        }
-    };
-
     useEffect(() => {
         if (!hydrated || autoOpenRef.current || (mode !== "new" && mode !== "recent")) return;
         autoOpenRef.current = true;
@@ -69,6 +48,7 @@ export default function CanvasPage() {
                     <div>
                         <p className="text-xs text-stone-500">{t("canvas.library")}</p>
                         <h1 className="mt-3 text-3xl font-semibold">{t("canvas.title")}</h1>
+                        <p className="mt-2 max-w-xl text-sm text-muted-foreground">{t("browserStorage.localDataHint")}</p>
                     </div>
                     <div className="flex items-center gap-2">
                         {selectedIds.length ? (
@@ -80,7 +60,7 @@ export default function CanvasPage() {
                                         void exportCanvasProjects(
                                             projects.filter((project) => selectedIds.includes(project.id)),
                                             `${t("canvas.title")}-${selectedIds.length}`,
-                                        )
+                                        ).catch((error) => message.error(error instanceof Error ? error.message : t("canvas.sidePanel.exportFailed")))
                                     }
                                 >
                                     {t("canvas.exportSelected")}
@@ -95,7 +75,7 @@ export default function CanvasPage() {
                                 {t("canvas.deleteAll")}
                             </Button>
                         ) : null}
-                        <Button disabled={!hydrated} icon={<FileUp className="size-4" />} onClick={() => inputRef.current?.click()}>
+                        <Button disabled={!hydrated || importLocked} icon={<FileUp className="size-4" />} onClick={() => inputRef.current?.click()}>
                             {t("canvas.import")}
                         </Button>
                         <Button disabled={!hydrated} type="primary" icon={<Plus className="size-4" />} onClick={createAndEnter}>
@@ -103,6 +83,21 @@ export default function CanvasPage() {
                         </Button>
                     </div>
                 </header>
+
+                {canvasImport.status !== "idle" ? (
+                    <Alert showIcon type={canvasImport.status === "saved" ? "success" : canvasImport.status === "error" || canvasImport.status === "save-error" ? "error" : "info"} title={<span className="break-words">{t(importLabel)} · {canvasImport.fileName}</span>} description={
+                        <div className="space-y-2" role="status">
+                            {canvasImport.status === "working" && canvasImport.progress ? <>
+                                {canvasImport.progress.total > 0 ? <div><div>{t("assetImport.progress", { completed: canvasImport.progress.completed, total: canvasImport.progress.total })}</div><Progress percent={Math.round(canvasImport.progress.completed / canvasImport.progress.total * 100)} showInfo={false} size="small" aria-label={t(phaseLabels[canvasImport.progress.phase])} /></div> : null}
+                                {canvasImport.progress.item ? <p className="break-words">{canvasImport.progress.item}</p> : null}
+                            </> : null}
+                            {canvasImport.status === "saving" ? <p>{t("canvasImport.savingHint", { count: canvasImport.projectIds.length })}</p> : null}
+                            {canvasImport.status === "saved" ? <p>{t("canvas.imported", { count: canvasImport.projectIds.length })}</p> : null}
+                            {canvasImport.error ? <p className="whitespace-pre-wrap break-words">{canvasImport.error}</p> : null}
+                            {canvasImport.status === "save-error" ? <><p>{t("canvasImport.saveErrorHint")}</p><Button onClick={() => void canvasImport.retrySave()}>{t("assetImport.retrySave")}</Button></> : null}
+                        </div>
+                    } />
+                ) : null}
 
                 {!hydrated ? (
                     <section className="flex min-h-[360px] items-center justify-center border-y border-stone-200 text-sm text-stone-500 dark:border-stone-800">{t("canvas.loading")}</section>
@@ -123,7 +118,11 @@ export default function CanvasPage() {
                 )}
             </div>
 
-            <input ref={inputRef} type="file" accept="application/zip,.zip" className="hidden" onChange={(event) => void importCanvas(event.target.files?.[0])} />
+            <input ref={inputRef} type="file" accept="application/zip,.zip" className="hidden" disabled={importLocked || !hydrated} onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file) void canvasImport.startImport(file);
+            }} />
             <CanvasDeleteProjectsDialog />
         </main>
     );

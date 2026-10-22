@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { focusViewportForNode } from "../src/lib/canvas/canvas-node-geometry";
+import { focusViewportForNode, focusViewportForNodes } from "../src/lib/canvas/canvas-node-geometry";
 
 // Mirrors the canvas transform: screen = viewport.offset + world * viewport.k, origin at top-left.
 function projectPoint(world: { x: number; y: number }, viewport: { x: number; y: number; k: number }) {
@@ -57,4 +57,27 @@ test("keeps the panel clear of the bottom dock, leaving a smaller gap below it",
     const usableBottom = size.height - bottomInset;
     expect(bottom).toBeLessThanOrEqual(usableBottom);
     expect(usableBottom - bottom).toBeCloseTo(top / 3, 6);
+});
+
+test("focuses all batch nodes together without depending on their order or aspect ratios", () => {
+    const nodes = [
+        { position: { x: -400, y: -100 }, width: 300, height: 500 },
+        { position: { x: 800, y: 350 }, width: 600, height: 200 },
+    ];
+    const size = { width: 1000, height: 800 };
+    const viewport = focusViewportForNodes(nodes, size)!;
+    expect(viewport).toEqual(focusViewportForNodes([...nodes].reverse(), size)!);
+    const center = projectPoint({ x: 500, y: 225 }, viewport);
+    expect(center.x).toBeCloseTo(size.width / 2, 6);
+    expect(center.y).toBeCloseTo(size.height / 2, 6);
+    for (const node of nodes) {
+        const topLeft = projectPoint(node.position, viewport);
+        const bottomRight = projectPoint({ x: node.position.x + node.width, y: node.position.y + node.height }, viewport);
+        expect(topLeft.x).toBeGreaterThanOrEqual(0);
+        expect(topLeft.y).toBeGreaterThanOrEqual(0);
+        expect(bottomRight.x).toBeLessThanOrEqual(size.width);
+        expect(bottomRight.y).toBeLessThanOrEqual(size.height);
+    }
+    expect(focusViewportForNodes([nodes[0]], size)).toEqual(focusViewportForNode(nodes[0], size));
+    expect(focusViewportForNodes([], size)).toBeNull();
 });

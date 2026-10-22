@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -9,9 +9,10 @@ import { publicMediaResponse, type Fetcher } from "../src/gateway.ts";
 import { SESSION_COOKIE, TRANSACTION_COOKIE } from "../src/security.ts";
 import type { CanvasStorage } from "../src/storage.ts";
 
-const fixtures: { storage: CanvasStorage; directory: string }[] = [];
-afterEach(() => {
+const fixtures: { storage: CanvasStorage; directory: string; revokePending: () => Promise<void> }[] = [];
+afterEach(async () => {
     for (const fixture of fixtures.splice(0)) {
+        await fixture.revokePending();
         fixture.storage.close();
         const resolved = realpathSync(fixture.directory);
         if (dirname(resolved) !== realpathSync(tmpdir()) || !basename(resolved).startsWith("canvas-server-test-")) throw new Error("Refusing to delete an unexpected test directory");
@@ -19,16 +20,19 @@ afterEach(() => {
     }
 });
 
-function setup() {
+type Intercept = (path: string, init?: RequestInit) => Response | undefined | Promise<Response | undefined>;
+function setup(options: { publicMedia?: typeof publicMediaResponse } = {}) {
     const directory = mkdtempSync(join(tmpdir(), "canvas-server-test-"));
     const config: ServerConfig = { origin: "https://canvas.example", gatewayUrl: "http://new-api.internal", gatewayPublicUrl: "https://gateway.example", clientId: "infinite-canvas", clientSecret: "test-client-secret", encryptionKey: randomBytes(32).toString("base64"), dataDir: directory };
     let currentTime = 1_800_000_000;
     const calls: { path: string; url: string; init?: RequestInit; json?: Record<string, unknown> }[] = [];
     const grants = new Map<string, { active: boolean; reason?: string; user: { id: number; subject: string; username: string; display_name: string }; expires_at: number }>();
     const subjects = new Map<number, string>();
+    const taskOwners = new Map<string, string>();
     let paidFailure = false;
     let introspectionStatus = 200;
     let failStream = false;
+    let intercept: Intercept | undefined;
     const resourceCalls: string[] = [];
     const auditEvents: SecurityAuditEvent[] = [];
     const resource = async (source: string, content: "media" | "json") => {
@@ -39,6 +43,18 @@ function setup() {
         const path = new URL(String(input)).pathname;
         const json = typeof init?.body === "string" && path.includes("/integrations/") ? JSON.parse(init.body) : undefined;
         calls.push({ path, url: String(input), init, json });
+        const requestHeaders = new Headers(init?.headers);
+        const taskGrant = grants.get(requestHeaders.get("X-Infinite-Canvas-Grant") || (requestHeaders.get("Authorization") || "").replace(/^Bearer ic_server-key-/, ""));
+        const requestedTask = /^\/v1\/videos\/([^/]+)(?:\/content)?$/.exec(path)?.[1] || /^\/api\/integrations\/canvas\/history\/(?:images|media)\/([^/]+)/.exec(path)?.[1];
+        // Model the existing New API owner check, which is authoritative after
+        // Canvas stops keeping its own generation table.
+        if (requestedTask && (!taskGrant?.active || taskOwners.get(requestedTask) !== taskGrant.user.subject)) return new Response(null, { status: 404 });
+        if (init?.method === "POST" && taskGrant) {
+            if (path.endsWith("/images/generations_async")) taskOwners.set("asyncimg_123", taskGrant.user.subject);
+            if (path === "/v1/videos") taskOwners.set("video_123", taskGrant.user.subject);
+        }
+        const intercepted = await intercept?.(path, init);
+        if (intercepted) return intercepted;
         if (path.endsWith("/exchange")) {
             const id = Number(String(json?.code).split("-")[1]);
             const grantId = `grant-${calls.length}`;
@@ -66,8 +82,8 @@ function setup() {
         if (path === "/v1/responses") return new Response(failStream ? "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n" : "event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n", { headers: { "Content-Type": "text/event-stream" } });
         return Response.json({ data: [{ b64_json: "aW1hZ2U=" }] });
     };
-    const service = createApp(config, { fetch: transport, publicResource: resource, audit: (event) => { auditEvents.push(event); }, now: () => currentTime });
-    const fixture = { ...service, directory, config, grants, subjects, calls, transport, resourceCalls, auditEvents, clock: () => currentTime, time: (seconds: number) => { currentTime += seconds; }, failPaid: () => { paidFailure = true; }, failStream: () => { failStream = true; }, introspectStatus: (status: number) => { introspectionStatus = status; } };
+    const service = createApp(config, { fetch: transport, publicResource: resource, publicMedia: options.publicMedia, audit: (event) => { auditEvents.push(event); }, now: () => currentTime });
+    const fixture = { ...service, directory, config, grants, subjects, calls, transport, resourceCalls, auditEvents, clock: () => currentTime, time: (seconds: number) => { currentTime += seconds; }, failPaid: () => { paidFailure = true; }, failStream: () => { failStream = true; }, introspectStatus: (status: number) => { introspectionStatus = status; }, intercept: (handler: Intercept) => { intercept = handler; } };
     fixtures.push(fixture);
     return fixture;
 }
@@ -136,22 +152,22 @@ describe("Canvas authorization and owner isolation", () => {
         expect(f.calls.filter((call) => call.path.endsWith("exchange"))).toHaveLength(0);
     });
 
-    test("enforces origin and CSRF and uses revision CAS without crossing owners", async () => {
+    test("disables all document and generation persistence APIs while retaining origin and CSRF checks", async () => {
         const f = setup();
         const a = await login(f, 1);
-        const b = await login(f, 2);
         const url = `${f.config.origin}/api/data/canvas`;
-        const body = JSON.stringify({ value: { projects: ["A private project"] }, revision: 0 });
+        const body = JSON.stringify({ value: { projects: ["browser-only project"] }, revision: 0 });
         expect((await f.app.request(url, { method: "PUT", body, headers: { Cookie: a.cookie, Origin: f.config.origin, "Content-Type": "application/json" } })).status).toBe(403);
         expect((await f.app.request(url, { method: "PUT", body, headers: { ...headers(f, a), Origin: "https://sibling.example" } })).status).toBe(403);
-        const saved = await f.app.request(url, { method: "PUT", body, headers: headers(f, a) });
-        expect(saved.status).toBe(200);
-        expect((await saved.json()).revision).toBe(1);
-        expect((await f.app.request(url, { method: "PUT", body, headers: headers(f, a) })).status).toBe(409);
-        const other = await f.app.request(url, { headers: { Cookie: b.cookie } });
-        expect(await other.json()).toEqual({ value: null, revision: 0 });
+        for (const [method, path] of [["GET", "/api/data/canvas"], ["PUT", "/api/data/assets"], ["GET", "/api/generations"], ["POST", "/api/generations"], ["GET", "/api/generations/old-id"], ["PUT", "/api/generations/old-id"], ["DELETE", "/api/generations/old-id"], ["POST", "/api/generations/old-id/recover"]]) {
+            const response = await f.app.request(`${f.config.origin}${path}`, { method, headers: headers(f, a), ...(["POST", "PUT"].includes(method) ? { body } : {}) });
+            expect(response.status).toBe(404);
+        }
         expect((await f.app.request(url)).status).toBe(401);
         expect((await f.app.request(url, { headers: { Cookie: a.cookie, "Sec-Fetch-Site": "same-site" } })).status).toBe(403);
+        expect(f.storage.db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()).toEqual([
+            { name: "login_transactions" }, { name: "pending_revocations" }, { name: "sessions" }, { name: "users" },
+        ]);
     });
 
     test("checks live grants on data reads and terminates logout, idle and absolute sessions", async () => {
@@ -176,27 +192,37 @@ describe("Canvas authorization and owner isolation", () => {
         expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: absolute.cookie, "X-Canvas-Activity": "1" } })).status).toBe(401);
     });
 
-    test("keeps files private, allocates opaque identifiers and handles byte ranges", async () => {
+    test("rejects file uploads and legacy file access without creating a media directory", async () => {
         const f = setup();
         const a = await login(f, 1);
-        const b = await login(f, 2);
         const form = new FormData();
-        form.set("file", new File(["private-image"], "../../dangerous.svg", { type: "image/svg+xml" }));
+        form.set("file", new File(["browser-only-image"], "image.png", { type: "image/png" }));
         form.set("kind", "image");
         const uploadHeaders = headers(f, a);
         delete uploadHeaders["Content-Type"];
-        const upload = await f.app.request(`${f.config.origin}/api/files`, { method: "POST", headers: uploadHeaders, body: form });
-        expect(upload.status).toBe(201);
-        const file = await upload.json() as { id: string; url: string; storageKey: string };
-        expect(file.id).toMatch(/^[a-f\d-]+$/);
-        const read = await f.app.request(`${f.config.origin}${file.url}`, { headers: { Cookie: a.cookie, Range: "bytes=0-6" } });
-        expect(read.status).toBe(206);
-        expect(await read.text()).toBe("private");
-        expect(read.headers.get("content-disposition")).toBe("attachment");
-        expect(read.headers.get("content-security-policy")).toContain("sandbox");
-        expect((await f.app.request(`${f.config.origin}${file.url}`, { headers: { Cookie: b.cookie } })).status).toBe(404);
-        expect((await f.app.request(`${f.config.origin}${file.url}`, { method: "DELETE", headers: headers(f, b) })).status).toBe(404);
-        expect((await f.app.request(`${f.config.origin}${file.url}`)).status).toBe(401);
+        expect((await f.app.request(`${f.config.origin}/api/files`, { method: "POST", headers: uploadHeaders, body: form })).status).toBe(404);
+        expect((await f.app.request(`${f.config.origin}/api/files`, { headers: { Cookie: a.cookie } })).status).toBe(404);
+        for (const method of ["GET", "HEAD", "DELETE"]) {
+            expect((await f.app.request(`${f.config.origin}/api/files/image%3Aold-id`, { method, headers: headers(f, a) })).status).toBe(404);
+        }
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
+        expect(readdirSync(f.directory).every((name) => /^canvas\.sqlite(?:-wal|-shm)?$/.test(name))).toBe(true);
+    });
+
+    test("does not migrate or remove legacy user data when opening an existing authorization database", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        mkdirSync(join(f.directory, "files"));
+        writeFileSync(join(f.directory, "files", "legacy-image"), "old bytes untouched");
+        f.storage.db.exec("CREATE TABLE documents(owner TEXT, domain TEXT, value TEXT, revision INTEGER)");
+        f.storage.db.query("INSERT INTO documents VALUES (?,?,?,?)").run("legacy-owner", "canvas", "old document untouched", 1);
+        await f.revokePending();
+        f.storage.close();
+        Object.assign(f, createApp(f.config, { fetch: f.transport, audit: (event) => { f.auditEvents.push(event); }, now: f.clock }));
+        expect(readFileSync(join(f.directory, "files", "legacy-image"), "utf8")).toBe("old bytes untouched");
+        expect(f.storage.db.query("SELECT value FROM documents").all()).toEqual([{ value: "old document untouched" }]);
+        expect((await f.app.request(`${f.config.origin}/api/data/canvas`, { headers: { Cookie: a.cookie } })).status).toBe(404);
+        expect((await f.app.request(`${f.config.origin}/api/files/legacy-image`, { headers: { Cookie: a.cookie } })).status).toBe(404);
     });
 
     test("keeps AI credentials server-side, checks models, streams SSE and rejects arbitrary paths", async () => {
@@ -209,8 +235,7 @@ describe("Canvas authorization and owner isolation", () => {
         expect(stream.status).toBe(200);
         expect(stream.headers.get("content-type")).toBe("text/event-stream");
         expect(await stream.text()).toContain("hello");
-        const records = await (await f.app.request(`${f.config.origin}/api/generations`, { headers: { Cookie: a.cookie } })).json();
-        expect(records.records[0].status).toBe("succeeded");
+        expect(stream.headers.get("X-Canvas-Generation-Id")).toBeNull();
         const relayed = f.calls.find((call) => call.path === "/v1/responses")!;
         const forwarded = new Headers(relayed.init?.headers);
         expect(forwarded.get("Authorization")).toStartWith("Bearer ic_server-key");
@@ -226,20 +251,21 @@ describe("Canvas authorization and owner isolation", () => {
         expect(f.calls.find((call) => call.path.includes("streamGenerateContent"))?.url).toBe("http://new-api.internal/v1beta/models/allowed-gemini:streamGenerateContent?alt=sse");
     });
 
-    test("persists async ownership and records unknown execution without automatically charging twice", async () => {
+    test("forwards original task IDs through New API ownership checks and never retries unknown paid execution", async () => {
         const f = setup();
         const a = await login(f, 1);
         const b = await login(f, 2);
         const create = await f.app.request(`${f.config.origin}/api/ai/v1/videos`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-video", prompt: "video" }) });
         expect(create.status).toBe(202);
+        expect(await create.json()).toEqual({ id: "video_123", status: "queued" });
         expect((await f.app.request(`${f.config.origin}/api/ai/v1/videos/video_123`, { headers: { Cookie: a.cookie } })).status).toBe(200);
         expect((await f.app.request(`${f.config.origin}/api/ai/v1/videos/video_123`, { headers: { Cookie: b.cookie } })).status).toBe(404);
         f.failPaid();
         const failed = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-image", prompt: "image" }) });
         expect(failed.status).toBe(502);
         expect(f.calls.filter((call) => call.path === "/v1/images/generations")).toHaveLength(1);
-        const rows = f.storage.db.query("SELECT status FROM generations WHERE kind = 'image'").all();
-        expect(rows).toEqual([{ status: "execution_unknown" }]);
+        expect((await failed.json()).error.code).toBe("EXECUTION_UNKNOWN");
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
     });
 
     test("rejects loopback, link-local and IPv4-mapped private result addresses", async () => {
@@ -264,19 +290,20 @@ describe("Canvas authorization and owner isolation", () => {
         expect(new Uint8Array(await (decoded.get("image[]") as File).arrayBuffer())).toEqual(new Uint8Array([0, 1, 2, 255]));
     });
 
-    test("fails closed during authorization outages and keeps private state across a database reopen", async () => {
+    test("fails closed during authorization outages and keeps only authorization state across reopen", async () => {
         const f = setup();
         const a = await login(f, 1);
-        const put = await f.app.request(`${f.config.origin}/api/data/canvas`, { method: "PUT", headers: headers(f, a), body: JSON.stringify({ revision: 0, value: { projects: ["persistent"] } }) });
-        expect(put.status).toBe(200);
         f.introspectStatus(503);
-        expect((await f.app.request(`${f.config.origin}/api/data/canvas`, { headers: { Cookie: a.cookie } })).status).toBe(503);
+        expect((await f.app.request(`${f.config.origin}/api/models`, { headers: { Cookie: a.cookie } })).status).toBe(503);
         f.introspectStatus(200);
+        await f.revokePending();
         f.storage.close();
         Object.assign(f, createApp(f.config, { fetch: f.transport, audit: (event) => { f.auditEvents.push(event); }, now: f.clock }));
-        const restored = await f.app.request(`${f.config.origin}/api/data/canvas`, { headers: { Cookie: a.cookie } });
+        const restored = await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie } });
         expect(restored.status).toBe(200);
-        expect(await restored.json()).toEqual({ value: { projects: ["persistent"] }, revision: 1 });
+        expect((await restored.json()).csrf_token).toBe(a.csrf);
+        expect((await f.app.request(`${f.config.origin}/api/data/canvas`, { headers: { Cookie: a.cookie } })).status).toBe(404);
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
     });
 
     test("serves historical async media only through the current grant after a new authorization", async () => {
@@ -285,6 +312,9 @@ describe("Canvas authorization and owner isolation", () => {
         const accepted = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations_async`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-image" }) });
         expect(accepted.status).toBe(202);
         expect((await accepted.json()).query_url).toBe("/api/ai/v1/images/tasks_async/asyncimg_123");
+        await f.revokePending();
+        f.storage.close();
+        Object.assign(f, createApp(f.config, { fetch: f.transport, audit: (event) => { f.auditEvents.push(event); }, now: f.clock }));
         await f.app.request(`${f.config.origin}/api/logout`, { method: "POST", headers: headers(f, a) });
         const renewed = await login(f, 1);
         const history = await f.app.request(`${f.config.origin}/api/ai/v1/images/tasks_async/asyncimg_123`, { headers: { Cookie: renewed.cookie } });
@@ -302,14 +332,13 @@ describe("Canvas authorization and owner isolation", () => {
         expect((await f.app.request(`${f.config.origin}/api/ai/v1/images/tasks_async/asyncimg_123/content/0`, { headers: { Cookie: b.cookie } })).status).toBe(404);
     });
 
-    test("records an upstream SSE error as failed while retaining the original stream", async () => {
+    test("retains upstream SSE terminal errors without recording or retrying them", async () => {
         const f = setup();
         const a = await login(f, 1);
         f.failStream();
         const stream = await f.app.request(`${f.config.origin}/api/ai/v1/responses`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-text", input: "hello" }) });
         expect(await stream.text()).toContain("response.failed");
-        const rows = await (await f.app.request(`${f.config.origin}/api/generations`, { headers: { Cookie: a.cookie } })).json();
-        expect(rows.records[0].status).toBe("failed");
+        expect(stream.headers.get("X-Canvas-Generation-Id")).toBeNull();
         expect(f.calls.filter((call) => call.path === "/v1/responses")).toHaveLength(1);
     });
 
@@ -332,20 +361,20 @@ describe("Canvas authorization and owner isolation", () => {
         expect(image.headers.get("location")).toBeNull();
         expect(image.headers.get("content-security-policy")).toContain("sandbox");
         await f.app.request(`${f.config.origin}${entries[0].coverUrl}`, { headers: { Cookie: a.cookie } });
-        expect(f.resourceCalls).toHaveLength(2);
+        expect(f.resourceCalls).toHaveLength(3);
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
     });
 
-    test("never assigns an old owner's canvas to a recreated account with the same numeric ID", async () => {
+    test("never assigns old media capabilities to a recreated account with the same numeric ID", async () => {
         const f = setup();
         const old = await login(f, 1);
-        await f.app.request(`${f.config.origin}/api/data/canvas`, { method: "PUT", headers: headers(f, old), body: JSON.stringify({ value: { projects: ["old account secret"] }, revision: 0 }) });
+        const catalog = await (await f.app.request(`${f.config.origin}/api/prompt-catalog/awesome-gpt-image`, { headers: { Cookie: old.cookie } })).json();
         const nextSubject = `ics_${randomBytes(16).toString("hex")}`;
         f.subjects.set(1, nextSubject);
         for (const grant of f.grants.values()) if (grant.user.id === 1) grant.user.subject = nextSubject;
         const recreated = await login(f, 1);
-        const result = await f.app.request(`${f.config.origin}/api/data/canvas`, { headers: { Cookie: recreated.cookie } });
-        expect(await result.json()).toEqual({ value: null, revision: 0 });
-        expect((await f.app.request(`${f.config.origin}/api/data/canvas`, { headers: { Cookie: old.cookie } })).status).toBe(401);
+        expect((await f.app.request(`${f.config.origin}${catalog[0].coverUrl}`, { headers: { Cookie: recreated.cookie } })).status).toBe(404);
+        expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: old.cookie } })).status).toBe(401);
     });
 
     test("does not let a late old-session failure delete a newer browser cookie", async () => {
@@ -367,5 +396,256 @@ describe("Canvas authorization and owner isolation", () => {
         expect(late.headers.getSetCookie()).toEqual([]);
         expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: b.cookie } })).status).toBe(200);
         expect((await f.app.request(`${f.config.origin}/api/logout`, { method: "POST", headers: { ...headers(f, a), Cookie: b.cookie } })).status).toBe(403);
+    });
+
+    test("logs out locally during gateway outages while enforcing CSRF and draining revocations once", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        const b = await login(f, 2);
+        const revocation = Promise.withResolvers<Response>();
+        f.introspectStatus(503);
+        f.intercept((path) => path.endsWith("/revoke") ? revocation.promise : undefined);
+        try {
+            const endpoint = `${f.config.origin}/api/logout`;
+            expect((await f.app.request(endpoint, { method: "POST", headers: { ...headers(f, a), "X-CSRF-Token": "wrong" } })).status).toBe(403);
+            expect((await f.app.request(endpoint, { method: "POST", headers: { ...headers(f, a), Origin: "https://evil.example" } })).status).toBe(403);
+            const introspections = f.calls.filter((call) => call.path.endsWith("/introspect")).length;
+            const logout = await f.app.request(endpoint, { method: "POST", headers: headers(f, a) });
+            expect(logout.status).toBe(204);
+            expect(logout.headers.getSetCookie().join(";")).toContain(`${SESSION_COOKIE}=`);
+            expect(logout.headers.getSetCookie().join(";")).toContain("Max-Age=0");
+            expect(f.calls.filter((call) => call.path.endsWith("/introspect"))).toHaveLength(introspections);
+            expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie } })).status).toBe(401);
+            expect(f.storage.db.query("SELECT grant_id FROM pending_revocations").all()).toHaveLength(1);
+            f.introspectStatus(200);
+            expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: b.cookie } })).status).toBe(200);
+            expect((await f.app.request(`${f.config.origin}/auth/start`)).status).toBe(303);
+            expect(f.calls.filter((call) => call.path.endsWith("/revoke"))).toHaveLength(1);
+            revocation.resolve(new Response(null, { status: 204 }));
+            await f.revokePending();
+            expect(f.storage.db.query("SELECT grant_id FROM pending_revocations").all()).toHaveLength(0);
+        } finally {
+            revocation.resolve(new Response(null, { status: 204 }));
+        }
+    });
+
+    test.each([false, true])("drains a concurrent logout without retrying the first grant in the same run (first fails: %s)", async (failFirst) => {
+        const f = setup();
+        const a = await login(f, 1);
+        const b = await login(f, 2);
+        const [firstGrant, secondGrant] = [...f.grants.keys()];
+        await f.revokePending();
+        const started = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        let first = true;
+        f.intercept(async (path, init) => {
+            if (!path.endsWith("/revoke") || JSON.parse(String(init?.body)).grant_id !== firstGrant || !first) return;
+            first = false;
+            started.resolve();
+            await release.promise;
+            if (failFirst) return new Response(null, { status: 503 });
+        });
+        try {
+            const endpoint = `${f.config.origin}/api/logout`;
+            expect((await f.app.request(endpoint, { method: "POST", headers: headers(f, a) })).status).toBe(204);
+            await started.promise;
+            const draining = f.revokePending();
+            const second = await f.app.request(endpoint, { method: "POST", headers: headers(f, b) });
+            expect(second.status).toBe(204);
+            expect(second.headers.getSetCookie().join(";")).toContain("Max-Age=0");
+            for (const session of [a, b]) expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: session.cookie } })).status).toBe(401);
+            expect(f.storage.db.query("SELECT hash FROM sessions").all()).toHaveLength(0);
+            expect(f.calls.filter((call) => call.path.endsWith("/revoke")).map((call) => call.json?.grant_id)).toEqual([firstGrant]);
+            release.resolve();
+            await draining;
+            expect(f.calls.filter((call) => call.path.endsWith("/revoke")).map((call) => call.json?.grant_id)).toEqual([firstGrant, secondGrant]);
+            expect(f.grants.get(secondGrant)?.active).toBe(false);
+            expect(f.storage.db.query("SELECT grant_id FROM pending_revocations").all()).toEqual(failFirst ? [{ grant_id: firstGrant }] : []);
+            if (failFirst) {
+                await f.revokePending();
+                expect(f.calls.filter((call) => call.path.endsWith("/revoke")).map((call) => call.json?.grant_id)).toEqual([firstGrant, secondGrant, firstGrant]);
+                expect(f.grants.get(firstGrant)?.active).toBe(false);
+                expect(f.storage.db.query("SELECT grant_id FROM pending_revocations").all()).toEqual([]);
+            }
+        } finally {
+            release.resolve();
+        }
+    });
+
+    test("a grant queued as an empty drain ends starts another drain", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        await f.revokePending();
+        const session = f.storage.db.query("SELECT * FROM sessions").get() as NonNullable<ReturnType<CanvasStorage["session"]>>;
+        const ending = f.revokePending();
+        const next = Promise.resolve().then(() => {
+            f.storage.retire(session);
+            return f.revokePending();
+        });
+        await Promise.all([ending, next]);
+        expect(f.calls.filter((call) => call.path.endsWith("/revoke")).map((call) => call.json?.grant_id)).toEqual([session.grant_id]);
+        expect(f.grants.get(session.grant_id)?.active).toBe(false);
+        expect(f.storage.db.query("SELECT grant_id FROM pending_revocations").all()).toEqual([]);
+        expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie } })).status).toBe(401);
+    });
+
+    test("late passive introspection cannot roll back activity or recreate a logged-out session", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        f.time(SESSION_IDLE_SECONDS - 10);
+        let delayed = Promise.withResolvers<Response>();
+        let started = Promise.withResolvers<void>();
+        f.intercept((path, init) => {
+            if (!path.endsWith("/introspect") || JSON.parse(String(init?.body)).activity) return;
+            started.resolve();
+            return delayed.promise;
+        });
+        const passive = f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie } });
+        await started.promise;
+        f.time(1);
+        const active = await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie, "X-Canvas-Activity": "1" } });
+        expect(active.status).toBe(200);
+        delayed.resolve(Response.json([...f.grants.values()][0]));
+        expect((await passive).status).toBe(200);
+        f.time(9);
+        expect((await f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie, "X-Canvas-Activity": "1" } })).status).toBe(200);
+
+        delayed = Promise.withResolvers<Response>();
+        started = Promise.withResolvers<void>();
+        const late = f.app.request(`${f.config.origin}/api/session`, { headers: { Cookie: a.cookie } });
+        await started.promise;
+        const previouslyActive = { ...[...f.grants.values()][0] };
+        expect((await f.app.request(`${f.config.origin}/api/logout`, { method: "POST", headers: headers(f, a) })).status).toBe(204);
+        delayed.resolve(Response.json(previouslyActive));
+        expect((await late).status).toBe(401);
+        expect(f.storage.db.query("SELECT hash FROM sessions").all()).toHaveLength(0);
+    });
+
+    test.each(["openai", "gemini"])("streams trusted %s result capabilities across restart without archiving or repeating generation", async (format) => {
+        const mediaCalls: string[] = [];
+        let mediaAvailable = false;
+        const media: typeof publicMediaResponse = async (source) => {
+            mediaCalls.push(source);
+            if (!mediaAvailable) throw new Error("temporary media failure");
+            return new Response("remote-image", { headers: { "Content-Type": "image/png" } });
+        };
+        const f = setup({ publicMedia: media });
+        const a = await login(f, 1);
+        const b = await login(f, 2);
+        const signedUrl = "https://images.example/private-result.png?signature=upstream-secret";
+        const path = format === "gemini" ? "/v1beta/models/allowed-gemini:generateContent" : "/v1/images/generations";
+        const payload = format === "gemini"
+            ? { candidates: [{ finishReason: "STOP", content: { parts: [{ fileData: { mimeType: "image/png", fileUri: signedUrl } }, { inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } }] } }] }
+            : { created: 123, data: [{ url: signedUrl, revised_prompt: "result prompt" }, { b64_json: "aW1hZ2U=" }] };
+        f.intercept((target) => target === path ? Response.json(payload) : undefined);
+        const response = await f.app.request(`${f.config.origin}/api/ai${path}`, { method: "POST", headers: headers(f, a), body: JSON.stringify(format === "gemini" ? { contents: [{ parts: [{ text: "browser keeps paid result" }] }] } : { model: "allowed-image", prompt: "browser keeps paid result" }) });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("X-Canvas-Generation-Id")).toBeNull();
+        const result = await response.json();
+        if (format === "gemini") {
+            expect(result.candidates[0].finishReason).toBe("STOP");
+            expect(result.candidates[0].content.parts[0].fileData.mimeType).toBe("image/png");
+            expect(result.candidates[0].content.parts[1]).toEqual({ inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } });
+        } else {
+            expect(result.created).toBe(123);
+            expect(result.data[0].revised_prompt).toBe("result prompt");
+            expect(result.data[1]).toEqual({ b64_json: "aW1hZ2U=" });
+        }
+        const resultUrl = format === "gemini" ? result.candidates[0].content.parts[0].fileData.fileUri : result.data[0].url;
+        expect(resultUrl).toMatch(/^\/api\/result-media\/[A-Za-z0-9_-]+$/);
+        expect(JSON.stringify(result)).not.toContain(signedUrl);
+        expect(mediaCalls).toEqual([]);
+        const mediaURL = `${f.config.origin}${resultUrl}`;
+        expect((await f.app.request(mediaURL, { headers: { Cookie: b.cookie } })).status).toBe(404);
+        expect((await f.app.request(mediaURL)).status).toBe(401);
+        expect((await f.app.request(`${f.config.origin}/api/result-media/forged`, { headers: { Cookie: a.cookie } })).status).toBe(404);
+        expect((await f.app.request(`${f.config.origin}/api/result-media/forged?url=https://evil.example`, { headers: { Cookie: a.cookie } })).status).toBe(404);
+        expect((await f.app.request(`${f.config.origin}${resultUrl.replace("result-media", "prompt-assets")}`, { headers: { Cookie: a.cookie } })).status).toBe(404);
+        expect((await f.app.request(mediaURL, { headers: { Cookie: a.cookie } })).status).toBe(500);
+        await f.revokePending();
+        f.storage.close();
+        Object.assign(f, createApp(f.config, { fetch: f.transport, publicMedia: media, audit: (event) => { f.auditEvents.push(event); }, now: f.clock }));
+        await f.app.request(`${f.config.origin}/api/logout`, { method: "POST", headers: headers(f, a) });
+        const renewed = await login(f, 1);
+        mediaAvailable = true;
+        const recovered = await f.app.request(mediaURL, { headers: { Cookie: renewed.cookie } });
+        expect(recovered.status).toBe(200);
+        expect(await recovered.text()).toBe("remote-image");
+        expect(recovered.headers.get("content-security-policy")).toContain("sandbox");
+        expect(mediaCalls).toEqual([signedUrl, signedUrl]);
+        expect(f.calls.filter((call) => call.path === path)).toHaveLength(1);
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
+        expect((await f.app.request(`${f.config.origin}/api/generations`, { headers: { Cookie: renewed.cookie } })).status).toBe(404);
+    });
+
+    test.each(["openai", "gemini"])("applies public-network checks when a trusted %s result capability is read", async (format) => {
+        const f = setup();
+        const a = await login(f, 1);
+        const path = format === "gemini" ? "/v1beta/models/allowed-gemini:generateContent" : "/v1/images/generations";
+        const payload = format === "gemini" ? { candidates: [{ content: { parts: [{ fileData: { fileUri: "http://127.0.0.1/private" } }] } }] } : { data: [{ url: "http://127.0.0.1/private" }] };
+        f.intercept((target) => target === path ? Response.json(payload) : undefined);
+        const generated = await f.app.request(`${f.config.origin}/api/ai${path}`, { method: "POST", headers: headers(f, a), body: JSON.stringify(format === "gemini" ? { contents: [] } : { model: "allowed-image" }) });
+        expect(generated.status).toBe(200);
+        const result = await generated.json();
+        const resultUrl = format === "gemini" ? result.candidates[0].content.parts[0].fileData.fileUri : result.data[0].url;
+        const download = await f.app.request(`${f.config.origin}${resultUrl}`, { headers: { Cookie: a.cookie } });
+        expect(download.status).toBe(502);
+        expect((await download.json()).error.code).toBe("MEDIA_URL_REJECTED");
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
+    });
+
+    test("streams video content and selected public redirects without caching either response", async () => {
+        const downloads: string[] = [];
+        const f = setup({ publicMedia: async (source) => {
+            downloads.push(source);
+            return new Response("redirected-video", { headers: { "Content-Type": "video/mp4" } });
+        } });
+        const a = await login(f, 1);
+        await f.app.request(`${f.config.origin}/api/ai/v1/videos`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-video" }) });
+        const path = `${f.config.origin}/api/ai/v1/videos/video_123/content`;
+        f.intercept((target, init) => target === "/v1/videos/video_123/content" ? new Response(init?.method === "HEAD" ? null : "part", { status: 206, headers: { "Content-Type": "video/mp4", "Content-Range": "bytes 2-5/10", "Accept-Ranges": "bytes" } }) : undefined);
+        const partial = await f.app.request(path, { headers: { Cookie: a.cookie, Range: "bytes=2-5" } });
+        expect(partial.status).toBe(206);
+        expect(partial.headers.get("Content-Range")).toBe("bytes 2-5/10");
+        expect(await partial.text()).toBe("part");
+        expect(new Headers(f.calls.findLast((call) => call.path === "/v1/videos/video_123/content")!.init?.headers).get("Range")).toBe("bytes=2-5");
+        f.intercept((target) => target === "/v1/videos/video_123/content" ? new Response(null, { status: 302, headers: { Location: "https://video.example/result.mp4" } }) : undefined);
+        const redirected = await f.app.request(path, { headers: { Cookie: a.cookie } });
+        expect(redirected.headers.get("Location")).toBeNull();
+        expect(await redirected.text()).toBe("redirected-video");
+        expect(downloads).toEqual(["https://video.example/result.mp4"]);
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
+        expect(f.calls.filter((call) => call.path === "/v1/videos")).toHaveLength(1);
+    });
+
+    test("preserves conditional media reads, async idempotency and polling metadata", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        let conditionalStatus = 304;
+        f.intercept((path) => {
+            if (path === "/v1/images/generations_async") return Response.json({ task_id: "asyncimg_123" }, { status: 202, headers: { "Retry-After": "7" } });
+            if (path.endsWith("/history/images/asyncimg_123")) return Response.json({ status: "pending" }, { headers: { "Retry-After": "9" } });
+            if (path.endsWith("/history/images/asyncimg_123/content/0") || path === "/v1/videos/video_123/content") return new Response(null, { status: conditionalStatus, headers: { "Content-Type": "image/png", ETag: '"result-version"', Location: "https://evil.example" } });
+        });
+        const accepted = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations_async`, { method: "POST", headers: { ...headers(f, a), "Idempotency-Key": "image-intent-1" }, body: JSON.stringify({ model: "allowed-image" }) });
+        expect(accepted.status).toBe(202);
+        expect(accepted.headers.get("Retry-After")).toBe("7");
+        expect(await accepted.json()).toEqual({ task_id: "asyncimg_123" });
+        const submitted = f.calls.findLast((call) => call.path === "/v1/images/generations_async")!;
+        expect(new Headers(submitted.init?.headers).get("Idempotency-Key")).toBe("image-intent-1");
+        const polled = await f.app.request(`${f.config.origin}/api/ai/v1/images/tasks_async/asyncimg_123`, { headers: { Cookie: a.cookie } });
+        expect(polled.status).toBe(200);
+        expect(polled.headers.get("Retry-After")).toBe("9");
+        expect(await polled.json()).toEqual({ status: "pending" });
+        expect((await f.app.request(`${f.config.origin}/api/ai/v1/videos`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-video" }) })).status).toBe(202);
+        for (const path of ["/api/ai/v1/images/tasks_async/asyncimg_123/content/0", "/api/ai/v1/videos/video_123/content"]) {
+            const response = await f.app.request(`${f.config.origin}${path}`, { headers: { Cookie: a.cookie, "If-None-Match": '"result-version"' } });
+            expect(response.status).toBe(304);
+            expect(response.headers.get("ETag")).toBe('"result-version"');
+            expect(response.headers.get("Location")).toBeNull();
+            expect(await response.text()).toBe("");
+        }
+        conditionalStatus = 302;
+        expect((await f.app.request(`${f.config.origin}/api/ai/v1/images/tasks_async/asyncimg_123/content/0`, { headers: { Cookie: a.cookie } })).status).toBe(502);
     });
 });

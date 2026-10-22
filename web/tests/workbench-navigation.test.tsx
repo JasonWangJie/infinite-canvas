@@ -1,0 +1,501 @@
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { App, ConfigProvider } from "antd";
+import { createMemoryRouter, RouterProvider } from "react-router-dom";
+import axios from "axios";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { browser } from "./browser";
+import { mockBrowserDocuments } from "./local-document-fixture";
+import { mockBrowserFiles } from "./local-file-fixture";
+import i18n from "@/i18n";
+import { endCanvasSession, readCanvasSession } from "@/services/api/canvas-client";
+import { getDocumentDraft, readDocument, retryDocument } from "@/services/canvas-data";
+import { readStoredImage } from "@/services/image-storage";
+import { defaultConfig, useConfigStore } from "@/stores/use-config-store";
+import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
+import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useAssetStore } from "@/stores/use-asset-store";
+import { deleteVideoGenerationLogs } from "@/pages/video/generation-log";
+
+const originalFetch = globalThis.fetch;
+const originalAdapter = axios.defaults.adapter;
+const session = { user: { id: 1, subject: `ics_${"a".repeat(32)}`, username: "alice" }, csrf_token: "csrf", session_tag: "history-session", expires_at: Math.floor(Date.now() / 1000) + 3600 };
+const config = {
+    ...defaultConfig,
+    model: "gateway::image-model", imageModel: "gateway::image-model", videoModel: "gateway::video-model",
+    channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [
+        { name: "image-model", capability: "image" as const, endpointTypes: ["image-generation"] },
+        { name: "video-model", capability: "video" as const, endpointTypes: ["openai-video"] },
+    ] }],
+};
+let documents: Record<string, { value: unknown; revision: number }>;
+let requests: { path: string; method: string }[];
+let localDocuments: ReturnType<typeof mockBrowserDocuments>;
+let localFiles: ReturnType<typeof mockBrowserFiles>;
+let root: Root | undefined;
+let container: HTMLDivElement | undefined;
+let descriptors: Map<string, PropertyDescriptor | undefined>;
+let oldMatchMedia: typeof browser.matchMedia;
+
+function log(id: string, prompt: string, status = "success") {
+    return { id, title: id, prompt, status, createdAt: id === "alpha" ? 2 : 1, time: "now", model: id === "alpha" ? "gateway::image-model" : "gateway::other-model", config, references: [], durationMs: 0, images: [], imageCount: 1, successCount: status === "success" ? 1 : 0, failCount: status === "failed" ? 1 : 0, size: "1024x1024", quality: "auto", resolution: "720", seconds: "5" };
+}
+
+beforeEach(async () => {
+    endCanvasSession();
+    localStorage.clear();
+    localDocuments = mockBrowserDocuments();
+    localFiles = mockBrowserFiles();
+    documents = {
+        "image-tasks": { value: {}, revision: 1 },
+        "image-workbench": { value: { alpha: log("alpha", "sunrise mountain"), beta: log("beta", "night river", "failed") }, revision: 1 },
+        "video-workbench": { value: { alpha: log("alpha", "slow camera"), beta: log("beta", "fast camera", "paused") }, revision: 1 },
+    };
+    requests = [];
+    const globals = {
+        HTMLAnchorElement: browser.HTMLAnchorElement, MouseEvent: browser.MouseEvent, XMLHttpRequest: browser.XMLHttpRequest, navigator: browser.navigator,
+        HTMLElement: browser.HTMLElement, Element: browser.Element, SVGElement: browser.SVGElement, ShadowRoot: browser.ShadowRoot,
+        HTMLInputElement: browser.HTMLInputElement, HTMLTextAreaElement: browser.HTMLTextAreaElement, HTMLSelectElement: browser.HTMLSelectElement,
+        DocumentFragment: browser.DocumentFragment, Event: browser.Event,
+        Node: browser.Node, MutationObserver: browser.MutationObserver, getComputedStyle: browser.getComputedStyle.bind(browser),
+        IS_REACT_ACT_ENVIRONMENT: true,
+        ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+        requestAnimationFrame: (callback: () => void) => setTimeout(callback, 0), cancelAnimationFrame: clearTimeout,
+    };
+    descriptors = new Map(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+    for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+    oldMatchMedia = browser.matchMedia;
+    browser.matchMedia = () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true, media: "", onchange: null });
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        requests.push({ path, method: init?.method || "GET" });
+        if (path === "/api/session") return Response.json(session);
+        if (path.startsWith("/api/data/")) {
+            const domain = decodeURIComponent(path.slice("/api/data/".length));
+            if (init?.method === "PUT") {
+                const body = JSON.parse(String(init.body));
+                documents[domain] = { value: body.value, revision: body.revision + 1 };
+            }
+            return Response.json(documents[domain] || { value: null, revision: 0 });
+        }
+        if (path === "/api/files" && init?.method === "POST") return Response.json({ id: "saved", storageKey: "image:saved", url: "/api/files/image%3Asaved", bytes: 5, mimeType: "image/png" });
+        if (path.startsWith("/api/files/")) return new Response("image", { headers: { "Content-Type": "image/png" } });
+        if (path === "/api/result-media/original") return new Response("image", { headers: { "Content-Type": "image/png" } });
+        throw new Error(`Unexpected request ${path}`);
+    }) as typeof fetch;
+    axios.defaults.adapter = async () => { throw new Error("History navigation must not generate"); };
+    await readCanvasSession();
+    useConfigStore.setState({ config });
+});
+
+afterEach(async () => {
+    if (root) await act(async () => root!.unmount());
+    root = undefined;
+    container?.remove();
+    container = undefined;
+    endCanvasSession();
+    localDocuments.restore();
+    localFiles.restore();
+    useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
+    useAssetStore.setState({ assets: [], hydrated: false });
+    globalThis.fetch = originalFetch;
+    axios.defaults.adapter = originalAdapter;
+    browser.matchMedia = oldMatchMedia;
+    for (const [key, descriptor] of descriptors) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else Reflect.deleteProperty(globalThis, key);
+    }
+});
+
+async function renderPage(path: string) {
+    const { default: ImagePage } = await import("@/pages/image");
+    const { default: VideoPage } = await import("@/pages/video");
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    const wrap = (page: React.ReactNode) => <QueryClientProvider client={queryClient}><ConfigProvider theme={{ token: { motion: false } }}><App message={{ duration: 0 }}>{page}</App></ConfigProvider></QueryClientProvider>;
+    const router = createMemoryRouter([{ path: "/image", element: wrap(<ImagePage />) }, { path: "/video", element: wrap(<VideoPage />) }], { initialEntries: [path] });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root!.render(<RouterProvider router={router} />));
+    return router;
+}
+
+async function click(key: string, within: ParentNode = container!) {
+    const button = [...within.querySelectorAll<HTMLButtonElement>("button")].find((element) => element.textContent?.replace(/\s/g, "") === i18n.t(key).replace(/\s/g, ""));
+    expect(button).toBeDefined();
+    await act(async () => button!.click());
+}
+
+async function selectAllResults() {
+    const label = [...container!.querySelectorAll("label")].find((element) => element.textContent?.trim() === i18n.t("resultToCanvas.selectAllResults"));
+    const checkbox = label?.querySelector<HTMLInputElement>("input");
+    expect(checkbox).toBeDefined();
+    await act(async () => checkbox!.click());
+}
+
+test("image deep links use a fresh history snapshot and never submit generation", async () => {
+    await readDocument("image-workbench");
+    documents["image-workbench"] = { value: { fresh: log("fresh", "new record from another page") }, revision: 2 };
+    await renderPage("/image?log=fresh");
+    expect(container!.querySelector("textarea")!.value).toBe("new record from another page");
+    expect(container!.querySelector('[role="alert"]')).toBeNull();
+    expect(requests.filter((request) => request.path.startsWith("/api/ai/"))).toEqual([]);
+});
+
+test("video deep links preview paused tasks without querying or resubmitting them", async () => {
+    documents["video-workbench"].value = { beta: { ...log("beta", "paused camera", "paused"), task: { id: "existing-video", provider: "openai", model: config.videoModel }, error: "temporary failure" } };
+    await renderPage("/video?log=beta");
+    expect(container!.querySelector("textarea")!.value).toBe("paused camera");
+    expect(container!.textContent).toContain("temporary failure");
+    expect(requests.filter((request) => request.path.startsWith("/api/ai/"))).toEqual([]);
+});
+
+test("image filters share desktop and drawer state, survive navigation, and clear on session end", async () => {
+    const router = await renderPage("/image");
+    await act(async () => useWorkbenchHistoryFilterStore.getState().update("image", { query: "night", status: "failed" }));
+    expect(container!.querySelector("aside")!.textContent).toContain("beta");
+    expect(container!.querySelector("aside")!.textContent).not.toContain("alpha");
+    await click("workbench.logs");
+    const searches = document.querySelectorAll<HTMLInputElement>(`input[aria-label="${i18n.t("workbench.historySearch")}"]`);
+    expect(searches.length).toBe(2);
+    expect([...searches].map((input) => input.value)).toEqual(["night", "night"]);
+    await act(async () => router.navigate("/video"));
+    await act(async () => router.navigate("/image"));
+    expect(container!.querySelector<HTMLInputElement>(`input[aria-label="${i18n.t("workbench.historySearch")}"]`)!.value).toBe("night");
+    await click("workbench.historyClearFilters", container!.querySelector("aside")!);
+    expect(container!.querySelector("aside")!.textContent).toContain("alpha");
+    await act(async () => useWorkbenchHistoryFilterStore.getState().update("image", { query: "secret search" }));
+    await act(async () => endCanvasSession());
+    expect(useWorkbenchHistoryFilterStore.getState().image.query).toBe("");
+});
+
+test("filtering clears hidden selection and deleting visible history preserves shared files", async () => {
+    const beta = { ...log("beta", "night river", "failed"), images: [{ id: "shared", storageKey: "image:shared", dataUrl: "", width: 1, height: 1, bytes: 4, durationMs: 0 }] };
+    documents["image-workbench"].value = { alpha: log("alpha", "sunrise mountain"), beta };
+    await renderPage("/image");
+    const aside = container!.querySelector("aside")!;
+    await click("workbench.selectAll", aside);
+    await act(async () => useWorkbenchHistoryFilterStore.getState().update("image", { query: "night" }));
+    expect(aside.textContent).toContain(i18n.t("workbench.historySelectedCount", { count: 1 }));
+    await click("common.delete", aside);
+    await click("common.delete", document.querySelector('[role="dialog"]')!);
+    expect(Object.keys(documents["image-workbench"].value as object)).toEqual(["alpha"]);
+    expect(requests.filter((request) => request.method === "PUT" && request.path === "/api/data/image-workbench")).toHaveLength(1);
+    expect(requests.filter((request) => request.method === "DELETE")).toEqual([]);
+});
+
+test("model search, no-match feedback and unavailable links preserve the current preview", async () => {
+    const router = await renderPage("/video?log=alpha");
+    await act(async () => useWorkbenchHistoryFilterStore.getState().update("video", { query: "other-model" }));
+    expect(container!.querySelector("aside")!.textContent).toContain("beta");
+    expect(container!.querySelector("aside")!.textContent).not.toContain("alpha");
+    await act(async () => useWorkbenchHistoryFilterStore.getState().update("video", { query: "not present" }));
+    expect(container!.textContent).toContain(i18n.t("workbench.historyNoMatches"));
+    await act(async () => router.navigate("/video?log=deleted"));
+    expect(container!.querySelector("textarea")!.value).toBe("slow camera");
+    expect(container!.textContent).toContain(i18n.t("workbench.historySourceMissing"));
+});
+
+test("image task links highlight the original task without starting a new generation", async () => {
+    documents["image-tasks"].value = { "original-record": { id: "original-record", task_id: "original-task", status: "succeeded", value: { model: "image-model", result: { data: [{ url: "/api/result-media/original" }] } } } };
+    await renderPage("/image?task=original-record");
+    expect(container!.querySelector('[aria-current="true"]')!.textContent).toContain("image-model");
+    expect(container!.querySelector('[aria-current="true"]')!.textContent).toContain(i18n.t("managed.viewResults"));
+    expect(requests.filter((request) => request.path.startsWith("/api/ai/") || request.path.startsWith("/api/generations"))).toEqual([]);
+});
+
+
+test("stored task images reuse the private file and reject a decode completed after session change", async () => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "Image");
+    let finishDecode: (() => void) | undefined;
+    let waitForDecode = false;
+    let notifyDecode!: () => void;
+    const decoding = new Promise<void>((resolve) => { notifyDecode = resolve; });
+    Object.defineProperty(globalThis, "Image", { configurable: true, value: class {
+        src = ""; naturalWidth = 1600; naturalHeight = 900;
+        decode() { return waitForDecode ? new Promise<void>((resolve) => { finishDecode = resolve; notifyDecode(); }) : Promise.resolve(); }
+    } });
+    try {
+        const image = await readStoredImage("image:original");
+        expect(image).toMatchObject({ storageKey: "image:original", url: "/api/files/image%3Aoriginal", width: 1600, height: 900, mimeType: "image/png" });
+        expect(requests.filter((request) => request.path.startsWith("/api/files"))).toEqual([{ path: "/api/files/image%3Aoriginal", method: "GET" }]);
+        documents["image-tasks"].value = { "original-record": { id: "original-record", task_id: "original-task", status: "succeeded", value: { model: "image-model", result: { data: [{ url: "/api/result-media/original" }] }, localImages: { 0: "image:original" } } } };
+        await renderPage("/image?task=original-record");
+        await click("managed.viewResults");
+        expect(container!.querySelector('img[src="/api/files/image%3Aoriginal"]')).not.toBeNull();
+        expect(requests.some((request) => request.path === "/api/files" && request.method === "POST")).toBe(false);
+        waitForDecode = true;
+        const reading = readStoredImage("image:original");
+        void reading.catch(() => {});
+        await decoding;
+        expect(finishDecode).toBeDefined();
+        await act(async () => endCanvasSession());
+        finishDecode!();
+        await expect(reading).rejects.toThrow(i18n.t("saveRecovery.sessionChanged"));
+        expect(requests.some((request) => request.method === "POST")).toBe(false);
+    } finally {
+        if (previous) Object.defineProperty(globalThis, "Image", previous);
+        else Reflect.deleteProperty(globalThis, "Image");
+    }
+});
+
+
+test("a history link waits for an active video query and opens only after it finishes", async () => {
+    const queued = { ...log("queued", "in-flight video", "pending"), model: config.videoModel, task: { id: "existing-video", provider: "openai", model: config.videoModel } };
+    documents["video-workbench"].value = { queued, alpha: log("alpha", "saved camera") };
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const queries: string[] = [];
+    axios.defaults.adapter = async (request) => {
+        queries.push(`${request.method} ${request.url}`);
+        await gate;
+        return { data: { id: "existing-video", status: "failed", error: { message: "upstream rejected" } }, status: 200, statusText: "OK", headers: {}, config: request };
+    };
+    const router = await renderPage("/video");
+    expect(queries).toHaveLength(1);
+    await act(async () => router.navigate("/video?log=alpha"));
+    expect(container!.querySelector("textarea")!.value).toBe("");
+    expect(container!.textContent).toContain(i18n.t("workbench.historyWaitForGeneration"));
+    await act(async () => finish());
+    expect(container!.querySelector("textarea")!.value).toBe("saved camera");
+    expect(queries.every((query) => query.startsWith("get "))).toBe(true);
+});
+
+test("an older history read cannot replace a newer deep-link preview", async () => {
+    const fetchNormally = globalThis.fetch;
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    let reads = 0;
+    globalThis.fetch = (async (input, init) => {
+        if (String(input) === "/api/data/image-workbench" && !init?.method && reads++ === 0) {
+            await gate;
+            return Response.json({ value: { alpha: log("alpha", "stale prompt") }, revision: 1 });
+        }
+        return fetchNormally(input, init);
+    }) as typeof fetch;
+    const router = await renderPage("/image?log=alpha");
+    await act(async () => router.navigate("/image?log=beta"));
+    expect(container!.querySelector("textarea")!.value).toBe("night river");
+    await act(async () => finish());
+    expect(container!.querySelector("textarea")!.value).toBe("night river");
+    expect(container!.querySelector('[role="alert"]')).toBeNull();
+});
+
+
+test.each(["deep-link", "leave-page"])("an image completing after %s persists its result without stale navigation", async (navigation) => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "Image");
+    Object.defineProperty(globalThis, "Image", { configurable: true, value: class { src = ""; naturalWidth = 1600; naturalHeight = 900; decode() { return Promise.resolve(); } } });
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const submissions: string[] = [];
+    axios.defaults.adapter = async (request) => {
+        submissions.push(`${request.method} ${request.url}`);
+        await gate;
+        return { data: { data: [{ url: "/api/result-media/original" }] }, status: 200, statusText: "OK", headers: {}, config: request };
+    };
+    try {
+        const router = await renderPage("/image?log=alpha");
+        await click("workbench.generate");
+        expect(submissions).toHaveLength(1);
+        await act(async () => router.navigate(navigation === "deep-link" ? "/image?log=beta" : "/video?log=alpha"));
+        if (navigation === "deep-link") expect(container!.querySelector("textarea")!.value).toBe("sunrise mountain");
+        await act(async () => finish());
+        const saved = Object.values(documents["image-workbench"].value as Record<string, ReturnType<typeof log>>).find((item) => item.id !== "alpha" && item.id !== "beta");
+        expect(saved?.status).toBe("success");
+        expect(saved?.images).toMatchObject([{ storageKey: "image:saved", width: 1600, height: 900 }]);
+        expect(container!.querySelector("textarea")!.value).toBe(navigation === "deep-link" ? "night river" : "slow camera");
+        expect(submissions).toHaveLength(1);
+    } finally {
+        if (previous) Object.defineProperty(globalThis, "Image", previous);
+        else Reflect.deleteProperty(globalThis, "Image");
+    }
+});
+
+
+test.each([false, true])("video creation persists its original task before polling even when saving the received ID fails: %s", async (failFirstSave) => {
+    const fetchNormally = globalThis.fetch;
+    let failSave = failFirstSave;
+    globalThis.fetch = (async (input, init) => {
+        const hasTask = init?.body && Object.values(JSON.parse(String(init.body)).value || {}).some((item: any) => item.task?.id === "created-video");
+        if (String(input) === "/api/data/video-workbench" && init?.method === "PUT" && failSave && hasTask) {
+            failSave = false;
+            return Response.json({ error: { message: "save unavailable" } }, { status: 503 });
+        }
+        return fetchNormally(input, init);
+    }) as typeof fetch;
+    const modelRequests: string[] = [];
+    const storedAtQuery: unknown[] = [];
+    axios.defaults.adapter = async (request) => {
+        modelRequests.push(`${request.method} ${request.url}`);
+        if (request.method === "get") storedAtQuery.push(Object.values(documents["video-workbench"].value as Record<string, { task?: { id: string } }>).find((item) => item.task?.id === "created-video"));
+        return { data: request.method === "post" ? { id: "created-video", status: "queued" } : { id: "created-video", status: "failed", error: { message: "provider failure" } }, status: 200, statusText: "OK", headers: {}, config: request };
+    };
+    await renderPage("/video?log=alpha");
+    const generate = [...container!.querySelectorAll<HTMLButtonElement>("button")].find((element) => element.textContent === i18n.t("workbench.generate"))!;
+    await act(async () => { generate.click(); generate.click(); });
+    if (failFirstSave) {
+        const draft = getDocumentDraft("video-workbench") as Record<string, { status: string; task?: { id: string } }>;
+        const pending = Object.values(draft).find((item) => item.task?.id === "created-video");
+        expect(pending?.status).toBe("paused");
+        expect(modelRequests).toEqual(["post /api/ai/v1/videos"]);
+        await act(async () => { await retryDocument("video-workbench"); });
+        await click("videoWorkbench.resume");
+    }
+    expect(modelRequests).toEqual(["post /api/ai/v1/videos", "get /api/ai/v1/videos/created-video"]);
+    expect(storedAtQuery).toHaveLength(1);
+    expect(storedAtQuery[0]).toMatchObject({ task: { id: "created-video" } });
+});
+
+test("video submission does not reach the paid endpoint if saving its intent fails", async () => {
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => String(input) === "/api/data/video-workbench" && init?.method === "PUT"
+        ? Response.json({ error: { message: "QuotaExceededError" } }, { status: 503 })
+        : transport(input, init)) as typeof fetch;
+    const submissions: string[] = [];
+    axios.defaults.adapter = async (request) => { submissions.push(String(request.url)); throw new Error("must not submit"); };
+    await renderPage("/video?log=alpha");
+    await click("workbench.generate");
+    expect(submissions).toEqual([]);
+    expect(Object.keys(documents["video-workbench"].value as object)).toEqual(["alpha", "beta"]);
+    const draft = Object.values(getDocumentDraft("video-workbench") as Record<string, { id: string; status: string }>).find((item) => !["alpha", "beta"].includes(item.id));
+    expect(draft?.status).toBe("failed");
+    expect(container!.textContent).toContain("QuotaExceededError");
+});
+
+test.each(["network", "server", "timeout", "missing-id"])("an uncertain video %s response keeps one durable intent without a regenerate action", async (failure) => {
+    const submissions: string[] = [];
+    let intentId = "";
+    axios.defaults.adapter = async (request) => {
+        submissions.push(`${request.method} ${request.url}`);
+        const intent = Object.values(documents["video-workbench"].value as Record<string, { id: string; status: string; task?: unknown }>).find((item) => !["alpha", "beta"].includes(item.id));
+        expect(intent?.status).toBe("unknown");
+        expect(intent?.task).toBeUndefined();
+        intentId = intent!.id;
+        if (failure === "missing-id") return { data: { status: "queued" }, status: 200, statusText: "OK", headers: {}, config: request };
+        const response = failure === "network" ? undefined : { status: failure === "timeout" ? 408 : 503, data: { error: { message: "response lost" } }, statusText: "Error", headers: {}, config: request };
+        throw new axios.AxiosError("response lost", "ERR_NETWORK", request, undefined, response);
+    };
+    const router = await renderPage("/video?log=alpha");
+    await click("workbench.generate");
+    const saved = documents["video-workbench"].value as Record<string, { status: string; task?: unknown }>;
+    expect(saved[intentId].status).toBe("unknown");
+    expect(saved[intentId].task).toBeUndefined();
+    expect(Object.keys(saved)).toHaveLength(3);
+    expect(container!.textContent).toContain(i18n.t("managed.imageTaskUnknown"));
+    expect(container!.textContent).not.toContain(i18n.t("videoWorkbench.regenerate"));
+    expect(container!.textContent).not.toContain(i18n.t("videoWorkbench.resume"));
+    await act(async () => router.navigate("/image?log=alpha"));
+    await act(async () => router.navigate(`/video?log=${intentId}`));
+    expect(container!.textContent).toContain(i18n.t("managed.imageTaskUnknown"));
+    expect(container!.textContent).not.toContain(i18n.t("videoWorkbench.regenerate"));
+    expect(submissions).toEqual(["post /api/ai/v1/videos"]);
+});
+
+test("an explicit video request rejection stays failed and permits a deliberate new submission", async () => {
+    const submissions: string[] = [];
+    axios.defaults.adapter = async (request) => {
+        submissions.push(String(request.url));
+        throw new axios.AxiosError("bad prompt", "ERR_BAD_REQUEST", request, undefined, { status: 400, data: { error: { message: "bad prompt" } }, statusText: "Bad Request", headers: {}, config: request });
+    };
+    await renderPage("/video?log=alpha");
+    await click("workbench.generate");
+    const saved = Object.values(documents["video-workbench"].value as Record<string, { id: string; status: string }>).find((item) => !["alpha", "beta"].includes(item.id));
+    expect(saved?.status).toBe("failed");
+    await click("videoWorkbench.regenerate");
+    expect(submissions).toEqual(["/api/ai/v1/videos", "/api/ai/v1/videos"]);
+});
+
+test("adding a video result waits for local saving and a failed save cannot add duplicates", async () => {
+    const video = { id: "saved-video", url: "", storageKey: "media:video", width: 1280, height: 720, bytes: 5, durationMs: 1000, mimeType: "video/mp4" };
+    documents["video-workbench"].value = { alpha: { ...log("alpha", "camera"), video } };
+    documents.assets = { value: { state: { assets: [] }, version: 0 }, revision: 1 };
+    await useAssetStore.persist.rehydrate();
+    const transport = globalThis.fetch;
+    const gate = Promise.withResolvers<void>();
+    let writes = 0, failing = true;
+    globalThis.fetch = (async (input, init) => {
+        if (String(input) === "/api/data/assets" && init?.method === "PUT") {
+            writes += 1;
+            await gate.promise;
+            if (failing) return Response.json({ error: { message: "QuotaExceededError" } }, { status: 503 });
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    await renderPage("/video?log=alpha");
+    await click("common.addToAssets");
+    await click("common.addToAssets");
+    expect(writes).toBe(1);
+    expect(document.body.textContent).not.toContain(i18n.t("common.addedToAssets"));
+    await act(async () => gate.resolve());
+    expect(useAssetStore.getState().assets).toHaveLength(1);
+    expect((documents.assets.value as { state: { assets: unknown[] } }).state.assets).toEqual([]);
+    expect(document.body.textContent).toContain("QuotaExceededError");
+    expect(document.body.textContent).not.toContain(i18n.t("common.addedToAssets"));
+    await click("common.addToAssets");
+    expect(writes).toBe(1);
+    expect(useAssetStore.getState().assets).toHaveLength(1);
+    failing = false;
+    await act(async () => { await retryDocument("assets"); });
+    expect((documents.assets.value as { state: { assets: unknown[] } }).state.assets).toHaveLength(1);
+    expect(requests.filter((request) => request.path === "/api/files" && request.method === "POST")).toEqual([]);
+});
+
+test.each([false, true])("a deleted video submission intent stays deleted when its response is uncertain: %s", async (uncertain) => {
+    const gate = Promise.withResolvers<void>();
+    const submissions: string[] = [];
+    let intentId = "";
+    axios.defaults.adapter = async (request) => {
+        submissions.push(`${request.method} ${request.url}`);
+        intentId = Object.keys(documents["video-workbench"].value as object).find((id) => !["alpha", "beta"].includes(id))!;
+        await gate.promise;
+        if (uncertain) throw new axios.AxiosError("lost response", "ERR_NETWORK", request);
+        return { data: { id: "created-video", status: "queued" }, status: 200, statusText: "OK", headers: {}, config: request };
+    };
+    await renderPage("/video?log=alpha");
+    await click("workbench.generate");
+    expect(intentId).not.toBe("");
+    await act(async () => { await deleteVideoGenerationLogs([intentId]); });
+    await act(async () => gate.resolve());
+    expect(Object.keys(documents["video-workbench"].value as object)).toEqual(["alpha", "beta"]);
+    expect(submissions).toEqual(["post /api/ai/v1/videos"]);
+});
+
+test("image result selection adds only the visible chosen results in one save without uploading or generating", async () => {
+    const images = ["first", "second", "third"].map((id) => ({ id, storageKey: `image:${id}`, dataUrl: "", width: 1600, height: 900, bytes: 4, durationMs: 0 }));
+    documents["image-workbench"].value = { alpha: { ...log("alpha", "gallery"), images, imageCount: 3, successCount: 3 } };
+    documents.canvas = { value: { state: { projects: [{ id: "destination", title: "Destination", createdAt: "2026-01-01", updatedAt: "2026-01-01", nodes: [], connections: [], chatSessions: [], activeChatId: null, backgroundMode: "lines", showImageInfo: false, viewport: { x: 0, y: 0, k: 1 } }], deletedProjects: [] }, version: 0 }, revision: 1 };
+    await useCanvasStore.persist.rehydrate();
+    await renderPage("/image?log=alpha");
+    await selectAllResults();
+    expect(container!.textContent).toContain(i18n.t("resultToCanvas.selectedCount", { count: 3 }));
+    const second = container!.querySelector<HTMLInputElement>(`input[aria-label="${i18n.t("resultToCanvas.selectResult", { count: 2 })}"]`);
+    expect(second).not.toBeNull();
+    await act(async () => second!.click());
+    expect(container!.textContent).toContain(i18n.t("resultToCanvas.selectedCount", { count: 2 }));
+    const add = [...container!.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.replace(/\s/g, "") === i18n.t("resultToCanvas.insertBatch", { count: 2 }).replace(/\s/g, ""));
+    expect(add).toBeDefined();
+    await act(async () => { add!.click(); add!.click(); });
+    const saved = documents.canvas.value as { state: { projects: Array<{ nodes: Array<{ metadata?: { storageKey?: string } }> }> } };
+    expect(saved.state.projects[0].nodes.map((node) => node.metadata?.storageKey)).toEqual(["image:first", "image:third"]);
+    expect(requests.filter((request) => request.method === "PUT" && request.path === "/api/data/canvas")).toHaveLength(1);
+    expect(requests.filter((request) => request.method === "POST" || request.method === "DELETE")).toEqual([]);
+});
+
+test("clearing result selection or switching history never keeps hidden images selected", async () => {
+    const image = { id: "first", storageKey: "image:first", dataUrl: "", width: 100, height: 100, bytes: 4, durationMs: 0 };
+    documents["image-workbench"].value = {
+        alpha: { ...log("alpha", "first gallery"), images: [image] },
+        beta: { ...log("beta", "second gallery"), images: [{ ...image, id: "second", storageKey: "image:second" }] },
+    };
+    const router = await renderPage("/image?log=alpha");
+    await selectAllResults();
+    expect(container!.textContent).toContain(i18n.t("resultToCanvas.selectedCount", { count: 1 }));
+    await click("resultToCanvas.clearSelection");
+    expect(container!.querySelector<HTMLInputElement>(`input[aria-label="${i18n.t("resultToCanvas.selectResult", { count: 1 })}"]`)!.checked).toBe(false);
+    await selectAllResults();
+    await act(async () => router.navigate("/image?log=beta"));
+    expect(container!.querySelector<HTMLInputElement>(`input[aria-label="${i18n.t("resultToCanvas.selectResult", { count: 1 })}"]`)!.checked).toBe(false);
+    expect(requests.filter((request) => request.path === "/api/data/canvas" && request.method !== "GET")).toEqual([]);
+    expect(requests.filter((request) => request.method === "POST" || request.method === "DELETE")).toEqual([]);
+});

@@ -9,11 +9,16 @@ import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
 import { exportCanvasNodes } from "@/lib/canvas/canvas-export";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { cn } from "@/lib/utils";
+import { filterAssets } from "@/lib/asset-search";
+import { AssetDeleteStatus } from "@/components/asset-delete-status";
 import { PromptDetailDialog } from "@/pages/prompts/components/prompt-detail-dialog";
 import { fetchSourcePrompts, type Prompt } from "@/services/api/prompts";
 import { uploadMediaFile } from "@/services/file-storage";
+import { sessionEpoch } from "@/services/api/canvas-client";
 import { previewUrlFor, subscribeImagePreviews, getImagePreviewRevision, uploadImage } from "@/services/image-storage";
-import { useAssetStore, type Asset, type AssetKind } from "@/stores/use-asset-store";
+import { assertAssetSaveReady, useAssetStore, type Asset, type AssetKind } from "@/stores/use-asset-store";
+import { useAssetDeleteStore } from "@/stores/use-asset-delete-store";
+import { CANVAS_ASSET_DRAG_TYPE, cancelCanvasAssetDrag, startCanvasAssetDrag } from "@/stores/canvas/use-canvas-asset-drag-store";
 import { usePromptSourceStore } from "@/stores/use-prompt-source-store";
 import { CANVAS_SIDE_PANEL_MAX_WIDTH, CANVAS_SIDE_PANEL_MIN_WIDTH, CANVAS_SIDE_PANEL_MOTION_MS, useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -375,7 +380,7 @@ function CheckMark({ checked, theme }: { checked: boolean; theme: CanvasTheme })
 }
 
 // ---------------------------------------------------------------------------
-// Assets tab: collapsible type groups, tag filtering, and click-to-insert.
+// Assets tab: collapsible type groups, tag filtering, and asset insertion.
 // ---------------------------------------------------------------------------
 
 const ASSET_GROUPS: { kind: AssetKind; icon: typeof Square }[] = [
@@ -394,48 +399,58 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
     const { message } = App.useApp();
     const { t } = useTranslation();
     const assets = useAssetStore((state) => state.assets);
-    const addAsset = useAssetStore((state) => state.addAsset);
-    const removeAsset = useAssetStore((state) => state.removeAsset);
+    const addAssetsAndSave = useAssetStore((state) => state.addAssetsAndSave);
     const [keyword, setKeyword] = useState("");
-    const [tagFilter, setTagFilter] = useState<string>("all");
+    const [tagFilter, setTagFilter] = useState<string | undefined>();
     const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
     const [uploading, setUploading] = useState(false);
+    const uploadingRef = useRef(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const allTags = useMemo(() => Array.from(new Set(assets.flatMap((asset) => asset.tags || []))).slice(0, 20), [assets]);
+    const allTags = useMemo(() => Array.from(new Set(filterAssets(assets, { keyword: "" }).flatMap((asset) => asset.tags || []))), [assets]);
+    const selectedTag = tagFilter !== undefined && allTags.includes(tagFilter) ? tagFilter : undefined;
+    const visibleTags = useMemo(() => {
+        const tags = allTags.slice(0, 20);
+        if (selectedTag !== undefined && !tags.includes(selectedTag)) tags.splice(-1, 1, selectedTag);
+        return tags;
+    }, [allTags, selectedTag]);
+    useEffect(() => {
+        if (tagFilter !== selectedTag) setTagFilter(undefined);
+    }, [tagFilter, selectedTag]);
 
-    const filtered = useMemo(() => {
-        const query = keyword.trim().toLowerCase();
-        return assets.filter((asset) => (tagFilter === "all" || (asset.tags || []).includes(tagFilter)) && (!query || [asset.title, ...(asset.tags || [])].join(" ").toLowerCase().includes(query)));
-    }, [assets, keyword, tagFilter]);
+    const filtered = useMemo(() => filterAssets(assets, { keyword, tag: selectedTag }), [assets, keyword, selectedTag]);
 
     const groups = useMemo(() => ASSET_GROUPS.map((group) => ({ ...group, items: filtered.filter((asset) => asset.kind === group.kind) })).filter((group) => group.items.length > 0), [filtered]);
 
     const handleFiles = async (fileList: FileList | null) => {
         const files = Array.from(fileList || []);
-        if (!files.length) return;
+        if (!files.length || uploadingRef.current) return;
+        uploadingRef.current = true;
+        const epoch = sessionEpoch();
         setUploading(true);
         const hide = message.loading(t("canvas.sidePanel.addingAssets"), 0);
         let added = 0;
         try {
             for (const file of files) {
+                assertAssetSaveReady(epoch);
                 if (file.type.startsWith("image/")) {
                     const image = await uploadImage(file);
-                    addAsset({ kind: "image", title: file.name || t("assets.kinds.image"), coverUrl: image.url, tags: [], data: { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType } });
+                    await addAssetsAndSave([{ kind: "image", title: file.name || t("assets.kinds.image"), coverUrl: image.url, tags: [], data: { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType } }], epoch);
                     added += 1;
                 } else if (file.type.startsWith("video/")) {
                     const media = await uploadMediaFile(file, "video");
-                    addAsset({ kind: "video", title: file.name || t("assets.kinds.video"), coverUrl: "", tags: [], data: { url: media.url, storageKey: media.storageKey, width: media.width || 0, height: media.height || 0, bytes: media.bytes, mimeType: media.mimeType } });
+                    await addAssetsAndSave([{ kind: "video", title: file.name || t("assets.kinds.video"), coverUrl: "", tags: [], data: { url: media.url, storageKey: media.storageKey, width: media.width || 0, height: media.height || 0, bytes: media.bytes, mimeType: media.mimeType } }], epoch);
                     added += 1;
                 }
             }
+            if (epoch !== sessionEpoch()) return;
             if (added) message.success(t("canvas.sidePanel.addedAssets", { count: added }));
             else message.warning(t("canvas.sidePanel.mediaOnly"));
         } catch (error) {
-            console.error(error);
-            message.error(t("canvas.sidePanel.addFailed"));
+            if (epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : t("canvas.sidePanel.addFailed"));
         } finally {
             hide();
+            uploadingRef.current = false;
             setUploading(false);
             if (fileInputRef.current) fileInputRef.current.value = "";
         }
@@ -444,7 +459,7 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
     return (
         <div className="flex h-full flex-col">
             <div className="flex items-center gap-2 px-3 pb-2 pt-1">
-                <Input size="small" allowClear prefix={<Search className="size-3.5 text-stone-400" />} placeholder={t("canvas.sidePanel.searchAssets")} value={keyword} onChange={(e) => setKeyword(e.target.value)} />
+                <Input size="small" allowClear prefix={<Search className="size-3.5 text-stone-400" />} placeholder={t("canvas.sidePanel.searchAssets")} aria-label={t("canvas.sidePanel.searchAssets")} value={keyword} onChange={(e) => setKeyword(e.target.value)} />
                 <button
                     type="button"
                     disabled={uploading}
@@ -459,17 +474,18 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
             </div>
             {allTags.length ? (
                 <div className="flex flex-wrap gap-1.5 px-3 pb-2">
-                    <Tag.CheckableTag checked={tagFilter === "all"} className={cn("prompt-filter-tag", tagFilter === "all" && "is-active")} onChange={() => setTagFilter("all")}>
+                    <Tag.CheckableTag checked={selectedTag === undefined} className={cn("prompt-filter-tag", selectedTag === undefined && "is-active")} onChange={() => setTagFilter(undefined)}>
                         {t("common.all")}
                     </Tag.CheckableTag>
-                    {allTags.map((tag) => (
-                        <Tag.CheckableTag key={tag} checked={tagFilter === tag} className={cn("prompt-filter-tag", tagFilter === tag && "is-active")} onChange={() => setTagFilter((prev) => (prev === tag ? "all" : tag))}>
+                    {visibleTags.map((tag) => (
+                        <Tag.CheckableTag key={tag} checked={selectedTag === tag} className={cn("prompt-filter-tag", selectedTag === tag && "is-active")} onChange={() => setTagFilter((prev) => (prev === tag ? undefined : tag))}>
                             {tag}
                         </Tag.CheckableTag>
                     ))}
                 </div>
             ) : null}
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+                <AssetDeleteStatus />
                 {groups.length ? (
                     <div className="space-y-1">
                         {groups.map((group) => {
@@ -489,7 +505,7 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
                                     {isCollapsed ? null : (
                                         <div className="grid grid-cols-2 gap-2 px-1 pb-2 pt-1">
                                             {group.items.map((asset) => (
-                                                <AssetCard key={asset.id} asset={asset} theme={theme} onInsert={() => onInsert(buildInsertPayload(asset))} onRemove={() => (removeAsset(asset.id), message.success(t("canvas.sidePanel.assetRemoved")))} />
+                                                <AssetCard key={asset.id} asset={asset} theme={theme} onInsert={() => onInsert(buildInsertPayload(asset))} />
                                             ))}
                                         </div>
                                     )}
@@ -505,25 +521,53 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
     );
 });
 
-function AssetCard({ asset, theme, onInsert, onRemove }: { asset: Asset; theme: CanvasTheme; onInsert: () => void; onRemove: () => void }) {
+function AssetCard({ asset, theme, onInsert }: { asset: Asset; theme: CanvasTheme; onInsert: () => void }) {
     const { t } = useTranslation();
+    const deleteAsset = useAssetDeleteStore((state) => state.deleteAsset);
+    const deleteDisabled = useAssetDeleteStore((state) => state.status === "saving" || state.status === "save-error");
+    const dragFromActionRef = useRef(false);
     return (
-        <div className="group relative aspect-square overflow-hidden rounded-xl border transition duration-200 hover:-translate-y-0.5 hover:shadow-lg" style={{ borderColor: theme.node.stroke, background: theme.node.panel }}>
+        <div
+            draggable
+            title={t("canvas.sidePanel.dragAssetHint")}
+            className="group relative aspect-square cursor-grab overflow-hidden rounded-xl border transition duration-200 hover:-translate-y-0.5 hover:shadow-lg active:cursor-grabbing"
+            style={{ borderColor: theme.node.stroke, background: theme.node.panel }}
+            onPointerDownCapture={(event) => { dragFromActionRef.current = event.target instanceof Element && !!event.target.closest("button"); }}
+            onDragStart={(event) => {
+                if (dragFromActionRef.current || (event.target instanceof Element && event.target.closest("button"))) {
+                    event.preventDefault();
+                    return;
+                }
+                const token = startCanvasAssetDrag(asset.id);
+                if (!token) {
+                    event.preventDefault();
+                    return;
+                }
+                event.dataTransfer.clearData();
+                event.dataTransfer.setData(CANVAS_ASSET_DRAG_TYPE, token);
+                event.dataTransfer.effectAllowed = "copy";
+            }}
+            onDragEnd={() => {
+                dragFromActionRef.current = false;
+                cancelCanvasAssetDrag();
+            }}
+        >
             <AssetCover asset={asset} />
-            <div className="absolute inset-0 flex items-center justify-center gap-2.5 opacity-0 transition duration-200 group-hover:opacity-100">
+            <div className="absolute inset-0 flex items-center justify-center gap-2.5 opacity-0 transition duration-200 group-hover:opacity-100 group-focus-within:opacity-100">
                 <button
                     type="button"
                     onClick={onInsert}
                     className="grid size-8 place-items-center rounded-full bg-white/90 text-stone-700 shadow-sm backdrop-blur transition hover:bg-white hover:text-stone-900 dark:bg-black/60 dark:text-stone-100 dark:hover:bg-black/80"
-                    aria-label={t("canvas.sidePanel.inserted")}
+                    aria-label={t("canvas.sidePanel.insertAssetNamed", { title: asset.title })}
                 >
                     <Plus className="size-4" />
                 </button>
-                <Popconfirm title={t("canvas.sidePanel.removeAssetTitle")} okText={t("canvas.sidePanel.remove")} cancelText={t("common.cancel")} okButtonProps={{ danger: true }} onConfirm={onRemove}>
+                <Popconfirm title={t("canvas.sidePanel.removeAssetTitle")} okText={t("canvas.sidePanel.remove")} cancelText={t("common.cancel")} disabled={deleteDisabled} okButtonProps={{ danger: true, disabled: deleteDisabled }} onConfirm={() => deleteAsset(asset.id)}>
                     <button
                         type="button"
-                        className="grid size-8 place-items-center rounded-full bg-white/90 text-stone-700 shadow-sm backdrop-blur transition hover:bg-white hover:text-red-500 dark:bg-black/60 dark:text-stone-100 dark:hover:bg-black/80 dark:hover:text-red-400"
-                        aria-label={t("canvas.sidePanel.removeAsset")}
+                        disabled={deleteDisabled}
+                        className="grid size-8 place-items-center rounded-full bg-white/90 text-stone-700 shadow-sm backdrop-blur transition hover:bg-white hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/60 dark:text-stone-100 dark:hover:bg-black/80 dark:hover:text-red-400"
+                        aria-label={t("canvas.sidePanel.removeAssetNamed", { title: asset.title })}
                     >
                         <Trash2 className="size-4" />
                     </button>
@@ -536,10 +580,10 @@ function AssetCard({ asset, theme, onInsert, onRemove }: { asset: Asset; theme: 
 function AssetCover({ asset }: { asset: Asset }) {
     if (asset.kind === "text") return <div className="size-full overflow-hidden whitespace-pre-wrap break-words p-2.5 text-[11px] leading-snug opacity-80">{asset.data.content}</div>;
     if (asset.kind === "video") {
-        if (asset.coverUrl) return <img src={asset.coverUrl} alt="" className="size-full object-cover transition duration-300 group-hover:scale-[1.04]" />;
+        if (asset.coverUrl) return <img src={asset.coverUrl} alt="" draggable={false} className="size-full object-cover transition duration-300 group-hover:scale-[1.04]" />;
         return <video src={`${asset.data.url}#t=0.1`} muted playsInline preload="metadata" className="size-full object-cover transition duration-300 group-hover:scale-[1.04]" />;
     }
-    return <img src={asset.coverUrl || asset.data.dataUrl} alt="" className="size-full object-cover transition duration-300 group-hover:scale-[1.04]" />;
+    return <img src={asset.coverUrl || asset.data.dataUrl} alt="" draggable={false} className="size-full object-cover transition duration-300 group-hover:scale-[1.04]" />;
 }
 
 // ---------------------------------------------------------------------------

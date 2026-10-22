@@ -1,5 +1,7 @@
-import { beforeEach, afterAll, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, afterAll, describe, expect, test } from "bun:test";
 import { browser } from "../../tests/browser";
+import { mockBrowserDocuments } from "../../tests/local-document-fixture";
+import { mockBrowserFiles } from "../../tests/local-file-fixture";
 const originalFetch = globalThis.fetch;
 const client = await import("./api/canvas-client");
 const data = await import("./canvas-data");
@@ -7,6 +9,8 @@ const packages = await import("./package-import");
 const sanitizers = await import("../../../plugins/canvas/sdk/src/sanitize");
 const calls: Array<{ path: string; init?: RequestInit }> = [];
 const session = { user: { id: "user-a", subject: `ics_${"a".repeat(32)}`, username: "alice" }, csrf_token: "csrf-a", session_tag: "public-session-a", expires_at: Math.floor(Date.now() / 1000) + 60 };
+let browserDocuments: ReturnType<typeof mockBrowserDocuments>;
+let browserFiles: ReturnType<typeof mockBrowserFiles> | undefined;
 
 function respond(value: unknown, status = 200) {
     return Response.json(value, { status });
@@ -27,6 +31,13 @@ beforeEach(() => {
     localStorage.clear();
     calls.length = 0;
     mockFetch((path) => (path === "/api/session" ? respond(session) : respond({ value: null, revision: 0 })));
+    browserDocuments = mockBrowserDocuments();
+});
+afterEach(() => {
+    client.endCanvasSession();
+    browserDocuments.restore();
+    browserFiles?.restore();
+    browserFiles = undefined;
 });
 afterAll(() => {
     globalThis.fetch = originalFetch;
@@ -47,6 +58,16 @@ describe("managed session and storage boundary", () => {
 
     test("keeps generation and multipart editing on the authenticated gateway", async () => {
         await authorize();
+        let document = { value: null as unknown, revision: 0 };
+        mockFetch((path, init) => {
+            if (path !== "/api/data/image-tasks") return respond({ value: null, revision: 0 });
+            if (init?.method === "PUT") {
+                const body = JSON.parse(String(init.body));
+                expect(body.revision).toBe(document.revision);
+                document = { value: body.value, revision: document.revision + 1 };
+            }
+            return respond(document);
+        });
         const { useConfigStore, defaultConfig } = await import("@/stores/use-config-store");
         const config = {
             ...defaultConfig,
@@ -74,6 +95,9 @@ describe("managed session and storage boundary", () => {
             expect(JSON.parse(requests[0].body as string).model).toBe("gpt-image-test");
             expect((requests[1].body as FormData).get("model")).toBe("gpt-image-test");
             expect((requests[1].body as FormData).get("image")).toBeInstanceOf(File);
+            const tasks = Object.values(document.value as Record<string, { status: string; value: { result?: { data?: unknown[] } } }>);
+            expect(tasks).toHaveLength(2);
+            expect(tasks.every((task) => task.status === "succeeded" && task.value.result?.data?.length === 1)).toBe(true);
         } finally {
             axios.defaults.adapter = previous;
         }
@@ -263,6 +287,103 @@ describe("managed session and storage boundary", () => {
         expect(client.currentSession()?.session_tag).toBe("public-session-b");
     });
 
+    test("session checks preserve the active session on temporary failures and terminate confirmed expiry", async () => {
+        await authorize();
+        const epoch = client.sessionEpoch();
+        for (const status of [429, 503]) {
+            mockFetch(() => respond({ error: { message: "temporarily unavailable" } }, status));
+            await expect(client.readCanvasSession()).rejects.toMatchObject({ retryable: true, status });
+            expect(client.currentSession()).toEqual(session);
+            expect(client.sessionEpoch()).toBe(epoch);
+        }
+        mockFetch(() => {
+            throw new TypeError("Failed to fetch");
+        });
+        await expect(client.readCanvasSession(true)).rejects.toMatchObject({ retryable: true });
+        expect(client.currentSession()).toEqual(session);
+        mockFetch(() => respond({ ...session, expires_at: Math.floor(Date.now() / 1000) - 1 }));
+        await expect(client.readCanvasSession()).rejects.toMatchObject({ retryable: false });
+        expect(client.currentSession()).toBeNull();
+    });
+
+    test("a delayed session-check rejection cannot invalidate a replacement login", async () => {
+        await authorize();
+        const delayed = Promise.withResolvers<Response>();
+        mockFetch(() => delayed.promise);
+        const pending = client.readCanvasSession();
+        client.endCanvasSession();
+        const replacement = { ...session, session_tag: "public-session-b", csrf_token: "csrf-b" };
+        mockFetch(() => respond(replacement));
+        await client.readCanvasSession();
+        delayed.resolve(respond({ error: { message: "old authorization expired" } }, 401));
+        await expect(pending).rejects.toThrow("会话已改变");
+        expect(client.currentSession()?.session_tag).toBe("public-session-b");
+    });
+
+    test("bootstrap retries without showing private UI and transient rechecks retain the mounted draft and AI request", async () => {
+        const { act, createElement } = await import("react");
+        const { createRoot } = await import("react-dom/client");
+        const { ClientRootInit } = await import("./../components/layout/client-root-init");
+        const i18n = (await import("@/i18n")).default;
+        const globals = { HTMLElement: browser.HTMLElement, SVGElement: browser.SVGElement, Element: browser.Element, ShadowRoot: browser.ShadowRoot, getComputedStyle: browser.getComputedStyle.bind(browser), IS_REACT_ACT_ENVIRONMENT: true };
+        const descriptors = new Map(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+        for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+        const visibility = Object.getOwnPropertyDescriptor(document, "visibilityState");
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+        const container = document.createElement("div");
+        document.body.append(container);
+        const root = createRoot(container);
+        let status = 503;
+        const slow = Promise.withResolvers<Response>();
+        let requestSignal: AbortSignal | undefined;
+        mockFetch((path, init) => {
+            if (path === "/api/session") return status === 200 ? respond(session) : respond({ error: { message: "session unavailable" } }, status);
+            if (path === "/api/slow") {
+                requestSignal = init?.signal || undefined;
+                return slow.promise;
+            }
+            if (path === "/api/models") return respond({ data: [] });
+            return respond(init?.method === "PUT" ? JSON.parse(String(init.body)) : { value: null, revision: 0 });
+        });
+        try {
+            await act(async () => root.render(createElement(ClientRootInit, { children: createElement("input", { "data-draft": true, defaultValue: "unsaved draft" }) })));
+            expect(container.querySelector("[data-draft]")).toBeNull();
+            expect(client.currentSession()).toBeNull();
+            const retry = [...container.querySelectorAll("button")].find((button) => button.textContent?.replace(/\s/g, "") === i18n.t("workbench.retry"));
+            expect(retry).toBeDefined();
+            status = 200;
+            await act(async () => retry!.click());
+            const draft = container.querySelector("[data-draft]") as HTMLInputElement;
+            expect(draft?.value).toBe("unsaved draft");
+            const pending = client.canvasJson("/api/slow");
+            status = 503;
+            await act(async () => window.dispatchEvent(new browser.Event("focus")));
+            expect(client.currentSession()?.session_tag).toBe(session.session_tag);
+            expect(container.querySelector("[data-draft]")).toBe(draft);
+            expect(requestSignal?.aborted).toBe(false);
+            expect(container.textContent).toContain(i18n.t("managed.connectionInterrupted"));
+            status = 200;
+            await act(async () => window.dispatchEvent(new browser.Event("focus")));
+            expect(container.textContent).not.toContain(i18n.t("managed.connectionInterrupted"));
+            slow.resolve(respond({ completed: true }));
+            expect(await pending).toEqual({ completed: true });
+            status = 401;
+            await act(async () => window.dispatchEvent(new browser.Event("focus")));
+            expect(client.currentSession()).toBeNull();
+            expect(container.querySelector("[data-draft]")).toBeNull();
+        } finally {
+            slow.resolve(respond({ completed: true }));
+            await act(async () => root.unmount());
+            container.remove();
+            if (visibility) Object.defineProperty(document, "visibilityState", visibility);
+            else Reflect.deleteProperty(document, "visibilityState");
+            for (const [key, descriptor] of descriptors) {
+                if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+                else Reflect.deleteProperty(globalThis, key);
+            }
+        }
+    });
+
     test("hydrates the actual stores only after authorization and loads gateway models", async () => {
         await authorize();
         mockFetch((path) => (path === "/api/models" ? respond({ data: [{ id: "gpt-image-test", supported_endpoint_types: ["image-generation"] }] }) : respond({ value: null, revision: 0 })));
@@ -278,9 +399,67 @@ describe("managed session and storage boundary", () => {
 });
 
 describe("private package and trusted content compatibility", () => {
+    test("a canvas package finishing its read after account replacement cannot upload or import into the new account", async () => {
+        const { act, createElement } = await import("react");
+        const { createRoot } = await import("react-dom/client");
+        const { App, ConfigProvider } = await import("antd");
+        const { MemoryRouter } = await import("react-router-dom");
+        const { zipSync } = await import("fflate");
+        const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
+        const globals = { HTMLAnchorElement: browser.HTMLAnchorElement, HTMLElement: browser.HTMLElement, SVGElement: browser.SVGElement, Element: browser.Element, ShadowRoot: browser.ShadowRoot, getComputedStyle: browser.getComputedStyle.bind(browser), IS_REACT_ACT_ENVIRONMENT: true, ResizeObserver: class { observe() {} unobserve() {} disconnect() {} } };
+        const descriptors = new Map(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+        for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+        const matchMedia = browser.matchMedia;
+        browser.matchMedia = () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true, media: "", onchange: null });
+        useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: true });
+        await authorize();
+        const container = document.createElement("div");
+        document.body.append(container);
+        const root = createRoot(container);
+        const pending = Promise.withResolvers<ArrayBuffer>();
+        const file = new File([], "private-canvas.zip");
+        let reads = 0;
+        Object.defineProperty(file, "arrayBuffer", { value: () => { reads += 1; return pending.promise; } });
+        const archive = zipSync({
+            "projects.json": new TextEncoder().encode(JSON.stringify({ app: "infinite-canvas", version: 3, projects: [{ project: { id: "old-owner-project", title: "Private project", nodes: [], connections: [] }, files: [{ storageKey: "image:old", path: "files/private.png", mimeType: "image/png" }] }] })),
+            "files/private.png": new TextEncoder().encode("private image"),
+        });
+        try {
+            const { default: CanvasPage } = await import("@/pages/canvas");
+            await act(async () => root.render(createElement(MemoryRouter, null, createElement(ConfigProvider, { theme: { token: { motion: false } } }, createElement(App, null, createElement(CanvasPage))))));
+            const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+            expect(input).not.toBeNull();
+            Object.defineProperty(input, "files", { configurable: true, value: [file] });
+            await act(async () => input.dispatchEvent(new browser.Event("change", { bubbles: true })));
+            expect(reads).toBe(1);
+            await act(async () => {
+                client.endCanvasSession();
+                mockFetch(() => respond({ ...session, user: { ...session.user, id: "user-b", subject: `ics_${"b".repeat(32)}` }, session_tag: "public-session-b" }));
+                await client.readCanvasSession();
+                useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: true });
+            });
+            calls.length = 0;
+            await act(async () => pending.resolve(archive.buffer as ArrayBuffer));
+            expect(useCanvasStore.getState().projects).toEqual([]);
+            expect(calls).toEqual([]);
+        } finally {
+            pending.resolve(archive.buffer as ArrayBuffer);
+            await act(async () => root.unmount());
+            container.remove();
+            client.endCanvasSession();
+            useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
+            browser.matchMedia = matchMedia;
+            for (const [key, descriptor] of descriptors) {
+                if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+                else Reflect.deleteProperty(globalThis, key);
+            }
+        }
+    });
+
     test("imports allocate new resources and preserve unknown node fields and connections", async () => {
         await authorize();
-        mockFetch(() => respond({ id: "new", storageKey: "image:new", url: "/api/files/new", mimeType: "image/png", bytes: 3 }));
+        browserFiles = mockBrowserFiles();
+        mockFetch(() => respond({ id: "new", storageKey: "image:new", url: "blob:mock-new", mimeType: "image/png", bytes: 3 }));
         const mapping = await packages.importPackageFiles([{ storageKey: "image:old", path: "files/source.png", mimeType: "image/png" }], new Map([["files/source.png", new Blob(["png"], { type: "image/png" })]]));
         const project = {
             owner: "attacker",
@@ -289,7 +468,7 @@ describe("private package and trusted content compatibility", () => {
         };
         const imported = packages.remapPackageResources(project, mapping);
         expect(imported).not.toHaveProperty("owner");
-        expect(imported.nodes[0]).toEqual({ id: "node", type: "unknown:node", extra: { retain: true }, metadata: { storageKey: "image:new", content: "/api/files/new", references: ["image:new"] } });
+        expect(imported.nodes[0]).toEqual({ id: "node", type: "unknown:node", extra: { retain: true }, metadata: { storageKey: "image:new", content: "blob:mock-new", references: ["image:new"] } });
         expect(imported.connections).toEqual(project.connections);
         await expect(packages.importPackageFiles([{ storageKey: "image:missing", path: "missing.png", mimeType: "image/png" }], new Map())).rejects.toThrow("缺少素材");
     });

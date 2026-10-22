@@ -1,7 +1,9 @@
 import i18n from "@/i18n";
 import { createImageThumbnail } from "@/lib/image-thumbnail";
 import { onSessionEnd, readPrivateBlob, sessionEpoch } from "@/services/api/canvas-client";
-import { deletePrivateFile, fileUrl, uploadPrivateFile } from "@/services/canvas-data";
+import { deletePrivateFile, uploadPrivateFile } from "@/services/canvas-data";
+
+import { readBrowserFile, resolveBrowserFileUrl } from "@/services/browser-files";
 
 export type UploadedImage = { url: string; storageKey?: string; width: number; height: number; bytes: number; mimeType: string };
 type ImageReadOptions = { signal?: AbortSignal };
@@ -15,6 +17,7 @@ onSessionEnd(() => {
 });
 
 export async function uploadImage(input: string | Blob, options?: ImageReadOptions): Promise<UploadedImage> {
+    const epoch = sessionEpoch();
     const blob = typeof input === "string" ? await readPrivateBlob(input, options?.signal) : input;
     const url = URL.createObjectURL(blob);
     try {
@@ -23,6 +26,7 @@ export async function uploadImage(input: string | Blob, options?: ImageReadOptio
         await image.decode();
         if (!image.naturalWidth || !image.naturalHeight) throw new Error(i18n.t("common.imageReadFailed"));
         options?.signal?.throwIfAborted();
+        if (epoch !== sessionEpoch()) throw new Error("登录会话已改变");
         const file = await uploadPrivateFile(blob, "image");
         return { url: file.url, storageKey: file.storageKey, width: image.naturalWidth, height: image.naturalHeight, bytes: file.bytes, mimeType: file.mimeType };
     } finally {
@@ -30,14 +34,31 @@ export async function uploadImage(input: string | Blob, options?: ImageReadOptio
     }
 }
 
+// Task results already have a private file. Inspect that file without duplicating it.
+export async function readStoredImage(storageKey: string): Promise<UploadedImage> {
+    const epoch = sessionEpoch();
+    const blob = await readBrowserFile(storageKey);
+    const preview = URL.createObjectURL(blob);
+    try {
+        const image = new Image();
+        image.src = preview;
+        await image.decode();
+        if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+        if (!image.naturalWidth || !image.naturalHeight) throw new Error(i18n.t("common.imageReadFailed"));
+        return { storageKey, url: await resolveBrowserFileUrl(storageKey), width: image.naturalWidth, height: image.naturalHeight, bytes: blob.size, mimeType: blob.type };
+    } finally {
+        URL.revokeObjectURL(preview);
+    }
+}
+
 export async function resolveImageUrl(storageKey?: string, fallback = "") {
-    return storageKey ? fileUrl(storageKey) : safeImageFallback(fallback);
+    return storageKey ? resolveBrowserFileUrl(storageKey) : safeImageFallback(fallback);
 }
 function safeImageFallback(value: string) {
-    return value.startsWith("data:image/") || value.startsWith("blob:") || value.startsWith("/api/files/") ? value : "";
+    return value.startsWith("data:image/") || value.startsWith("blob:") || value.startsWith("/api/result-media/") ? value : "";
 }
 export async function getImageBlob(storageKey: string) {
-    return readPrivateBlob(fileUrl(storageKey));
+    return readBrowserFile(storageKey);
 }
 export function previewUrlFor(storageKey?: string) {
     return storageKey ? previewUrls.get(storageKey) : undefined;
@@ -66,17 +87,23 @@ export async function ensureImagePreview(storageKey?: string) {
     return url;
 }
 
-// Importers upload and rewrite all package references to newly allocated IDs.
+// Importers store files locally and rewrite package references to newly allocated IDs.
 export async function setImageBlob(_storageKey: string, blob: Blob) {
     return (await uploadImage(blob)).url;
 }
 export async function imageToDataUrl(image: { url?: string; dataUrl?: string; storageKey?: string }, options?: ImageReadOptions) {
-    const url = image.storageKey ? fileUrl(image.storageKey) : image.dataUrl || image.url || "";
-    if (url.startsWith("data:image/")) return url;
-    const blob = await readPrivateBlob(url, options?.signal);
+    const url = image.dataUrl || image.url || "";
+    if (!image.storageKey && url.startsWith("data:image/")) return url;
+    const epoch = sessionEpoch();
+    const blob = image.storageKey ? await readBrowserFile(image.storageKey) : await readPrivateBlob(url, options?.signal);
+    options?.signal?.throwIfAborted();
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
     return new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
+        reader.onload = () => {
+            if (epoch !== sessionEpoch() || options?.signal?.aborted) reject(new Error(i18n.t("saveRecovery.sessionChanged")));
+            else resolve(String(reader.result));
+        };
         reader.onerror = reject;
         reader.readAsDataURL(blob);
     });

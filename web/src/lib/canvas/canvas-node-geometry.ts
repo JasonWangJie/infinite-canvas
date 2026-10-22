@@ -1,6 +1,6 @@
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type ConnectionHandle, type ViewportTransform } from "@/types/canvas";
 
-export function nodeBounds(nodes: CanvasNodeData[]) {
+export function nodeBounds(nodes: readonly Pick<CanvasNodeData, "position" | "width" | "height">[]) {
     return nodes.reduce(
         (acc, node) => ({
             left: Math.min(acc.left, node.position.x),
@@ -173,4 +173,10 @@ export function focusViewportForNode(node: Pick<CanvasNodeData, "position" | "wi
     const slack = usableBottom - groupHeight;
     const groupTop = slack * (below > 0 && slack > 0 ? 0.75 : 0.5);
     return { x: size.width / 2 - nodeCenterX * k, y: groupTop + groupHeight / 2 - nodeCenterY * k - (below - above) / 2, k };
+}
+
+export function focusViewportForNodes(nodes: readonly Pick<CanvasNodeData, "position" | "width" | "height">[], size: { width: number; height: number }, frame: FocusFrame = {}) {
+    if (!nodes.length) return null;
+    const bounds = nodeBounds(nodes);
+    return focusViewportForNode({ position: { x: bounds.left, y: bounds.top }, width: bounds.right - bounds.left, height: bounds.bottom - bounds.top }, size, frame);
 }

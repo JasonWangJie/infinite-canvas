@@ -167,6 +167,7 @@ export type GenerateVideoOptions = GenerateOptions & {
 
 export type GenerateVideoResult = {
     url: string; // 视频可访问 URL
+    storageKey: string; // 随节点 metadata 保存，刷新后由宿主恢复本地视频 URL
     mimeType: string;
     width?: number;
     height?: number;

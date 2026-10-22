@@ -3,7 +3,8 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
-import { onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
+import { currentSession, onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
+import { flushDocument, getDocumentDraft, getDocumentSaveState, reloadSavedDocument, stageDocument } from "@/services/canvas-data";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
@@ -45,30 +46,71 @@ const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
+let applyingSnapshot = false;
 onSessionEnd(() => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
     queuedPersistState = null;
 });
 
+export async function flushCanvasSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    await flushDocument("canvas");
+}
+
+export async function refreshCanvasTaskTarget(projectId: string, nodeId: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    if (!currentSession()) throw new Error(i18n.t("managed.sessionExpired"));
+    const status = getDocumentSaveState("canvas").status;
+    if (status !== "idle" && status !== "saved") {
+        if (useCanvasStore.getState().openProject(projectId)?.nodes.some((node) => node.id === nodeId)) return;
+        throw new Error(i18n.t("taskCenter.unsavedTarget"));
+    }
+    await reloadSavedDocument("canvas", (value) => {
+        const persisted = value as StorageValue<CanvasStore> | null;
+        if (!Array.isArray(persisted?.state?.projects) || !Array.isArray(persisted.state.deletedProjects)) throw new Error(i18n.t("saveRecovery.invalidCanvasDocument"));
+        const project = persisted.state.projects.find((item) => item.id === projectId);
+        if (!Array.isArray(project?.nodes) || !project.nodes.some((node) => node.id === nodeId)) throw new Error(i18n.t("taskCenter.missingTarget"));
+    }, applyCanvasDocument, signal);
+}
+
+export function applyCanvasDocument(document: unknown) {
+    if (!currentSession() || getDocumentDraft("canvas") !== document) throw new Error(i18n.t("saveRecovery.newEditsDuringRecovery"));
+    const persisted = document as StorageValue<CanvasStore>;
+    if (!Array.isArray(persisted?.state?.projects) || !Array.isArray(persisted.state.deletedProjects)) throw new Error(i18n.t("saveRecovery.invalidCanvasDocument"));
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    queuedPersistState = persisted.state;
+    applyingSnapshot = true;
+    try {
+        useCanvasStore.setState({ projects: persisted.state.projects, deletedProjects: persisted.state.deletedProjects, hydrated: true });
+    } finally {
+        applyingSnapshot = false;
+    }
+}
+
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
         const value = await localForageStorage.getItem(name);
         if (!value) return null;
         const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
+        if (!Array.isArray(parsed?.state?.projects) || !Array.isArray(parsed.state.deletedProjects)) throw new Error(i18n.t("saveRecovery.invalidCanvasDocument"));
         queuedPersistState = parsed.state as PersistedCanvasState;
         return parsed;
     },
     setItem: (name, value) => {
+        if (applyingSnapshot || !currentSession()) return;
         const nextState = value.state as PersistedCanvasState;
         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
         queuedPersistState = nextState;
+        stageDocument("canvas", value);
         if (saveTimer) clearTimeout(saveTimer);
         const epoch = sessionEpoch();
         saveTimer = setTimeout(() => {
             if (epoch !== sessionEpoch()) return;
             saveTimer = null;
-            void localForageStorage.setItem(name, JSON.stringify(value));
+            void flushCanvasSave().catch(() => {});
         }, 400);
     },
     removeItem: (name) => localForageStorage.removeItem(name),
@@ -148,8 +190,12 @@ export const useCanvasStore = create<CanvasStore>()(
                     projects: state.projects,
                     deletedProjects: state.deletedProjects,
                 }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => () => {
-                useCanvasStore.setState({ hydrated: true });
+            merge: (stored, current) => {
+                const state = stored as PersistedCanvasState | undefined;
+                return { ...current, projects: state?.projects || current.projects, deletedProjects: state?.deletedProjects || current.deletedProjects, hydrated: true };
+            },
+            onRehydrateStorage: () => (_state, error) => {
+                if (error) throw error;
             },
         },
     ),

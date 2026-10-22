@@ -1,14 +1,29 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { Alert, Button, Result, Spin } from "antd";
-import { canvasJson, currentSession, endCanvasSession, notifyCanvasLogout, readCanvasSession, sessionEpoch } from "@/services/api/canvas-client";
+import { CanvasSessionError, canvasJson, currentSession, endCanvasSession, notifyCanvasLogout, onSessionEnd, readCanvasSession, sessionEpoch } from "@/services/api/canvas-client";
 import { useTranslation } from "react-i18next";
+import i18n from "@/i18n";
 
 let bootstrap: Promise<void> | undefined;
+onSessionEnd(() => {
+    bootstrap = undefined;
+});
 function initialize() {
-    bootstrap ||= readCanvasSession().then(async (session) => {
-        const { hydrateCanvasSession } = await import("@/services/canvas-bootstrap");
-        await hydrateCanvasSession(session);
-    });
+    if (!bootstrap) {
+        const epoch = sessionEpoch();
+        const pending = readCanvasSession()
+            .then(async (session) => {
+                const { hydrateCanvasSession } = await import("@/services/canvas-bootstrap");
+                if (epoch !== sessionEpoch()) throw new CanvasSessionError(i18n.t("managed.sessionExpired"), false);
+                await hydrateCanvasSession(session);
+                if (epoch !== sessionEpoch()) throw new CanvasSessionError(i18n.t("managed.sessionExpired"), false);
+            })
+            .catch((error) => {
+                if (bootstrap === pending) bootstrap = undefined;
+                throw error;
+            });
+        bootstrap = pending;
+    }
     return bootstrap;
 }
 
@@ -16,74 +31,99 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
     const { t } = useTranslation();
     const [ready, setReady] = useState(false);
     const [error, setError] = useState("");
-    const [storageError, setStorageError] = useState("");
+    const [connectionError, setConnectionError] = useState("");
+    const [retryable, setRetryable] = useState(false);
+    const [attempt, setAttempt] = useState(0);
+    const [expiresAt, setExpiresAt] = useState(0);
+    const recheck = useCallback(async (activity = false) => {
+        if (!currentSession() || document.visibilityState === "hidden") return;
+        const epoch = sessionEpoch();
+        try {
+            const session = await readCanvasSession(activity);
+            if (epoch === sessionEpoch()) {
+                setConnectionError("");
+                setExpiresAt(session.expires_at);
+            }
+        } catch (reason) {
+            // Authentication failures terminate the session in canvas-client.
+            // A failed connectivity check must not discard drafts or abort AI work.
+            if (epoch === sessionEpoch() && currentSession()) setConnectionError(reason instanceof Error ? reason.message : String(reason));
+        }
+    }, []);
     useEffect(() => {
         let alive = true;
         for (const key of ["infinite-canvas:ai_config_store", "canvas-agent-token", "canvas-agent-url"]) localStorage.removeItem(key);
+        setError("");
         void initialize()
             .then(() => {
-                if (alive && currentSession()) setReady(true);
+                if (alive && currentSession()) {
+                    setExpiresAt(currentSession()!.expires_at);
+                    setReady(true);
+                }
             })
             .catch((reason) => {
-                if (alive) setError(reason instanceof Error ? reason.message : t("managed.authorizationFailed"));
+                if (alive) {
+                    setError(reason instanceof Error ? reason.message : t("managed.authorizationFailed"));
+                    setRetryable(!(reason instanceof CanvasSessionError) || reason.retryable);
+                }
             });
+        return () => {
+            alive = false;
+        };
+    }, [t, attempt]);
+    useEffect(() => {
         const expired = (event: Event) => {
             setReady(false);
+            setRetryable(false);
+            setConnectionError("");
             setError((event as CustomEvent<string>).detail || t("managed.sessionExpired"));
         };
-        const saveError = (event: Event) => setStorageError((event as CustomEvent<string>).detail);
-        const recheck = () => {
-            if (!currentSession() || document.visibilityState === "hidden") return;
-            const epoch = sessionEpoch();
-            void readCanvasSession().catch((reason) => {
-                if (epoch === sessionEpoch()) endCanvasSession(reason instanceof Error ? reason.message : undefined);
-            });
+        const focus = () => {
+            void recheck();
         };
         let checkingActivity = false;
         const activity = () => {
             if (!currentSession() || checkingActivity) return;
             checkingActivity = true;
-            const epoch = sessionEpoch();
-            void readCanvasSession(true)
-                .catch((reason) => {
-                    if (epoch === sessionEpoch()) endCanvasSession(reason instanceof Error ? reason.message : undefined);
-                })
-                .finally(() => {
-                    checkingActivity = false;
-                });
+            void recheck(true).finally(() => {
+                checkingActivity = false;
+            });
         };
         window.addEventListener("canvas-session-ended", expired);
-        window.addEventListener("canvas-storage-error", saveError);
-        window.addEventListener("focus", recheck);
-        document.addEventListener("visibilitychange", recheck);
+        window.addEventListener("focus", focus);
+        document.addEventListener("visibilitychange", focus);
         window.addEventListener("pointerdown", activity, { passive: true });
         window.addEventListener("keydown", activity);
         return () => {
-            alive = false;
             window.removeEventListener("canvas-session-ended", expired);
-            window.removeEventListener("canvas-storage-error", saveError);
-            window.removeEventListener("focus", recheck);
-            document.removeEventListener("visibilitychange", recheck);
+            window.removeEventListener("focus", focus);
+            document.removeEventListener("visibilitychange", focus);
             window.removeEventListener("pointerdown", activity);
             window.removeEventListener("keydown", activity);
         };
-    }, [t]);
+    }, [t, recheck]);
     useEffect(() => {
         if (!ready) return;
-        const timer = window.setTimeout(() => endCanvasSession(), Math.max(0, (currentSession()?.expires_at || 0) * 1000 - Date.now()));
+        const timer = window.setTimeout(() => endCanvasSession(), Math.max(0, expiresAt * 1000 - Date.now()));
         return () => window.clearTimeout(timer);
-    }, [ready]);
+    }, [ready, expiresAt]);
     if (error)
         return (
             <div className="flex min-h-dvh items-center justify-center bg-background">
                 <Result
-                    status="403"
-                    title={t("managed.authorizationRequired")}
+                    status={retryable ? "warning" : "403"}
+                    title={t(retryable ? "managed.loadFailed" : "managed.authorizationRequired")}
                     subTitle={error}
                     extra={
-                        <Button type="primary" href="/auth/start">
-                            {t("managed.authorize")}
-                        </Button>
+                        retryable ? (
+                            <Button type="primary" onClick={() => setAttempt((value) => value + 1)}>
+                                {t("workbench.retry")}
+                            </Button>
+                        ) : (
+                            <Button type="primary" href="/auth/start">
+                                {t("managed.authorize")}
+                            </Button>
+                        )
                     }
                 />
             </div>
@@ -96,7 +136,7 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
         );
     return (
         <>
-            {storageError ? <Alert type="error" showIcon title={t("managed.saveFailed")} description={storageError} action={<Button onClick={() => window.location.reload()}>{t("managed.reload")}</Button>} /> : null}
+            {connectionError ? <Alert type="warning" showIcon title={t("managed.connectionInterrupted")} description={connectionError} action={<Button onClick={() => void recheck()}>{t("workbench.retry")}</Button>} /> : null}
             {children}
         </>
     );

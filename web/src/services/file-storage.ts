@@ -1,18 +1,23 @@
-import { readPrivateBlob } from "@/services/api/canvas-client";
-import { deletePrivateFile, fileUrl, uploadPrivateFile } from "@/services/canvas-data";
+import { readPrivateBlob, sessionEpoch } from "@/services/api/canvas-client";
+import { deletePrivateFile, uploadPrivateFile } from "@/services/canvas-data";
+
+import { readBrowserFile, resolveBrowserFileUrl } from "@/services/browser-files";
 
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
 export async function uploadMediaFile(input: string | Blob, _prefix = "file"): Promise<UploadedFile> {
+    const epoch = sessionEpoch();
     const blob = typeof input === "string" ? await readPrivateBlob(input) : input;
+    if (epoch !== sessionEpoch()) throw new Error("登录会话已改变");
     const file = await uploadPrivateFile(blob, "media");
     const meta = blob.type.startsWith("video/") ? await readMediaMeta(blob, "video") : blob.type.startsWith("audio/") ? await readMediaMeta(blob, "audio") : {};
+    if (epoch !== sessionEpoch()) throw new Error("登录会话已改变");
     return { url: file.url, storageKey: file.storageKey, bytes: file.bytes, mimeType: file.mimeType, ...meta };
 }
 export async function resolveMediaUrl(storageKey?: string, fallback = "") {
-    return storageKey ? fileUrl(storageKey) : /^(blob:|data:|\/api\/files\/)/.test(fallback) ? fallback : "";
+    return storageKey ? resolveBrowserFileUrl(storageKey) : /^(blob:|data:|\/api\/result-media\/)/.test(fallback) ? fallback : "";
 }
 export async function getMediaBlob(storageKey: string) {
-    return readPrivateBlob(fileUrl(storageKey));
+    return readBrowserFile(storageKey);
 }
 export async function setMediaBlob(_storageKey: string, blob: Blob) {
     return (await uploadMediaFile(blob)).url;

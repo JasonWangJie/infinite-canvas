@@ -2,8 +2,11 @@ import { create } from "zustand";
 import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 
 import { nanoid } from "nanoid";
+import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
-import { cleanupUnusedImages, ensureImagePreview, previewUrlFor, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { currentSession, sessionEpoch } from "@/services/api/canvas-client";
+import { equalDocument, flushDocument, getDocumentBaseline, getDocumentSaveState } from "@/services/canvas-data";
+import { cleanupUnusedImages, ensureImagePreview, previewUrlFor, resolveImageUrl } from "@/services/image-storage";
 import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
 
 export type AssetKind = "text" | "image" | "video";
@@ -29,6 +32,8 @@ type AssetStore = {
     hydrated: boolean;
     assets: Asset[];
     addAsset: (asset: Omit<Asset, "id" | "createdAt" | "updatedAt">) => string;
+    addAssets: (assets: Omit<Asset, "id" | "createdAt" | "updatedAt">[]) => string[];
+    addAssetsAndSave: (assets: Omit<Asset, "id" | "createdAt" | "updatedAt">[], epoch?: number) => Promise<string[]>;
     updateAsset: (id: string, patch: Partial<Omit<Asset, "id" | "createdAt">>) => void;
     removeAsset: (id: string) => void;
     replaceAssets: (assets: Asset[]) => void;
@@ -44,11 +49,20 @@ export function assetCoverUrl(asset: Asset) {
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
 
+export function assertAssetSaveReady(epoch = sessionEpoch()) {
+    if (!currentSession() || epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    if (!useAssetStore.getState().hydrated) throw new Error(i18n.t("assets.importJobNotReady"));
+    const status = getDocumentSaveState("assets").status;
+    if (status === "error" || status === "conflict") throw new Error(i18n.t("assets.importJobRecoveryRequired"));
+    if (status === "pending" || status === "saving") throw new Error(i18n.t("assets.formSaveUnconfirmed"));
+}
+
 const assetStorage: PersistStorage<AssetStore> = {
     getItem: async (name) => {
         const value = await localForageStorage.getItem(name);
         if (!value) return null;
         const parsed = JSON.parse(value) as StorageValue<AssetStore>;
+        if (!Array.isArray(parsed?.state?.assets)) throw new Error("素材数据无法读取，原数据未被修改");
         parsed.state.assets = await Promise.all(
             parsed.state.assets.map(async (asset) => {
                 if (asset.kind === "video" && asset.data.storageKey) return { ...asset, data: { ...asset.data, url: await resolveMediaUrl(asset.data.storageKey, asset.data.url) } };
@@ -61,9 +75,8 @@ const assetStorage: PersistStorage<AssetStore> = {
                         data: { ...asset.data, dataUrl: await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl) },
                     };
                 }
-                if (!asset.data.dataUrl.startsWith("data:image/")) return asset;
-                const image = await uploadImage(asset.data.dataUrl);
-                return { ...asset, coverUrl: asset.coverUrl.startsWith("data:image/") ? image.url : asset.coverUrl, data: { ...asset.data, dataUrl: image.url, storageKey: image.storageKey, bytes: image.bytes, mimeType: image.mimeType } };
+                // Reading existing assets must not upload or replace their contents.
+                return asset;
             }),
         );
         return parsed;
@@ -77,11 +90,24 @@ export const useAssetStore = create<AssetStore>()(
         (set, get) => ({
             hydrated: false,
             assets: [],
-            addAsset: (asset) => {
+            addAsset: (asset) => get().addAssets([asset])[0],
+            addAssets: (assets) => {
+                if (!assets.length) return [];
                 const now = new Date().toISOString();
-                const id = nanoid();
-                set((state) => ({ assets: [{ ...asset, id, createdAt: now, updatedAt: now } as Asset, ...state.assets] }));
-                return id;
+                const added = assets.map((asset) => ({ ...asset, id: nanoid(), createdAt: now, updatedAt: now } as Asset));
+                set((state) => ({ assets: [...added, ...state.assets] }));
+                return added.map((asset) => asset.id);
+            },
+            addAssetsAndSave: async (assets, epoch = sessionEpoch()) => {
+                assertAssetSaveReady(epoch);
+                const ids = get().addAssets(assets);
+                const added = JSON.parse(JSON.stringify(get().assets.filter((asset) => ids.includes(asset.id)))) as Asset[];
+                await flushDocument("assets");
+                if (!currentSession() || epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+                const saved = getDocumentBaseline("assets") as { state?: { assets?: Asset[] } } | undefined;
+                const current = JSON.parse(JSON.stringify(get().assets)) as Asset[];
+                if (!added.every((asset) => equalDocument(current.find((item) => item.id === asset.id), asset) && equalDocument(saved?.state?.assets?.find((item) => item.id === asset.id), asset))) throw new Error(i18n.t("assets.formSaveUnconfirmed"));
+                return ids;
             },
             updateAsset: (id, patch) =>
                 set((state) => ({
@@ -107,8 +133,10 @@ export const useAssetStore = create<AssetStore>()(
             name: ASSET_STORE_KEY,
             storage: assetStorage,
             partialize: (state) => ({ assets: state.assets }) as StorageValue<AssetStore>["state"],
-            onRehydrateStorage: () => () => {
-                useAssetStore.setState({ hydrated: true });
+            merge: (stored, current) => ({ ...current, ...(stored as Partial<AssetStore>), hydrated: true }),
+            onRehydrateStorage: () => (_state, error) => {
+                // Let bootstrap show the read failure; persisting defaults here would erase the document.
+                if (error) throw error;
             },
         },
     ),

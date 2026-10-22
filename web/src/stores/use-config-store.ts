@@ -381,7 +381,8 @@ function uniqueModelOptions(models: string[]) {
 }
 
 export function buildApiUrl(_baseUrl: string, path: string) {
-    if (!/^\/(responses|chat\/completions|images\/(generations|edits)|audio\/speech|videos(?:\/[^/?#]+(?:\/content)?)?)$/.test(path)) throw new Error("不支持的网关接口");
+    if (!/^\/(responses|chat\/completions|images\/(?:generations|edits)(?:_async)?|(?:images|media)\/tasks_async\/[A-Za-z0-9_-]+(?:\/content\/[A-Za-z0-9][A-Za-z0-9._~-]{0,127})?|audio\/speech|videos(?:\/[^/?#]+(?:\/content)?)?)$/.test(path))
+        throw new Error("不支持的网关接口");
     return `/api/ai/v1${path}`;
 }
 

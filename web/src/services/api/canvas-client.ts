@@ -1,6 +1,16 @@
 import axios from "axios";
+import i18n from "@/i18n";
 
 export type CanvasSession = { user: { id: string | number; subject: string; username: string; display_name?: string }; csrf_token: string; session_tag: string; expires_at: number };
+export class CanvasSessionError extends Error {
+    constructor(
+        message: string,
+        readonly retryable: boolean,
+        readonly status?: number,
+    ) {
+        super(message);
+    }
+}
 const SESSION_TAG_KEY = "infinite-canvas:session-tag";
 const LOGOUT_TAG_KEY = "infinite-canvas:logout-tag";
 let session: CanvasSession | null = null;
@@ -62,28 +72,46 @@ export function endCanvasSession(message = "授权已失效，请从 New API 重
 export async function readCanvasSession(activity = false) {
     const requestEpoch = sessionEpoch();
     const previousSharedTag = readSharedTag();
-    const response = await fetch("/api/session", {
-        credentials: "same-origin",
-        cache: "no-store",
-        redirect: "error",
-        headers: { ...(activity ? { "X-Canvas-Activity": "1" } : {}), ...(session ? { "X-Canvas-Session-Tag": session.session_tag } : {}) },
-        signal: requests.signal,
-    });
+    if (session && session.expires_at * 1000 <= Date.now()) {
+        endCanvasSession();
+        throw new CanvasSessionError(i18n.t("managed.sessionExpired"), false);
+    }
+    let response: Response;
+    try {
+        response = await fetch("/api/session", {
+            credentials: "same-origin",
+            cache: "no-store",
+            redirect: "error",
+            headers: { ...(activity ? { "X-Canvas-Activity": "1" } : {}), ...(session ? { "X-Canvas-Session-Tag": session.session_tag } : {}) },
+            signal: requests.signal,
+        });
+    } catch {
+        if (requestEpoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
+        throw new CanvasSessionError(i18n.t("managed.connectionInterrupted"), true);
+    }
+    if (requestEpoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
     if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        throw new Error(body.error?.message || "授权已失效，请从 New API 重新进入画布");
+        if (requestEpoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
+        const message = body.error?.message || i18n.t(response.status === 401 ? "managed.sessionExpired" : "managed.connectionInterrupted");
+        if (response.status === 401) endCanvasSession(message);
+        throw new CanvasSessionError(message, response.status !== 401, response.status);
     }
-    const next = (await response.json()) as CanvasSession;
-    if (!next.user?.id || !/^ics_[a-f0-9]{32}$/.test(next.user.subject) || !next.csrf_token || !next.session_tag || next.expires_at * 1000 <= Date.now()) throw new Error("画布授权无效");
-    if (requestEpoch !== sessionEpoch()) throw new Error("登录会话已改变");
+    const next = (await response.json().catch(() => null)) as CanvasSession | null;
+    if (requestEpoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
+    if (!next?.user?.id || !/^ics_[a-f0-9]{32}$/.test(next.user.subject) || !next.csrf_token || !next.session_tag || !Number.isFinite(next.expires_at)) throw new CanvasSessionError(i18n.t("managed.loadFailed"), true);
+    if (next.expires_at * 1000 <= Date.now()) {
+        endCanvasSession();
+        throw new CanvasSessionError(i18n.t("managed.sessionExpired"), false);
+    }
     const sharedTag = readSharedTag();
     if (sharedTag !== previousSharedTag && sharedTag !== next.session_tag) {
         endCanvasSession();
-        throw new Error("其他标签页已切换授权，请重新进入画布");
+        throw new CanvasSessionError("其他标签页已切换授权，请重新进入画布", false);
     }
     if (session && (session.user.subject !== next.user.subject || session.session_tag !== next.session_tag)) {
         endCanvasSession();
-        throw new Error("登录用户已改变，请重新进入画布");
+        throw new CanvasSessionError("登录用户已改变，请重新进入画布", false);
     }
     session = next;
     if (sharedTag !== next.session_tag) {
@@ -154,11 +182,28 @@ axios.interceptors.response.use(
 );
 
 export async function readPrivateBlob(url: string, signal?: AbortSignal) {
+    const epoch = sessionEpoch();
     const requestSignal = signal ? AbortSignal.any([signal, requests.signal]) : requests.signal;
-    if (url.startsWith("data:") || url.startsWith("blob:")) return (await fetch(url, { signal: requestSignal })).blob();
+    if (url.startsWith("local-file:")) {
+        const { readBrowserFile } = await import("@/services/browser-files");
+        requestSignal.throwIfAborted();
+        if (epoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
+        const blob = await readBrowserFile(decodeURIComponent(url.slice("local-file:".length)));
+        requestSignal.throwIfAborted();
+        return blob;
+    }
+    if (url.startsWith("data:") || url.startsWith("blob:")) {
+        const blob = await (await fetch(url, { signal: requestSignal })).blob();
+        if (epoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
+        return blob;
+    }
     const parsed = new URL(url, window.location.origin);
-    if (parsed.origin !== window.location.origin || !/^\/api\/(files\/|prompt-assets\/|ai\/v1\/videos\/)/.test(parsed.pathname)) throw new Error("远程素材必须先由网关安全保存，请上传本地文件");
+    const privateMedia = /^\/api\/(result-media\/[A-Za-z0-9_-]+$|prompt-assets\/[A-Za-z0-9_-]+$|ai\/v1\/videos\/)/.test(parsed.pathname);
+    const taskMedia = /^\/api\/ai\/v1\/(images|media)\/tasks_async\/[A-Za-z0-9_-]+\/content\/[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/.test(parsed.pathname) && !parsed.search;
+    if (parsed.origin !== window.location.origin || parsed.username || parsed.password || (!privateMedia && !taskMedia)) throw new Error("远程素材必须通过已授权的网关地址读取，请选择本地文件");
     const response = await canvasFetch(`${parsed.pathname}${parsed.search}`, { signal });
     if (!response.ok) throw new Error("无法读取素材，授权可能已过期");
-    return response.blob();
+    const blob = await response.blob();
+    if (epoch !== sessionEpoch()) throw new CanvasSessionError("登录会话已改变", false);
+    return blob;
 }

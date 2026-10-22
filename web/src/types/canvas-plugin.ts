@@ -13,7 +13,7 @@ export type GenerateOptions = { signal?: AbortSignal; references?: string[]; mod
 export type GenerateImageOptions = GenerateOptions & { count?: number; size?: string };
 export type GenerateImageResult = { images: string[] };
 export type GenerateVideoOptions = GenerateOptions & { size?: string; seconds?: string };
-export type GenerateVideoResult = { url: string; mimeType: string; width?: number; height?: number; durationMs?: number };
+export type GenerateVideoResult = { url: string; storageKey: string; mimeType: string; width?: number; height?: number; durationMs?: number };
 export type GenerateTextOptions = { signal?: AbortSignal; model?: string; system?: string; onDelta?: (text: string) => void };
 export type GenerateTextResult = { text: string };
 export type PluginModelCapability = "image" | "video" | "text" | "audio";
