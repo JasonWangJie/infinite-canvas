@@ -1,13 +1,27 @@
 ---
 title: 本地开发
-description: 前端优先的本地开发方式
+description: 同时启动前端和 Canvas BFF，对接 New API
 ---
 
 # 本地开发
 
-当前主应用以 `web/` 前端为主，AI 请求由浏览器前台直连用户自己的 OpenAI 兼容接口。
+受管前端位于 `web/`，通过同源 `/auth`、`/api` 请求 `canvas-server/` 中的 Canvas BFF，由 BFF 管理凭证并向 New API 转发模型请求。
 
-## 1. 启动前端
+## 1. 配置 New API 并启动 BFF
+
+需要支持 Canvas 授权集成的 New API，并注册画布应用的客户端 ID、共享密钥和回调 `http://localhost:3000/auth/callback`。只有 OpenAI 兼容接口、没有授权集成路由的服务不能直接替代。
+
+将 `canvas-server/.env.example` 中的字段复制到私有环境文件。本机开发设置 `CANVAS_ORIGIN=http://localhost:3000`，New API 内部地址和公开地址分别使用 BFF 与浏览器可访问的地址；共享密钥必须与注册信息一致。按示例生成独立的 32 字节 base64 会话加密密钥，为 `DATA_DIR` 选择固定保存目录，建议使用绝对路径避免受工作目录影响。
+
+在一个终端启动 BFF：
+
+```bash
+cd canvas-server
+bun install
+bun --env-file=/path/to/canvas.env --watch src/index.ts
+```
+
+## 2. 在另一个终端启动前端
 
 ```bash
 cd web
@@ -15,15 +29,11 @@ bun install
 bun run dev
 ```
 
-前端默认访问：
+Vite 默认访问地址为 `http://localhost:3000`，将 `/auth`、`/api` 转发到 `http://127.0.0.1:3001`。BFF 使用其他地址时，在前端进程设置 `CANVAS_DEV_BACKEND`；浏览器访问源、`CANVAS_ORIGIN` 与注册回调必须一致。
 
-```text
-http://localhost:3000
-```
+登录 New API 后从其画布入口授权进入，再选择可用模型。浏览器不填写服务商 API Key 或任意地址；提示词目录和媒体经过 BFF，本地代理、本机 Agent、WebDAV 与远程插件均不开放。
 
-## 2. 配置模型
-
-打开右上角配置弹窗，填写自己的 `Base URL`、`API Key` 和模型名。第三方提示词和 WebDAV 都由浏览器前端直连。
+非本机回环部署使用 HTTPS。浏览器业务数据保存在按授权用户隔离的 IndexedDB，BFF 数据目录仅保存授权状态；正常重启不要清空站点数据或随意更换会话加密密钥。
 
 ## 3. 启动文档站
 
@@ -36,5 +46,6 @@ bun run dev
 ## 常见场景
 
 - 改画布、页面和交互：主要看 `web/`
+- 改授权、模型转发与媒体访问：主要看 `canvas-server/`
 - 改提示词缓存：主要看 `web/src/services/api/prompts.ts`
 - 改文档站内容：主要看 `docs/content/docs/`

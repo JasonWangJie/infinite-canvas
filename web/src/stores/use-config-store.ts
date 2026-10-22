@@ -184,7 +184,7 @@ export function resolveModelForCapability(config: AiConfig, currentModel: string
         const configuredCapability = modelCapabilityOf(config, model);
         // Keep unavailable selections visible so the readiness check blocks the
         // request. Only a known capability switch may choose another model.
-        if (!configuredCapability || configuredCapability === capability) return model;
+        if (!configuredCapability || modelMatchesCapability(config, model, capability)) return model;
     }
     return fallbackModel;
 }
@@ -352,18 +352,24 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     );
 }
 
-export function resolveModelRequestConfig(config: AiConfig, value: string) {
+export function supportsAsyncImageGeneration(config: AiConfig, value: string) {
+    return Boolean(findChannelModel(config, value)?.model.endpointTypes?.includes("image-generation"));
+}
+
+export function resolveModelRequestConfig(config: AiConfig, value: string, capability: ModelCapability, operation?: "async") {
     const match = findChannelModel(useConfigStore.getState().config, value);
     if (!currentSession() || !match) throw new Error("当前用户无权调用所选模型，请刷新模型列表");
     const endpoints = match.model.endpointTypes || [];
-    const nativeGemini = endpoints.includes("gemini") && !endpoints.some((type) => ["openai", "openai-response", "image-generation", "openai-video"].includes(type));
+    const supported = capability === "image" ? operation === "async" ? ["image-generation"] : ["image-generation", "gemini"] : capability === "text" ? ["openai-response", "openai", "gemini"] : capability === "video" ? ["openai-video"] : ["openai"];
+    const endpoint = supported.find((type) => endpoints.includes(type));
+    if (!endpoint) throw new Error(operation === "async" ? i18n.t("managed.asyncImageModelRequired") : "当前模型不支持所选调用接口，请刷新模型列表");
     return {
         ...config,
         model: modelOptionName(value || config.model),
         baseUrl: "/api/ai",
         apiKey: "",
-        apiFormat: (nativeGemini ? "gemini" : "openai") as ApiCallFormat,
-        textApi: (endpoints.includes("openai") && !endpoints.includes("openai-response") ? "chat" : "responses") as "chat" | "responses",
+        apiFormat: (endpoint === "gemini" ? "gemini" : "openai") as ApiCallFormat,
+        textApi: (endpoint === "openai" ? "chat" : "responses") as "chat" | "responses",
     };
 }
 

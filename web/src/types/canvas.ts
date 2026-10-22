@@ -29,6 +29,7 @@ export type CanvasNodeImage = {
     id: string;
     status: CanvasNodeStatus;
     errorDetails?: string;
+    imageTaskRecordId?: string;
     content: string;
     storageKey?: string;
     naturalWidth: number;
@@ -50,6 +51,7 @@ export type CanvasNodeMetadata = {
     prompt?: string;
     status?: CanvasNodeStatus;
     errorDetails?: string;
+    imageTaskRecordId?: string;
     fontSize?: number;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;

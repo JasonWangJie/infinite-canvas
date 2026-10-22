@@ -5,12 +5,8 @@ description: Deploy Infinite Canvas with Render
 
 # Deploy on Render
 
-[Deploy to Render](https://render.com/deploy?repo=https://github.com/basketikun/infinite-canvas)
+The repository's Render shortcut describes the upstream standalone frontend. It does not provision Canvas BFF, the New API authorization integration or their shared configuration, so it is not a complete deployment path for this managed branch.
 
-1. Select **Deploy to Render**.
-2. Sign in and connect GitHub as prompted.
-3. Confirm the deployment.
+Start with [Quick Start](/docs/overview/quick-start) and the [managed Docker topology](/docs/overview/docker). Any Render deployment of this branch must provide the same BFF, New API, HTTPS origin, callback registration and persistent authorization storage, with `/api` and `/auth` available on the frontend's origin. This hosting configuration has not been acceptance-tested here.
 
-When deployment finishes, open the assigned `.onrender.com` domain.
-
-The default configuration uses Render's free Web Service. It sleeps after a period of inactivity and wakes on the next request. Application data is primarily stored in the browser, and prompt repositories are fetched by the frontend. The free tier is suitable for evaluation and demos; use Vercel or configure WebDAV for longer-term use.
+User business data remains in the current browser's IndexedDB; moving the frontend to another host does not synchronize it. Export complete resource packages for transfers and backups. WebDAV and browser-direct model requests are disabled.

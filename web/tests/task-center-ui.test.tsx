@@ -1,9 +1,9 @@
+import { browser } from "./browser";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { App, ConfigProvider } from "antd";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
-import { browser } from "./browser";
 import { mockBrowserDocuments } from "./local-document-fixture";
 import i18n from "../src/i18n";
 import TasksPage from "../src/pages/tasks";
@@ -12,6 +12,7 @@ import * as imageTasks from "../src/services/api/image-tasks";
 import { getDocumentDraft, getDocumentSaveState, readDocument, writeDocument } from "../src/services/canvas-data";
 import * as taskCenter from "../src/services/task-center";
 import * as canvasStore from "../src/stores/canvas/use-canvas-store";
+import * as clipboard from "../src/hooks/use-copy-text";
 import { endCanvasSession, readCanvasSession, sessionEpoch } from "../src/services/api/canvas-client";
 
 const globals = {
@@ -31,7 +32,7 @@ let openCanvas: ReturnType<typeof spyOn<typeof canvasStore, "refreshCanvasTaskTa
 let localDocuments: ReturnType<typeof mockBrowserDocuments>;
 
 function item(overrides: Partial<taskCenter.TaskCenterItem> = {}): taskCenter.TaskCenterItem {
-    return { id: "image-task:original", source: "image-tasks", kind: "image", status: "active", title: "A green forest", prompt: "A green forest", model: "image-model", createdAt: 0, taskId: "original-task", href: "/image?task=original", canResume: true, sessionEpoch: sessionEpoch(), ...overrides };
+    return { id: "image-task:original", recordId: "original", source: "image-tasks", kind: "image", status: "active", title: "A green forest", prompt: "A green forest", model: "image-model", createdAt: 0, taskId: "original-task", href: "/image?task=original", canResume: true, sessionEpoch: sessionEpoch(), ...overrides };
 }
 
 beforeEach(() => {
@@ -91,6 +92,24 @@ test("partial image batches show their summary separately from errors and only l
     expect(router.state.location.pathname).toBe("/image");
     expect(router.state.location.search).toBe("?task=original");
     expect(resume).not.toHaveBeenCalled();
+});
+
+test("canvas recovery links open the original image record and diagnostic copy uses only safe metadata", async () => {
+    const copied: string[] = [];
+    const copy = spyOn(clipboard, "useCopyText").mockReturnValue((value: string) => { copied.push(value); });
+    const record = item({ id: "canvas:p:n", recordId: "n", source: "canvas", status: "attention", projectId: "p", nodeId: "n", imageTaskRecordIds: ["image/original"], title: "private title", prompt: "private prompt", error: "private failure https://private.example", canResume: false });
+    load.mockResolvedValue({ items: [record], errors: {} });
+    try {
+        const router = await renderPage();
+        await act(async () => button("tasks.copyDiagnostics").click());
+        expect(copied).toEqual([taskCenter.taskCenterDiagnostics(record)]);
+        expect(copied[0]).not.toContain("private");
+        const link = container!.querySelector<HTMLAnchorElement>('a[href="/image?task=image%2Foriginal"]');
+        expect(link).not.toBeNull();
+        await act(async () => link!.click());
+        expect(router.state.location.pathname + router.state.location.search).toBe("/image?task=image%2Foriginal");
+        expect(resume).not.toHaveBeenCalled();
+    } finally { copy.mockRestore(); }
 });
 
 test.each([false, true])("local batch writes update the image panel without model queries or manual refresh (repeated save errors: %s)", async (saveFailures) => {

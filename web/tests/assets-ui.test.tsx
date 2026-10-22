@@ -141,20 +141,23 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-    if (root) await act(async () => root!.unmount());
-    root = undefined;
-    container?.remove();
-    container = undefined;
-    endCanvasSession();
-    localDocuments.restore();
-    localFiles.restore();
-    useAssetStore.setState({ assets: [], hydrated: false });
-    useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
-    globalThis.fetch = originalFetch;
-    browser.matchMedia = oldMatchMedia;
-    for (const [key, descriptor] of descriptors) {
-        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-        else Reflect.deleteProperty(globalThis, key);
+    try {
+        if (root) await act(async () => root!.unmount());
+    } finally {
+        root = undefined;
+        container?.remove();
+        container = undefined;
+        endCanvasSession();
+        localDocuments?.restore();
+        localFiles?.restore();
+        useAssetStore.setState({ assets: [], hydrated: false });
+        useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
+        globalThis.fetch = originalFetch;
+        browser.matchMedia = oldMatchMedia;
+        for (const [key, descriptor] of descriptors || []) {
+            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+            else Reflect.deleteProperty(globalThis, key);
+        }
     }
 });
 
@@ -492,6 +495,8 @@ test("manual validation keeps blank fields local and late cover reads cannot rep
     await editField("title", "   ");
     await editField("content", "   ");
     await clickText(i18n.t("common.save"), document.querySelector('[role="dialog"]')!);
+    // Ant Design renders ErrorList through a zero-delay timer after validation.
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain(i18n.t("assets.fields.titleRequired"));
     expect(requests.filter((request) => request.method === "PUT")).toHaveLength(0);
     await clickText(i18n.t("common.cancel"), document.querySelector('[role="dialog"]')!);

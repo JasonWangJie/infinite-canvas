@@ -1,13 +1,27 @@
 ---
 title: Local Development
-description: Frontend-first local development
+description: Run the frontend and Canvas BFF against New API
 ---
 
 # Local Development
 
-The main application lives in `web/`. The browser sends AI requests directly to the user's OpenAI-compatible endpoint.
+The managed frontend in `web/` calls Canvas BFF in `canvas-server/` through the same-origin `/auth` and `/api` routes. BFF manages credentials and forwards model requests to New API.
 
-## Start the frontend
+## Configure New API and BFF
+
+Use a New API instance with Canvas authorization integration and register the Canvas application's client ID, shared secret, and callback `http://localhost:3000/auth/callback`. A generic OpenAI-compatible endpoint without these integration routes is insufficient.
+
+Copy the fields in `canvas-server/.env.example` into a private environment file. For loopback development, set `CANVAS_ORIGIN=http://localhost:3000`; set the internal and public New API URLs to their respective reachable addresses. The shared secret must match the registered application. Generate a separate 32-byte base64 session encryption key as shown in the example, and choose a persistent `DATA_DIR` (an absolute path avoids working-directory ambiguity).
+
+Start BFF in one terminal:
+
+```bash
+cd canvas-server
+bun install
+bun --env-file=/path/to/canvas.env --watch src/index.ts
+```
+
+## Start the frontend in another terminal
 
 ```bash
 cd web
@@ -15,7 +29,11 @@ bun install
 bun run dev
 ```
 
-Open `http://localhost:3000`, then enter your `Base URL`, `API Key`, and model names in Settings. Prompt sources and WebDAV are also accessed directly by the browser.
+Vite listens on `http://localhost:3000` and proxies `/auth` and `/api` to `http://127.0.0.1:3001` by default. Set `CANVAS_DEV_BACKEND` in the frontend process if BFF uses another address; keep the browser's origin consistent with `CANVAS_ORIGIN` and the registered callback.
+
+Sign in to New API and use its Canvas entry to authorize, then select an available model. The browser has no provider API key or arbitrary host configuration. Prompt catalogs and media use BFF; local proxies, Agent connections, WebDAV and remote plugins are disabled.
+
+Use HTTPS outside loopback development. Browser data remains in IndexedDB, partitioned by authorized user; BFF's data directory contains authorization state only. Do not clear site data or rotate the encryption key as a routine restart step.
 
 ## Start the documentation site
 
@@ -27,5 +45,6 @@ bun run dev
 Common locations:
 
 - Canvas, pages, and interactions: `web/`
+- Authorization, model relay and media access: `canvas-server/`
 - Prompt caching: `web/src/services/api/prompts.ts`
 - Documentation content: `docs/content/docs/`

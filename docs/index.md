@@ -17,7 +17,7 @@
 
 - [Local Development](/docs/development/local-development)
 - [Canvas Data Structure](/docs/development/canvas-data-structure)
-- [How the Local Codex Connection Works](/docs/development/local-codex-canvas)
+- [How the Local Codex Connection Works (upstream standalone edition)](/docs/development/local-codex-canvas)
 
 ## Business
 
@@ -37,5 +37,8 @@
 
 ## Notes
 
-- Canvas projects and My Assets are primarily stored in the browser. WebDAV can be configured for cross-device synchronization.
-- The AI API key is stored in the browser, which sends requests directly to OpenAI-compatible endpoints.
+- This branch is the New API managed edition. Read the Quick Start and Local Development pages before running it: the frontend requires Canvas BFF and a New API instance with Canvas authorization integration.
+- Browser requests use the same-origin `/auth` and `/api` routes. Credentials remain in Canvas BFF; model and channel authorization comes from New API.
+- Projects, assets, configuration, generation records and media live in browser IndexedDB, partitioned by the authorized user's `subject`. Logout retains saved data; this is not cloud synchronization.
+- WebDAV, arbitrary AI hosts, browser API keys, local proxies, local Agent connections, model scripts and remote plugin installation are disabled. Their remaining documentation describes upstream standalone features.
+- Use `docker-compose.managed.yml` for the managed deployment topology. Docker static-resource paths, real HTTPS authorization and production upgrade/rollback still require acceptance testing.

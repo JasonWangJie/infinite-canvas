@@ -1,38 +1,38 @@
 ---
 title: Quick Start
-description: Run Infinite Canvas in a few steps
+description: Start the New API managed edition of Infinite Canvas
 ---
 
 # Quick Start
 
-To try the project, deploy or start the `web/` frontend.
+This branch requires the `web/` frontend, Canvas BFF in `canvas-server/`, and a New API instance with Canvas authorization integration. A static frontend deployment alone cannot sign in or call models.
 
-## Deploy with Vercel
+## Prerequisites
 
-Import the repository into Vercel. The root `vercel.json` builds `web/`. AI requests are sent directly from the browser to your OpenAI-compatible endpoint, so no additional application server is required.
+- Register the Canvas application in New API with its client ID, shared application secret, and exact callback URL: `<CANVAS_ORIGIN>/auth/callback`.
+- Configure the variables in `canvas-server/.env.example`. `CANVAS_ORIGIN` is the exact public Canvas origin; `NEW_API_URL` must be reachable by BFF, while `NEW_API_PUBLIC_URL` must be reachable by the browser.
+- Keep real secrets outside Git and container images. Preserve the session encryption key and BFF data volume across restarts. Set the proxy timeout explicitly to match the configured New API gateway policy.
+- Use HTTPS for production. Loopback HTTP is supported for development; see [Local Development](/docs/development/local-development).
 
-## Run locally
+## Start the services
 
-```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas/web
-bun install
-bun run dev
-```
+For development, start BFF and Vite in separate terminals using the [local development steps](/docs/development/local-development). Vite forwards `/auth` and `/api` to BFF.
 
-Open `http://localhost:3000`.
-
-## Run with Docker
+For the managed Docker topology, prepare an environment file outside the repository, then run from the repository root:
 
 ```bash
-docker build -t infinite-canvas .
-docker run --rm -p 3000:3000 infinite-canvas
+docker compose --env-file /path/to/canvas.env -f docker-compose.managed.yml up -d --build
 ```
 
-## First-time setup
+Follow [Docker Deployment](/docs/overview/docker) for the ingress and data-volume requirements. The default `docker-compose.yml`, standalone static image, Vercel configuration and Render shortcut do not provision the complete managed topology. Docker static-resource paths, real HTTPS authorization and production upgrade/rollback still need acceptance testing.
 
-- Open Settings and enter your `Base URL`, `API Key`, and model names.
-- Open `/prompts` to fetch prompt repositories directly from the browser and cache them in IndexedDB.
-- Configure WebDAV if you want to synchronize canvases, assets, and generation history across devices.
+## First use
 
-Canvas projects and My Assets are primarily stored in the browser. The API key is also stored locally and used by the browser to call OpenAI-compatible endpoints directly.
+1. Sign in to New API and open its Canvas entry to authorize the application.
+2. Select a model available to the authorized account. Manage channels and model permissions in New API; there are no browser API keys or arbitrary provider addresses to enter.
+3. Create a canvas, import local reference files and generate results. Prompt catalogs and their media are fetched through the authenticated BFF routes.
+4. Export complete resource packages for your own backups or transfers between browsers.
+
+Projects, assets, configuration, generation records and media are stored in the current browser's `infinite-canvas` IndexedDB, separated by authorized user. Logout retains saved data. Clearing site data removes these local records and files; there is no cloud synchronization or WebDAV. BFF persists only login and authorization state; generation requests and reference media still pass through New API.
+
+Local proxies, local Agent connections, arbitrary model scripts and remote plugin installation are disabled in this edition. The packaged SVG, Markdown, sticky-note and sandboxed HTML plugins remain available.

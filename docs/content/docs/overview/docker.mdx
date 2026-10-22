@@ -5,21 +5,23 @@ description: Deploy Infinite Canvas with Docker Compose
 
 # Docker Deployment
 
-## Use the published image
+## Managed application
+
+Prepare New API with Canvas authorization integration first; see [Quick Start](/docs/overview/quick-start). Copy `canvas-server/.env.example` to a private environment file outside the repository and fill in its values before running:
 
 ```bash
 git clone git@github.com:basketikun/infinite-canvas.git
 cd infinite-canvas
-docker compose up -d
+docker compose --env-file /path/to/canvas.env -f docker-compose.managed.yml up -d --build
 ```
 
-Open `http://localhost:3000`.
+This starts the Vite static frontend behind Nginx on port 3000 and a private Canvas BFF service on port 3001. BFF must be able to reach `NEW_API_URL`; the browser must be able to reach `NEW_API_PUBLIC_URL`.
 
-## Build locally
+Place an HTTPS ingress in front of port 3000, preserve the public Host, and set `CANVAS_ORIGIN` to that exact public origin. Register `<CANVAS_ORIGIN>/auth/callback` with the same client ID and secret in New API. Configure `CANVAS_PROXY_READ_TIMEOUT` to match the gateway's accepted generation and streaming duration; the compose file deliberately requires an explicit value.
 
-```bash
-docker compose -f docker-compose.local.yml up -d --build
-```
+The `canvas_private_data` volume stores BFF authorization state, not projects or media. Preserve that volume and `CANVAS_SESSION_ENCRYPTION_KEY` across restarts. Browser business data stays in IndexedDB, partitioned by authorized user; logout retains saved data. Generation requests and reference media still go through New API.
+
+The root `docker-compose.yml`, `docker-compose.local.yml` and standalone static image do not provide the complete managed topology. Docker static-resource paths, real HTTPS authorization, and production upgrade/rollback still require acceptance testing. After deployment, verify sign-in, model listing and local save/reload before testing a paid generation.
 
 ## Documentation image
 
@@ -37,26 +39,8 @@ cd docs
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
-The main application container only runs Next.js. Canvases, My Assets, generation history, and API keys are stored in the browser by default, while prompt repositories are fetched directly by the frontend. No persistent data volume is required for this data.
+The documentation site is separate from the Vite application and Canvas BFF. Its deployment does not establish Canvas authorization or a model relay.
 
 ## Optional analytics
 
-No analytics are enabled by default. A deployment can enable GA4, Baidu Analytics, or both at runtime:
-
-| Variable | Description |
-| --- | --- |
-| `ANALYTICS_GA4_ID` | Google Analytics 4 measurement ID (`G-XXXX`) |
-| `ANALYTICS_BAIDU_ID` | Baidu site ID, the hash after `hm.js?` |
-
-```yaml
-services:
-  app:
-    image: ghcr.io/basketikun/infinite-canvas:latest
-    ports:
-      - "3000:3000"
-    environment:
-      ANALYTICS_GA4_ID: G-XXXXXXXXXX
-      ANALYTICS_BAIDU_ID: e8263761cc5c32f5f7a855b8203b965a
-```
-
-SPA route changes automatically report page views to enabled providers. Only configure analytics IDs on sites you control, and do not commit them to the repository.
+The managed compose file does not enable analytics, and its Content Security Policy blocks external scripts and connections. The standalone image's analytics environment variables do not by themselves enable analytics in this topology. Do not weaken the managed policy just to copy a standalone deployment example.

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, App, Button, Empty, Input, Select, Spin, Tag, theme } from "antd";
-import { ArrowUpRight, ListChecks, Play, RefreshCw, Search } from "lucide-react";
+import { ArrowUpRight, Copy, ListChecks, Play, RefreshCw, Search } from "lucide-react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
-import { loadTaskCenter, resumeTaskCenterItem, type TaskCenterItem, type TaskCenterSource, type TaskCenterStatus } from "@/services/task-center";
+import { loadTaskCenter, resumeTaskCenterItem, taskCenterDiagnostics, type TaskCenterItem, type TaskCenterSource, type TaskCenterStatus } from "@/services/task-center";
 import { refreshCanvasTaskTarget } from "@/stores/canvas/use-canvas-store";
+import { useCopyText } from "@/hooks/use-copy-text";
 
 const sources: TaskCenterSource[] = ["image-tasks", "image-workbench", "video-workbench", "canvas"];
 const statuses: TaskCenterStatus[] = ["active", "attention", "completed", "failed"];
@@ -17,6 +18,7 @@ export default function TasksPage() {
     const { message } = App.useApp();
     const { token } = theme.useToken();
     const navigate = useNavigate();
+    const copyText = useCopyText();
     const [params, setParams] = useSearchParams();
     const [items, setItems] = useState<TaskCenterItem[]>([]);
     const [errors, setErrors] = useState<Partial<Record<TaskCenterSource, string>>>({});
@@ -188,11 +190,13 @@ export default function TasksPage() {
                                     {item.prompt && item.prompt !== item.title ? <p className="mt-1 line-clamp-2 whitespace-pre-wrap break-words text-sm" title={item.prompt} style={{ color: token.colorTextSecondary }}>{item.prompt}</p> : null}
                                     <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs" style={{ color: token.colorTextTertiary }}>
                                         {item.taskId ? <span className="break-all">{t("tasks.taskId", { id: item.taskId })}</span> : null}
+                                        {item.imageTaskRecordIds?.map((id) => <Link key={id} to={`/image?task=${encodeURIComponent(id)}`} className="break-all" style={{ color: token.colorLink }}>{t("tasks.imageTaskRecord", { id })}</Link>)}
                                         {hasTimestamp ? <time dateTime={timestamp.toISOString()}>{timestamp.toLocaleString(i18n.resolvedLanguage)}</time> : null}
                                     </div>
                                     {actionErrors[item.id] || item.error ? <p role="alert" className="mt-2 break-words text-sm" style={{ color: token.colorError }}>{actionErrors[item.id] || item.error}</p> : null}
                                 </div>
                                 <div className="flex shrink-0 flex-wrap items-center gap-2">
+                                    <Button type="text" icon={<Copy className="size-3.5" />} title={t("tasks.copyDiagnosticsHint")} onClick={() => { if (item.sessionEpoch === sessionEpoch()) copyText(taskCenterDiagnostics(item)); }}>{t("tasks.copyDiagnostics")}</Button>
                                     {item.canResume ? <Button icon={<Play className="size-3.5" />} title={t("tasks.resumeHint")} loading={busy.includes(item.id)} disabled={loading} onClick={() => void resume(item)}>{t("tasks.resume")}</Button> : null}
                                     {item.source === "canvas" ? <Button type="link" icon={<ArrowUpRight className="size-3.5" />} loading={busy.includes(`${item.id}:open`)} disabled={Boolean(opening.current)} onClick={() => void openCanvasSource(item)}>{t("tasks.openSource")}</Button> : <Link to={item.href} className="inline-flex min-h-8 items-center gap-1 px-2 text-sm" style={{ color: token.colorLink }}>{t("tasks.openSource")}<ArrowUpRight className="size-3.5" /></Link>}
                                 </div>

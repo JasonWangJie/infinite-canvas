@@ -23,6 +23,9 @@ export default {
         saveUnconfirmed: "The canvas save was not confirmed. Retry saving.",
     },
     tasks: {
+        copyDiagnostics: "Copy diagnostics",
+        copyDiagnosticsHint: "Copies only task status and related record IDs, without prompts, error details, or media",
+        imageTaskRecord: "Image record: {{id}}",
         title: "Task center",
         description: "Find generation records, check existing tasks, and open their canvas or workbench.",
         refresh: "Refresh list",
@@ -137,6 +140,13 @@ export default {
         invalidCanvas: "The canvas data is invalid. Your draft is preserved. Download the draft JSON.",
     },
     managed: {
+        modelsLoading: "Loading available models…",
+        modelsUnavailable: "Models are temporarily unavailable. Saved local content is still accessible.",
+        logoutSaving: "Saving before signing out",
+        logoutSavingHint: "Saving local changes. Please wait.",
+        logoutSaveFailed: "Sign-out stopped because local changes are not saved. Recover or export your draft first.",
+        gatewayModels: "New API · {{count}} available models",
+        asyncImageUnsupported: "This model does not support background image tasks. You can use synchronous generation.",
         imageBatchIncompleteNotice: "The remaining requests are unconfirmed. Refreshing or closing this page may prevent their results from arriving. Do not resubmit them.",
         imageBatchPartialNotice: "Successful images were kept; {{failed}} requests failed and {{unknown}} have unknown outcomes. Do not resubmit unknown requests.",
         imageBatchSaveFailed: "The generation record has not been saved. Received results remain in the current draft. Recover the save instead of resubmitting the batch.",
@@ -188,6 +198,7 @@ export default {
     },
     theme: { toggle: "Toggle theme" },
     common: {
+        close: "Close",
         cancel: "Cancel",
         save: "Save",
         edit: "Edit",
@@ -217,7 +228,7 @@ export default {
         video: { title: "Video settings", quality: "Quality", size: "Size", seconds: "Seconds", mode: "Mode", modes: { frames: "First & last frame", reference: "General reference" }, resolution: "Resolution", ratio: "Aspect ratio", duration: "Duration", smart: "Smart", output: "Output", generateAudio: "Generate audio", watermark: "Add watermark", adaptive: "Adaptive", sizes: { landscape: "Landscape", portrait: "Portrait", square: "Square", widescreen: "Widescreen", tall: "Tall", auto: "Auto" }, ratios: { landscape: "Landscape", portrait: "Portrait", square: "Square", standardLandscape: "Standard landscape", standardPortrait: "Standard portrait", cinematic: "Cinematic", adaptive: "Adaptive" } },
         audio: { title: "Audio settings", voice: "Voice", format: "Format", speed: "Speed", instructions: "Voice instructions", instructionsPlaceholder: "For example: natural, warm, and suitable for narration." },
         text: { title: "Text settings", reasoning: "Reasoning effort", count: "Generation count" },
-        model: { select: "Select model", assign: "Assign a model for {{capability}} in the provider settings", noMatch: "No matching {{capability}} models", addFirst: "Add a provider and models in Settings first", capabilities: { image: "image generation", video: "video", text: "text", audio: "audio" } },
+        model: { select: "Select model", assign: "Choose an available {{capability}} model in Settings", noMatch: "No matching {{capability}} models", addFirst: "Refresh available models in Settings and check gateway authorization", capabilities: { image: "image generation", video: "video", text: "text", audio: "audio" } },
     },
     generation: { pending: ["Creating image", "Almost there", "Just a little longer", "Refining details"] },
     imageReferences: { label: "Image {{index}}", separator: ", ", promptPrefix: "Reference image labels: {{labels}}. Use these labels to interpret image references in the prompt.\n\n{{prompt}}" },
@@ -238,7 +249,7 @@ export default {
             anyModel: "(the currently selected model)",
         },
     },
-    apiErrors: { requestFailed: "Request failed", requestCanceled: "Request canceled", baseUrlRequired: "Configure the Base URL first", apiKeyRequired: "Configure the API key first", authenticationFailed: "Authentication failed. Check the API key, plan permissions, and model permissions.", rateLimited: "The request was rate-limited or the quota is insufficient. Try again later.", notFound: "The endpoint was not found (404). Check the Base URL and selected model.", badGateway: "Gateway error (502). The API service is temporarily unavailable.", serviceBusy: "Service unavailable (503). Try again later.", httpFailed: "Request failed (HTTP {{status}}). Check the Base URL and API key.", htmlError: "The service returned an HTML error page ({{preview}})", imageTimeout: "The image request timed out. The endpoint did not respond in time; retry later or switch channels.", audioModelRequired: "Configure an audio model first", audioGenerationFailed: "Audio generation failed", scriptNoAudio: "The model request script did not return audio", geminiAudioUnsupported: "The Gemini API format does not support audio generation. Use an OpenAI-format provider.", invalidImageSizeFormat: "Unsupported image size. Use auto, 9:16, or 1024x1024.", positiveImageRatio: "The image ratio must use positive numbers, such as 9:16.", imageRatioLimit: "The image aspect ratio cannot exceed 3:1. Adjust the dimensions.", positiveImageDimensions: "Image dimensions must be positive integers, such as 1024x1024.", imageDimensionStep: "Image width and height must be multiples of 16.", imageEdgeLimit: "The longest image edge cannot exceed 3840px.", imagePixelLimit: "The total image pixel count must be between 655360 and 8294400.", unknownImageResponse: "The API returned data in an unknown format (fields: {{fields}}). Check model or API compatibility.", noImageReturned: "The API did not return an image. The prompt may have triggered safety review or the model may not support this operation.", geminiRejected: "Gemini rejected the request: {{reason}}", geminiNoImage: "The Gemini API did not return an image", maskModelUnsupported: "This model does not support mask editing. Use another provider.", noContent: "No content returned", modelReadFailed: "Failed to load models", videoTimeout: "{{provider}}video generation timed out. Try again later.", pluginVideoExpired: "The plugin video task has expired. Generate it again.", scriptNoVideo: "The model request script did not return a video", noPlayableVideo: "The video API did not return a playable video", noVideoTaskId: "The video API did not return a task ID", videoTaskCreateFailed: "Failed to create video task", videoGenerationFailed: "Video generation failed", videoTaskQueryFailed: "Failed to query video task", videoPromptRequired: "Enter a video prompt or connect a reference image, video, or audio asset", referenceImageReadFailed: "Failed to read the reference image. Choose another image or upload it again.", invalidReferenceVideo: "A reference video must be a public URL, asset ID, or locally saved video", invalidReferenceAudio: "Reference audio must be a public URL, asset ID, or locally saved audio file", videoModelRequired: "Configure a video model first", geminiVideoUnsupported: "The Gemini API format does not support video generation. Use an OpenAI-format provider.", noVideoTask: "The API did not return a video task", videoDownloadFailed: "Failed to download video", localAssetReadFailed: "Failed to read local asset" },
+    apiErrors: { requestFailed: "Request failed", requestCanceled: "Request canceled", baseUrlRequired: "Configure the Base URL first", apiKeyRequired: "Configure the API key first", authenticationFailed: "Authentication failed. Check the API key, plan permissions, and model permissions.", rateLimited: "The request was rate-limited or the quota is insufficient. Try again later.", notFound: "The endpoint was not found (404). Check the Base URL and selected model.", badGateway: "Gateway error (502). The API service is temporarily unavailable.", serviceBusy: "Service unavailable (503). Try again later.", httpFailed: "Request failed (HTTP {{status}}). Check the Base URL and API key.", htmlError: "The service returned an HTML error page ({{preview}})", imageTimeout: "The image request timed out and its outcome is unknown. Check the original task record; do not submit it again.", audioModelRequired: "Configure an audio model first", audioGenerationFailed: "Audio generation failed", scriptNoAudio: "The model request script did not return audio", geminiAudioUnsupported: "The Gemini API format does not support audio generation. Use an OpenAI-format provider.", invalidImageSizeFormat: "Unsupported image size. Use auto, 9:16, or 1024x1024.", positiveImageRatio: "The image ratio must use positive numbers, such as 9:16.", imageRatioLimit: "The image aspect ratio cannot exceed 3:1. Adjust the dimensions.", positiveImageDimensions: "Image dimensions must be positive integers, such as 1024x1024.", imageDimensionStep: "Image width and height must be multiples of 16.", imageEdgeLimit: "The longest image edge cannot exceed 3840px.", imagePixelLimit: "The total image pixel count must be between 655360 and 8294400.", unknownImageResponse: "The API returned data in an unknown format (fields: {{fields}}). Check model or API compatibility.", noImageReturned: "The API did not return an image. The prompt may have triggered safety review or the model may not support this operation.", geminiRejected: "Gemini rejected the request: {{reason}}", geminiNoImage: "The Gemini API did not return an image", maskModelUnsupported: "This model does not support mask editing. Use another provider.", noContent: "No content returned", modelReadFailed: "Failed to load models", videoTimeout: "{{provider}}video generation timed out. Try again later.", pluginVideoExpired: "The plugin video task has expired. Generate it again.", scriptNoVideo: "The model request script did not return a video", noPlayableVideo: "The video API did not return a playable video", noVideoTaskId: "The video API did not return a task ID", videoTaskCreateFailed: "Failed to create video task", videoGenerationFailed: "Video generation failed", videoTaskQueryFailed: "Failed to query video task", videoPromptRequired: "Enter a video prompt or connect a reference image, video, or audio asset", referenceImageReadFailed: "Failed to read the reference image. Choose another image or upload it again.", invalidReferenceVideo: "A reference video must be a public URL, asset ID, or locally saved video", invalidReferenceAudio: "Reference audio must be a public URL, asset ID, or locally saved audio file", videoModelRequired: "Configure a video model first", geminiVideoUnsupported: "The Gemini API format does not support video generation. Use an OpenAI-format provider.", noVideoTask: "The API did not return a video task", videoDownloadFailed: "Failed to download video", localAssetReadFailed: "Failed to read local asset" },
     prompts: {
         title: "Prompt Center",
         library: "Prompt Library",
@@ -383,6 +394,9 @@ export default {
         home: "Back to home",
     },
     workbench: {
+        referenceImportFailed: "Some reference images could not be imported: {{files}}",
+        importingReferences: "Reading reference images…",
+        modelUnavailable: "The selected model is unavailable or does not support this operation. Refresh models in settings and choose again.",
         historySearch: "Search titles, prompts or models",
         historyStatus: "History status",
         historyAllStatuses: "All statuses",
@@ -592,6 +606,10 @@ export default {
         },
     },
     navigation: {
+        loadingPage: "Loading page…",
+        pageLoadFailed: "Failed to load page",
+        pageLoadFailedHint: "Return home or reload the page. Recover or export any unsaved changes first.",
+        backHome: "Return home",
         tasks: "Tasks",
         canvas: "My Canvases",
         image: "Image Studio",
@@ -641,8 +659,8 @@ export default {
     config: {
         title: "Settings & Preferences",
         invalidFile: "The settings file format is invalid",
-        description: "Providers, model selection, sync, and local storage",
-        modalDescription: "Providers, default models, sync, and local storage",
+        description: "Available gateway models, generation preferences, and browser storage",
+        modalDescription: "Available gateway models, default models, and browser storage",
         tabs: {
             channels: "Providers",
             localProxy: "Local proxy",
@@ -677,7 +695,7 @@ export default {
             records: "{{count}} records",
             refresh: "Refresh usage",
             readFailed: "Failed to read local storage",
-            stores: { appState: "App state", images: "Image files", imagePreviews: "Image thumbnails", media: "Audio and video files", imageLogs: "Image history", videoLogs: "Video history", agentMessages: "Agent messages", promptCache: "Prompt cache" },
+            stores: { documents: "Local documents", files: "Local media files", appState: "App state", images: "Image files", imagePreviews: "Image thumbnails", media: "Audio and video files", imageLogs: "Image history", videoLogs: "Video history", agentMessages: "Agent messages", promptCache: "Prompt cache" },
         },
         promptSources: {
             add: "Add source",

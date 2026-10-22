@@ -75,7 +75,7 @@ describe("managed session and storage boundary", () => {
             apiKey: "must-never-send",
             model: "gateway::gpt-image-test",
             imageModel: "gateway::gpt-image-test",
-            channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [{ name: "gpt-image-test", capability: "image" as const }] }],
+            channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [{ name: "gpt-image-test", capability: "image" as const, endpointTypes: ["image-generation"] }] }],
             models: ["gateway::gpt-image-test"],
         };
         useConfigStore.setState({ config });
@@ -119,7 +119,7 @@ describe("managed session and storage boundary", () => {
         const config = {
             ...defaultConfig,
             model: "gateway::test-model",
-            channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [{ name: "test-model", capability: "text" as const }] }],
+            channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [{ name: "test-model", capability: "text" as const, endpointTypes: ["openai-response", "openai-video"] }] }],
             models: ["gateway::test-model"],
         };
         useConfigStore.setState({ config });

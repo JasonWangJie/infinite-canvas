@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import { saveAs } from "file-saver";
 import { useLocation } from "react-router-dom";
 import { useWorkbenchHistoryFilter } from "@/hooks/use-workbench-history-filter";
+import { readClipboardImages, useReferenceImageImport } from "@/hooks/use-reference-image-import";
 import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
 import { readTaskCenterDocument } from "@/services/task-center";
 import { useTranslation } from "react-i18next";
@@ -18,11 +19,11 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import { clampVideoSeconds } from "@/lib/media-size";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { resolveMediaUrl } from "@/services/file-storage";
-import { resolveImageUrl, ensureImagePreview, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
+import { resolveImageUrl, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { createVideoGenerationTask, VideoGenerationUncertainError, type VideoGenerationTask } from "@/services/api/video";
 import { assertAssetSaveReady, useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
-import { boolConfig, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { boolConfig, modelMatchesCapability, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
@@ -51,6 +52,8 @@ export default function VideoPage() {
     const latestLoad = useRef(0);
     const loadedSearch = useRef<string | null>(null);
     const interactionVersion = useRef(0);
+    const historyInteraction = useRef(0);
+    const cancelHistoryPreview = () => { historyInteraction.current += 1; };
     const [logsLoaded, setLogsLoaded] = useState(false);
     const [navigationError, setNavigationError] = useState("");
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
@@ -90,7 +93,9 @@ export default function VideoPage() {
     const agentTaskIdRef = useRef<string | undefined>(undefined);
 
     const model = effectiveConfig.videoModel || effectiveConfig.model;
-    const canGenerate = Boolean(prompt.trim());
+    const modelReady = isAiConfigReady(effectiveConfig, model) && modelMatchesCapability(effectiveConfig, model, "video");
+    const { importing: importingReferences, importReferences } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images].slice(0, 7)), `${location.key}:${interactionVersion.current}`);
+    const canGenerate = Boolean(prompt.trim()) && modelReady && !importingReferences;
 
     useEffect(() => {
         if (!running || !startedAt) return;
@@ -119,13 +124,7 @@ export default function VideoPage() {
         const unsupported = selectedFiles.filter((file) => !file.type.startsWith("image/"));
         if (unsupported.length) message.warning(t("videoWorkbench.unsupportedFiles"));
         const imageFiles = selectedFiles.filter((file) => file.type.startsWith("image/")).slice(0, 7 - references.length);
-        const nextReferences = await Promise.all(
-            imageFiles.map(async (file) => {
-                const image = await uploadImage(file);
-                return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-            }),
-        );
-        setReferences((value) => [...value, ...nextReferences].slice(0, 7));
+        await importReferences(imageFiles);
     };
 
     const handleReferenceDragEnter = (event: DragEvent<HTMLDivElement>) => {
@@ -147,28 +146,9 @@ export default function VideoPage() {
         void addReferences(event.dataTransfer.files);
     };
 
-    const addReferencesFromClipboard = async () => {
-        try {
-            const items = await navigator.clipboard.read();
-            const blobs = await Promise.all(items.flatMap((item) => item.types.filter((type) => type.startsWith("image/")).map((type) => item.getType(type))));
-            if (!blobs.length) {
-                message.error(t("videoWorkbench.clipboardEmpty"));
-                return;
-            }
-            const nextReferences = await Promise.all(
-                blobs.slice(0, 7 - references.length).map(async (blob, index) => {
-                    const image = await uploadImage(blob);
-                    return { id: nanoid(), name: `clipboard-${index + 1}.png`, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-                }),
-            );
-            setReferences((value) => [...value, ...nextReferences].slice(0, 7));
-            message.success(t("videoWorkbench.clipboardAdded", { count: nextReferences.length }));
-        } catch {
-            message.error(t("videoWorkbench.clipboardEmpty"));
-        }
-    };
+    const addReferencesFromClipboard = () => importReferences(async () => (await readClipboardImages()).slice(0, 7 - references.length));
     const generate = async () => {
-        if (runningRef.current) return;
+        if (runningRef.current || importingReferences) return;
         const epoch = sessionEpoch();
         const agentTaskId = agentTaskIdRef.current;
         agentTaskIdRef.current = undefined;
@@ -227,10 +207,11 @@ export default function VideoPage() {
     // Handle video-generation commands from the Agent panel by setting the prompt and optionally starting generation.
     useEffect(() => {
         if (!videoCommand || videoCommand.nonce === processedCommandRef.current) return;
+        cancelHistoryPreview();
         processedCommandRef.current = videoCommand.nonce;
         clearVideoCommand();
         if (typeof videoCommand.prompt === "string") setPrompt(videoCommand.prompt);
-        if (videoCommand.run && running) {
+        if (videoCommand.run && (running || importingReferences)) {
             if (videoCommand.taskId) updateAgentTask(videoCommand.taskId, { status: "failed", error: t("videoWorkbench.busy") });
             return;
         }
@@ -238,7 +219,7 @@ export default function VideoPage() {
             agentTaskIdRef.current = videoCommand.taskId;
             setAutoRunToken((value) => value + 1);
         }
-    }, [videoCommand, clearVideoCommand, running, updateAgentTask]);
+    }, [videoCommand, clearVideoCommand, running, importingReferences, updateAgentTask]);
 
     useEffect(() => {
         if (!autoRunToken) return;
@@ -252,8 +233,9 @@ export default function VideoPage() {
             message.error(t("videoWorkbench.promptRequired"));
             return null;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
-            message.warning(t("workbench.configFirst"));
+        if (importingReferences) return null;
+        if (!modelReady) {
+            message.warning(t("workbench.modelUnavailable"));
             openConfigDialog(true);
             return null;
         }
@@ -374,7 +356,7 @@ export default function VideoPage() {
         }
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
         try {
-            const next = await resumeVideoGeneration(log, configOverride || taskConfig);
+            const next = await normalizeLog(await resumeVideoGeneration(log, configOverride || taskConfig), true);
             if (!mounted.current || epoch !== sessionEpoch()) return;
             setResults([{ id: next.id, status: next.status, video: next.video, error: next.error, log: next }]);
             setLogs((items) => items.map((item) => (item.id === next.id ? next : item)));
@@ -387,6 +369,8 @@ export default function VideoPage() {
                 });
             if (next.status === "success") message.success(t("videoWorkbench.generated"));
             else if (next.error) message.warning(next.error);
+        } catch (error) {
+            if (mounted.current && epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : String(error));
         } finally {
             activeLogIdsRef.current.delete(log.id);
             if (mounted.current && epoch === sessionEpoch() && !activeLogIdsRef.current.size) {
@@ -397,8 +381,17 @@ export default function VideoPage() {
         }
     };
 
-    const previewGenerationLog = (log: GenerationLog) => {
+    const previewGenerationLog = async (log: GenerationLog) => {
         if (runningRef.current) return;
+        const version = interactionVersion.current, epoch = sessionEpoch(), search = locationSearch.current;
+        const interaction = ++historyInteraction.current;
+        try {
+            log = await normalizeLog(log, true);
+        } catch (error) {
+            if (mounted.current && epoch === sessionEpoch() && version === interactionVersion.current && search === locationSearch.current && interaction === historyInteraction.current) setNavigationError(error instanceof Error ? error.message : String(error));
+            return;
+        }
+        if (!mounted.current || epoch !== sessionEpoch() || version !== interactionVersion.current || search !== locationSearch.current || interaction !== historyInteraction.current) return;
         interactionVersion.current += 1;
         setPreviewLog(log);
         setLogsOpen(false);
@@ -428,7 +421,7 @@ export default function VideoPage() {
     }, [location.key, location.search, linkedLogId, logsLoaded, logs, running, t]);
 
     return (
-        <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
+        <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100" onClickCapture={cancelHistoryPreview} onKeyDownCapture={cancelHistoryPreview} onInputCapture={cancelHistoryPreview} onDropCapture={cancelHistoryPreview}>
             {navigationError ? <p role="alert" className="px-4 pt-3 text-sm text-destructive">{navigationError}</p> : null}
             {linkedLogId && running && navigationRef.current !== `${location.key}:${linkedLogId}` ? <p role="status" className="px-4 pt-3 text-sm text-muted-foreground">{t("workbench.historyWaitForGeneration")}</p> : null}
             <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-3 lg:grid-cols-[300px_minmax(0,1fr)] lg:overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)]">
@@ -479,10 +472,10 @@ export default function VideoPage() {
                                 <div className="mb-2 flex items-center justify-between gap-3">
                                     <span className="text-base font-semibold">{t("videoWorkbench.references")}</span>
                                     <div className="flex gap-2">
-                                        <Button size="small" icon={<ClipboardPaste className="size-3.5" />} onClick={() => void addReferencesFromClipboard()}>
+                                        <Button size="small" disabled={importingReferences} icon={<ClipboardPaste className="size-3.5" />} onClick={() => void addReferencesFromClipboard()}>
                                             {t("workbench.clipboard")}
                                         </Button>
-                                        <Button size="small" icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
+                                        <Button size="small" loading={importingReferences} icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
                                             {t("workbench.upload")}
                                         </Button>
                                     </div>
@@ -512,7 +505,8 @@ export default function VideoPage() {
                                             </button>
                                         </div>
                                     ))}
-                                    {!references.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noImages")}</div> : null}
+                                    {importingReferences ? <span role="status" className="self-center text-sm text-muted-foreground">{t("workbench.importingReferences")}</span> : null}
+                                    {!references.length && !importingReferences ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noImages")}</div> : null}
                                 </div>
                             </div>
 
@@ -532,6 +526,7 @@ export default function VideoPage() {
                         </div>
 
                         <div className="mt-auto pt-6">
+                            {!modelReady ? <p role="status" className="mb-2 text-sm text-muted-foreground">{t("workbench.modelUnavailable")} <Button type="link" size="small" onClick={() => openConfigDialog(false)}>{t("workbench.settings")}</Button></p> : null}
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
                                 {t("workbench.generate")}
                             </Button>
@@ -788,16 +783,13 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
 async function readStoredLogs() {
     const stored = await readTaskCenterDocument("video-workbench");
     const logs = stored && typeof stored === "object" && !Array.isArray(stored) ? Object.values(stored) as GenerationLog[] : [];
-    return (await Promise.all(logs.map(normalizeLog))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    return (await Promise.all(logs.map((log) => normalizeLog(log)))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
-async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
-    const video = log.video?.storageKey ? { ...log.video, url: await resolveMediaUrl(log.video.storageKey, log.video.url) } : log.video;
+async function normalizeLog(log: Partial<GenerationLog>, loadMedia = false): Promise<GenerationLog> {
+    const video = log.video?.storageKey ? { ...log.video, url: loadMedia ? await resolveMediaUrl(log.video.storageKey, log.video.url) : "" } : log.video;
     const references = await Promise.all(
-        (log.references || []).map(async (item) => {
-            void ensureImagePreview(item.storageKey);
-            return { ...item, dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl) };
-        }),
+        (log.references || []).map(async (item) => ({ ...item, dataUrl: !loadMedia && item.storageKey ? "" : await resolveImageUrl(item.storageKey, item.dataUrl) })),
     );
     const config = normalizeLogConfig(log);
     return {

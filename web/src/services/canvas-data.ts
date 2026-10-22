@@ -229,6 +229,19 @@ export function flushDocument(domain: string) {
     try { assertSession(); } catch (error) { return Promise.reject(error); }
     return enqueue(domain, (draft, epoch) => saveDraft(domain, draft, epoch));
 }
+// Drain edits added while a previous save was in flight; never resolve a conflict implicitly.
+export async function flushAllDocuments() {
+    const epoch = sessionEpoch();
+    while (true) {
+        assertSession(epoch);
+        const pending = [...drafts].filter(([, draft]) => draft.dirty || draft.pending.length || draft.issue).map(([domain]) => domain);
+        if (!pending.length && !queues.size) return;
+        const results = await Promise.allSettled([...queues.values(), ...pending.map(flushDocument)]);
+        assertSession(epoch);
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+    }
+}
 export function retryDocument(domain: string) {
     return enqueue(domain, async (draft, epoch) => {
         try {

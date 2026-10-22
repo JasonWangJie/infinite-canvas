@@ -106,13 +106,12 @@
 ## 核心功能
 
 - 无限画布：多画布项目、节点拖拽缩放、连线、小地图、撤销重做、导入导出。
-- AI 创作：浏览器前台直连你配置的 OpenAI 兼容接口，支持文生图、图生图、参考图编辑、文本问答、音频和视频生成。
+- AI 创作：从 New API 授权进入，通过同源 Canvas BFF 调用当前账号可用的图片、文本、音频和视频模型，凭证由服务端管理。
 - 画布助手：围绕选中节点和上游节点对话、生图，并把结果插回画布。
-- 本地 Agent：通过本机 Canvas Agent 连接 Codex / Claude Code，让 Agent 通过 MCP 操作当前画布；
-- Codex App 插件：提供 Codex app 插件，安装后会自动注册 MCP 并尝试拉起本地 Agent。
-- 插件系统：支持通过 URL 动态安装 / 启用 / 更新 / 卸载远程节点插件，并提供 TypeScript SDK 自行开发画布节点插件。
-- 自定义接口调用：可自定义生图 / 视频接口的调用方式，灵活适配各类中转站与自建服务。
-- 提示词库：内置 7 个开源提示词来源并支持自定义标准 JSON 来源，由浏览器前端直连并缓存到 IndexedDB。
+- 可信节点插件：随应用打包的 SVG、Markdown、便签和隔离 HTML 节点。
+- 提示词库：经 Canvas BFF 读取固定的开源来源，封面与参考图通过已授权的同源媒体接口读取。
+
+当前分支为 New API 受管画布，不开放浏览器 API Key、任意模型地址、本地代理、本机 Agent、WebDAV、模型脚本或远程插件安装。仓库保留的 Agent、代理与 Codex 插件包属于上游独立版能力。
 
 完整功能说明见 [功能介绍](docs/content/docs/overview/features.mdx)。
 
@@ -120,31 +119,28 @@
 
 ## 快速开始
 
-AI API Key、Base URL、画布、素材和生成记录默认保存在浏览器本地。
+先准备支持 Canvas 授权集成的 New API，并注册画布应用的回调地址与服务端凭证。仅启动静态前端无法完成登录和模型调用。
+
+画布、素材、配置、生成记录及媒体保存在当前浏览器 IndexedDB，按授权用户隔离；退出保留已保存数据，不提供云同步。Canvas BFF 只持久化登录、授权会话、凭证及撤销队列。生成请求和参考图仍会发送到 New API。
 
 ### 本地开发
 
 ```bash
 git clone git@github.com:basketikun/infinite-canvas.git
 cd infinite-canvas
-cd web
-bun install
-bun run dev
 ```
+
+按[本地开发说明](docs/content/docs/development/local-development.zh-CN.mdx)配置环境，并分别启动 `canvas-server/` 和 `web/`。前端通过 `/auth`、`/api` 同源代理连接 BFF。
 
 ### Docker 运行
 
 ```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
-docker compose up -d
+docker compose --env-file /path/to/canvas.env -f docker-compose.managed.yml up -d --build
 ```
 
-运行后默认端口3000，可访问 `http://localhost:3000`。
+环境变量见 [canvas-server/.env.example](canvas-server/.env.example)，部署步骤见[受管 Docker 部署](docs/content/docs/overview/docker.zh-CN.mdx)。生产入口需要 HTTPS，代理保留公开 Host，浏览器从 New API 的画布入口授权进入后选择可用模型。默认 `docker-compose.yml` 与静态托管入口不包含完整受管服务。
 
-首次打开后进入右上角配置，填入自己的 OpenAI 兼容 `Base URL` 和 `API Key`。
-
-如果默认的OpenAI接口调用方式与您的API不同，可自定义生图/视频脚本调用。
+Docker 静态资源路径、真实 HTTPS 双站授权及生产升级回退仍待验收，当前不承诺生产部署已经完整验证。
 
 ## 效果展示
 

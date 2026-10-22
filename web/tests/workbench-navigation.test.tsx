@@ -1,21 +1,24 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { browser } from "./browser";
+import { afterEach, beforeAll, beforeEach, expect, spyOn, test } from "bun:test";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { App, ConfigProvider } from "antd";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import axios from "axios";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { browser } from "./browser";
 import { mockBrowserDocuments } from "./local-document-fixture";
 import { mockBrowserFiles } from "./local-file-fixture";
 import i18n from "@/i18n";
 import { endCanvasSession, readCanvasSession } from "@/services/api/canvas-client";
 import { getDocumentDraft, readDocument, retryDocument } from "@/services/canvas-data";
 import { readStoredImage } from "@/services/image-storage";
+import * as imageStorage from "@/services/image-storage";
+import * as fileStorage from "@/services/file-storage";
 import { defaultConfig, useConfigStore } from "@/stores/use-config-store";
 import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
+import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { deleteVideoGenerationLogs } from "@/pages/video/generation-log";
 
 const originalFetch = globalThis.fetch;
@@ -41,6 +44,11 @@ let oldMatchMedia: typeof browser.matchMedia;
 function log(id: string, prompt: string, status = "success") {
     return { id, title: id, prompt, status, createdAt: id === "alpha" ? 2 : 1, time: "now", model: id === "alpha" ? "gateway::image-model" : "gateway::other-model", config, references: [], durationMs: 0, images: [], imageCount: 1, successCount: status === "success" ? 1 : 0, failCount: status === "failed" ? 1 : 0, size: "1024x1024", quality: "auto", resolution: "720", seconds: "5" };
 }
+
+beforeAll(async () => {
+    await import("@/pages/image");
+    await import("@/pages/video");
+});
 
 beforeEach(async () => {
     endCanvasSession();
@@ -90,21 +98,24 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-    if (root) await act(async () => root!.unmount());
-    root = undefined;
-    container?.remove();
-    container = undefined;
-    endCanvasSession();
-    localDocuments.restore();
-    localFiles.restore();
-    useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
-    useAssetStore.setState({ assets: [], hydrated: false });
-    globalThis.fetch = originalFetch;
-    axios.defaults.adapter = originalAdapter;
-    browser.matchMedia = oldMatchMedia;
-    for (const [key, descriptor] of descriptors) {
-        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-        else Reflect.deleteProperty(globalThis, key);
+    try {
+        if (root) await act(async () => root!.unmount());
+    } finally {
+        root = undefined;
+        container?.remove();
+        container = undefined;
+        endCanvasSession();
+        localDocuments?.restore();
+        localFiles?.restore();
+        useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
+        useAssetStore.setState({ assets: [], hydrated: false });
+        globalThis.fetch = originalFetch;
+        axios.defaults.adapter = originalAdapter;
+        browser.matchMedia = oldMatchMedia;
+        for (const [key, descriptor] of descriptors || []) {
+            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+            else Reflect.deleteProperty(globalThis, key);
+        }
     }
 });
 
@@ -133,6 +144,211 @@ async function selectAllResults() {
     expect(checkbox).toBeDefined();
     await act(async () => checkbox!.click());
 }
+
+async function chooseReferences(files: File[]) {
+    const input = container!.querySelector<HTMLInputElement>('input[type="file"][accept="image/*"]')!;
+    Object.defineProperty(input, "files", { configurable: true, value: files });
+    await act(async () => input.dispatchEvent(new browser.Event("change", { bubbles: true })));
+}
+
+function importedImage(name: string) {
+    return { url: `blob:${name}`, storageKey: `image:${name}`, width: 20, height: 10, bytes: 10, mimeType: "image/png" };
+}
+
+test.each(["image", "video"])("%s reference import retains successful files, names failures and blocks generation until settled", async (page) => {
+    const pending = Promise.withResolvers<imageStorage.UploadedImage>();
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async (file) => {
+        if ((file as File).name === "broken.png") throw new Error("decode failed");
+        return pending.promise;
+    });
+    let modelCalls = 0;
+    axios.defaults.adapter = async () => { modelCalls += 1; throw new Error("must not submit during import"); };
+    try {
+        await renderPage(`/${page}?log=alpha`);
+        const generate = [...container!.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === i18n.t("workbench.generate"))!;
+        expect(generate.disabled).toBe(false);
+        await chooseReferences([new File(["good"], "good.png", { type: "image/png" }), new File(["bad"], "broken.png", { type: "image/png" })]);
+        expect(upload).toHaveBeenCalledTimes(2);
+        expect(generate.disabled).toBe(true);
+        expect(container!.textContent).toContain(i18n.t("workbench.importingReferences"));
+        await act(async () => generate.click());
+        expect(modelCalls).toBe(0);
+        await act(async () => pending.resolve(importedImage("good.png")));
+        expect(container!.querySelector('img[alt="good.png"]')?.getAttribute("src")).toBe("blob:good.png");
+        expect(container!.querySelector('img[alt="broken.png"]')).toBeNull();
+        expect(document.body.textContent).toContain("broken.png：decode failed");
+        expect(generate.disabled).toBe(false);
+        expect(modelCalls).toBe(0);
+    } finally { upload.mockRestore(); }
+});
+
+test.each(["image", "video"])("%s rejects an agent run during import without attaching its task to the next manual run", async (page) => {
+    const pending = Promise.withResolvers<imageStorage.UploadedImage>();
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(() => pending.promise);
+    const updateTask = useWorkbenchAgentStore.getState().updateTask;
+    const updates: string[] = [];
+    useWorkbenchAgentStore.setState({ imageCommand: null, videoCommand: null, tasks: [], updateTask: (id, patch) => { updates.push(id); updateTask(id, patch); } });
+    let modelCalls = 0;
+    axios.defaults.adapter = async () => { modelCalls += 1; throw new Error("manual submission failed"); };
+    try {
+        await renderPage(`/${page}?log=alpha`);
+        await chooseReferences([new File(["image"], "pending.png", { type: "image/png" })]);
+        let taskId: string | undefined;
+        await act(async () => {
+            const store = useWorkbenchAgentStore.getState();
+            taskId = (page === "image" ? store.dispatchImage : store.dispatchVideo)({ prompt: "agent prompt", run: true });
+        });
+        expect(useWorkbenchAgentStore.getState().tasks.find((task) => task.id === taskId)?.status).toBe("failed");
+        expect(updates).toEqual([taskId!]);
+        expect(modelCalls).toBe(0);
+        await act(async () => pending.resolve(importedImage("pending.png")));
+        expect(modelCalls).toBe(0);
+        const removeReference = container!.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t(page === "image" ? "imageWorkbench.removeReference" : "videoWorkbench.removeImage")}"]`)!;
+        await act(async () => removeReference.click());
+        await click("workbench.generate");
+        expect(modelCalls).toBe(1);
+        expect(updates).toEqual([taskId!]);
+        expect(useWorkbenchAgentStore.getState().tasks.find((task) => task.id === taskId)?.status).toBe("failed");
+    } finally {
+        upload.mockRestore();
+        await act(async () => useWorkbenchAgentStore.setState({ imageCommand: null, videoCommand: null, tasks: [], updateTask }));
+    }
+});
+
+for (const page of ["image", "video"]) {
+    test.each(["denied", "empty"])(`${page} clipboard %s is reported without importing or submitting`, async (result) => {
+        const previous = Object.getOwnPropertyDescriptor(browser.navigator, "clipboard");
+        const upload = spyOn(imageStorage, "uploadImage");
+        Object.defineProperty(browser.navigator, "clipboard", { configurable: true, value: { read: async () => {
+            if (result === "denied") throw new DOMException("clipboard permission denied", "NotAllowedError");
+            return [{ types: ["text/plain"] }];
+        } } });
+        try {
+            await renderPage(`/${page}?log=alpha`);
+            await click("workbench.clipboard");
+            expect(document.body.textContent).toContain(result === "denied" ? "clipboard permission denied" : i18n.t("imageWorkbench.clipboardEmpty"));
+            expect(upload).not.toHaveBeenCalled();
+            expect(requests.some((request) => request.path.startsWith("/api/ai/") || request.method === "POST")).toBe(false);
+            expect(container!.textContent).not.toContain(i18n.t("workbench.importingReferences"));
+        } finally {
+            upload.mockRestore();
+            if (previous) Object.defineProperty(browser.navigator, "clipboard", previous);
+            else Reflect.deleteProperty(browser.navigator, "clipboard");
+        }
+    });
+
+    test.each(["navigation", "history", "session"])(`${page} reference import discards a late result after %s`, async (change) => {
+        const pending = Promise.withResolvers<imageStorage.UploadedImage>();
+        let signal: AbortSignal | undefined;
+        const upload = spyOn(imageStorage, "uploadImage").mockImplementation((_file, options) => { signal = options?.signal; return pending.promise; });
+        try {
+            const router = await renderPage(`/${page}?log=alpha`);
+            await chooseReferences([new File(["late"], "late.png", { type: "image/png" })]);
+            expect(upload).toHaveBeenCalledTimes(1);
+            if (change === "navigation") await act(async () => router.navigate(`/${page === "image" ? "video" : "image"}?log=alpha`));
+            if (change === "history") await act(async () => router.navigate(`/${page}?log=beta`));
+            if (change === "session") await act(async () => { endCanvasSession(); await readCanvasSession(); });
+            if (change !== "history") expect(signal?.aborted).toBe(true);
+            await act(async () => pending.resolve(importedImage("late.png")));
+            expect(container!.querySelector('img[alt="late.png"]')).toBeNull();
+            expect(requests.some((request) => request.method === "POST")).toBe(false);
+        } finally { upload.mockRestore(); }
+    });
+}
+
+test.each(["image", "video"])("%s history lists metadata first and loads only the opened record's media", async (page) => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver");
+    Object.defineProperty(globalThis, "IntersectionObserver", { configurable: true, value: class { observe() {} disconnect() {} } });
+    const resolveImage = spyOn(imageStorage, "resolveImageUrl").mockImplementation(async (key) => `blob:${key}`);
+    const resolveVideo = spyOn(fileStorage, "resolveMediaUrl").mockImplementation(async (key) => `blob:${key}`);
+    const preview = spyOn(imageStorage, "ensureImagePreview").mockResolvedValue(undefined);
+    documents[`${page}-workbench`].value = Object.fromEntries(["alpha", "beta"].map((id) => [id, {
+        ...log(id, `${id} media`), model: page === "image" ? config.imageModel : config.videoModel,
+        references: [{ id, name: `${id}.png`, type: "image/png", storageKey: `image:ref-${id}`, dataUrl: "" }],
+        images: [{ id, storageKey: `image:${id}`, dataUrl: "", width: 20, height: 10, bytes: 10, durationMs: 0 }],
+        video: { url: "", storageKey: `media:${id}`, width: 20, height: 10, bytes: 10, mimeType: "video/mp4" },
+    }]));
+    try {
+        await renderPage(`/${page}`);
+        expect(resolveImage).not.toHaveBeenCalled();
+        expect(resolveVideo).not.toHaveBeenCalled();
+        expect(preview).not.toHaveBeenCalled();
+        const card = [...container!.querySelectorAll<HTMLButtonElement>("aside button")].find((button) => button.textContent?.includes("alpha"))!;
+        expect(card).toBeDefined();
+        await act(async () => card.click());
+        expect(container!.querySelector('img[alt="alpha.png"]')?.getAttribute("src")).toBe("blob:image:ref-alpha");
+        expect(resolveImage.mock.calls.some(([key]) => key === "image:ref-alpha")).toBe(true);
+        expect(resolveImage.mock.calls.every(([key]) => !key?.includes("beta"))).toBe(true);
+        if (page === "image") expect(container!.querySelector('img[src="blob:image:alpha"]')).not.toBeNull();
+        else {
+            expect(resolveVideo).toHaveBeenCalledWith("media:alpha", "");
+            expect(container!.querySelector('video[src="blob:media:alpha"]')).not.toBeNull();
+        }
+        expect(resolveVideo.mock.calls.every(([key]) => !key?.includes("beta"))).toBe(true);
+    } finally {
+        resolveImage.mockRestore(); resolveVideo.mockRestore(); preview.mockRestore();
+        if (previous) Object.defineProperty(globalThis, "IntersectionObserver", previous);
+        else Reflect.deleteProperty(globalThis, "IntersectionObserver");
+    }
+});
+
+test.each(["image", "video"])("%s late history media cannot overwrite a newly edited prompt", async (page) => {
+    const pending = Promise.withResolvers<string>();
+    const resolveImage = spyOn(imageStorage, "resolveImageUrl").mockImplementation(() => pending.promise);
+    const importing = Promise.withResolvers<imageStorage.UploadedImage>();
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(() => importing.promise);
+    documents[`${page}-workbench`].value = { alpha: { ...log("alpha", "saved history prompt"), references: [{ id: "reference", name: "history.png", type: "image/png", storageKey: "image:slow", dataUrl: "" }] } };
+    try {
+        await renderPage(`/${page}?log=alpha`);
+        expect(resolveImage).toHaveBeenCalledWith("image:slow", "");
+        const textarea = container!.querySelector("textarea")!;
+        await act(async () => {
+            Object.getOwnPropertyDescriptor(browser.HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "my new prompt");
+            textarea.dispatchEvent(new browser.Event("input", { bubbles: true }));
+        });
+        expect(textarea.value).toBe("my new prompt");
+        await chooseReferences([new File(["image"], "new-reference.png", { type: "image/png" })]);
+        await act(async () => importing.resolve(importedImage("new-reference.png")));
+        expect(container!.querySelector('img[alt="new-reference.png"]')).not.toBeNull();
+        await act(async () => pending.resolve("blob:history"));
+        expect(textarea.value).toBe("my new prompt");
+        expect(container!.querySelector('img[alt="new-reference.png"]')).not.toBeNull();
+        expect(container!.querySelector('img[alt="history.png"]')).toBeNull();
+        // Capture cancellation must run before the next history click starts its own preview.
+        const card = [...container!.querySelectorAll<HTMLButtonElement>("aside button")].find((button) => button.textContent?.includes("alpha"))!;
+        await act(async () => card.click());
+        expect(textarea.value).toBe("saved history prompt");
+        expect(container!.querySelector('img[alt="history.png"]')?.getAttribute("src")).toBe("blob:history");
+        expect(requests.some((request) => request.method === "POST")).toBe(false);
+    } finally { resolveImage.mockRestore(); upload.mockRestore(); }
+});
+
+test("image history thumbnails load only when their card becomes visible", async () => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver");
+    const observers: { target?: Element; callback: IntersectionObserverCallback }[] = [];
+    Object.defineProperty(globalThis, "IntersectionObserver", { configurable: true, value: class {
+        entry: typeof observers[number];
+        constructor(callback: IntersectionObserverCallback) { this.entry = { callback }; observers.push(this.entry); }
+        observe(target: Element) { this.entry.target = target; }
+        disconnect() {}
+    } });
+    const preview = spyOn(imageStorage, "ensureImagePreview").mockImplementation(async (key) => `blob:thumb-${key}`);
+    documents["image-workbench"].value = Object.fromEntries(["alpha", "beta"].map((id) => [id, { ...log(id, id), images: [{ id, storageKey: `image:${id}`, dataUrl: "", width: 20, height: 10, bytes: 10 }] }]));
+    try {
+        await renderPage("/image");
+        expect(preview).not.toHaveBeenCalled();
+        const visible = observers.find((entry) => entry.target?.textContent?.includes("alpha"))!;
+        expect(visible).toBeDefined();
+        await act(async () => visible.callback([{ isIntersecting: true, target: visible.target } as IntersectionObserverEntry], {} as IntersectionObserver));
+        expect(preview).toHaveBeenCalledTimes(1);
+        expect(preview).toHaveBeenCalledWith("image:alpha");
+        expect(visible.target!.querySelector('img[src="blob:thumb-image:alpha"]')).not.toBeNull();
+    } finally {
+        preview.mockRestore();
+        if (previous) Object.defineProperty(globalThis, "IntersectionObserver", previous);
+        else Reflect.deleteProperty(globalThis, "IntersectionObserver");
+    }
+});
 
 test("image deep links use a fresh history snapshot and never submit generation", async () => {
     await readDocument("image-workbench");

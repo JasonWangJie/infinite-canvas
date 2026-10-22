@@ -1,12 +1,12 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
 import "./browser";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import i18n from "../src/i18n";
 import { mockBrowserDocuments } from "./local-document-fixture";
 import { mockBrowserFiles } from "./local-file-fixture";
 import axios, { type InternalAxiosRequestConfig } from "axios";
 import { endCanvasSession, readCanvasSession } from "../src/services/api/canvas-client";
 import { getDocumentSaveState, readDocument, stageDocument, writeDocument } from "../src/services/canvas-data";
-import { loadTaskCenter, readTaskCenterDocument, resumeTaskCenterItem } from "../src/services/task-center";
+import { loadTaskCenter, readTaskCenterDocument, resumeTaskCenterItem, taskCenterDiagnostics } from "../src/services/task-center";
 import { defaultConfig, useConfigStore } from "../src/stores/use-config-store";
 import type { GenerationLog } from "../src/pages/video/generation-log";
 import { refreshImageTask, type ImageTaskRecord } from "../src/services/api/image-tasks";
@@ -111,6 +111,36 @@ test("unconfirmed video submissions from both workbench and canvas require atten
         expect(await resumeTaskCenterItem(item)).toBe(item);
     }
     expect(requests).toEqual([]);
+});
+
+test("canvas image recovery stays actionable and preserves each original local task association", async () => {
+    documents.canvas.value = { state: { projects: [{ ...canvas("image recovery").state.projects[0], nodes: [
+        { id: "single", type: "image", title: "single", metadata: { status: "error", imageTaskRecordId: "single/record" } },
+        { id: "batch", type: "image", title: "batch", metadata: { status: "error", imageTaskRecordId: "first", images: [
+            { id: "a", status: "error", imageTaskRecordId: "first" },
+            { id: "b", status: "error", imageTaskRecordId: "second" },
+        ] } },
+    ] }], deletedProjects: [] }, version: 0 };
+    const items = (await loadTaskCenter()).items.filter((item) => item.source === "canvas");
+    expect(items).toHaveLength(2);
+    expect(items.find((item) => item.nodeId === "single")).toMatchObject({ status: "attention", canResume: false, recordId: "single", imageTaskRecordIds: ["single/record"] });
+    expect(items.find((item) => item.nodeId === "batch")).toMatchObject({ status: "attention", canResume: false, imageTaskRecordIds: ["first", "second"] });
+    requests = [];
+    for (const item of items) expect(await resumeTaskCenterItem(item)).toBe(item);
+    expect(requests).toEqual([]);
+});
+
+test("diagnostics contain only task metadata and exclude private records, errors, credentials and media", async () => {
+    const items = (await loadTaskCenter()).items;
+    for (const item of items) {
+        const diagnostic = JSON.parse(taskCenterDiagnostics({ ...item, title: "private title", prompt: "private prompt", error: "Bearer private-token https://private.example", summary: "private summary", href: "https://private.example", imageTaskRecordIds: ["linked-image"] }));
+        expect(diagnostic).toEqual({
+            source: item.source, kind: item.kind, status: item.status, recordId: item.recordId,
+            ...(item.taskId ? { taskId: item.taskId } : {}), ...(item.projectId ? { projectId: item.projectId } : {}), ...(item.nodeId ? { nodeId: item.nodeId } : {}), imageTaskRecordIds: ["linked-image"],
+        });
+        expect(JSON.stringify(diagnostic)).not.toContain("private");
+    }
+    expect(items.every((item) => Boolean(item.recordId))).toBe(true);
 });
 
 test("synchronous image batches retain progress and partial outcomes without offering resubmission", async () => {

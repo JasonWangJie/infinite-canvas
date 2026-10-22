@@ -10,6 +10,7 @@ export type TaskCenterSource = "image-tasks" | "image-workbench" | "video-workbe
 export type TaskCenterStatus = "active" | "attention" | "completed" | "failed";
 export type TaskCenterItem = {
     id: string;
+    recordId: string;
     source: TaskCenterSource;
     kind: "image" | "video" | "text" | "audio";
     status: TaskCenterStatus;
@@ -20,6 +21,7 @@ export type TaskCenterItem = {
     taskId?: string;
     projectId?: string;
     nodeId?: string;
+    imageTaskRecordIds?: string[];
     href: string;
     summary?: string;
     error?: string;
@@ -31,6 +33,20 @@ export type TaskCenterItem = {
 export type TaskCenterSnapshot = { items: TaskCenterItem[]; errors: Partial<Record<TaskCenterSource, string>> };
 type ImageLog = { id: string; title?: string; prompt?: string; model?: string; createdAt?: number; status: string; failCount?: number; images?: unknown[] };
 type TaskDocumentDomain = Exclude<TaskCenterSource, "image-tasks">;
+
+export function taskCenterDiagnostics(item: TaskCenterItem): string {
+    // Keep this allowlist independent of the full records, which contain private input and media.
+    return JSON.stringify({
+        source: item.source,
+        kind: item.kind,
+        status: item.status,
+        recordId: item.recordId,
+        taskId: item.taskId,
+        projectId: item.projectId,
+        nodeId: item.nodeId,
+        imageTaskRecordIds: item.imageTaskRecordIds,
+    }, null, 2);
+}
 
 function assertSession(epoch: number) {
     if (epoch !== sessionEpoch() || !currentSession()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
@@ -62,6 +78,7 @@ function imageTaskItem(record: ImageTaskRecord, epoch: number): TaskCenterItem {
     const pending = imageTaskPending(record);
     return {
         id: `image-task:${record.id}`,
+        recordId: record.id,
         source: "image-tasks",
         kind: "image",
         status: storagePending || incomplete ? "attention" : ready ? partial ? "attention" : "completed" : failed ? "failed" : pending ? "active" : "attention",
@@ -82,6 +99,7 @@ function imageTaskItem(record: ImageTaskRecord, epoch: number): TaskCenterItem {
 function videoLogItem(log: GenerationLog, epoch: number): TaskCenterItem {
     return {
         id: `video-log:${log.id}`,
+        recordId: log.id,
         source: "video-workbench",
         kind: "video",
         status: log.status === "success" ? "completed" : log.status === "failed" ? "failed" : log.status === "pending" && log.task ? "active" : "attention",
@@ -110,15 +128,18 @@ function canvasItems(value: unknown, epoch: number): TaskCenterItem[] {
     if (!Array.isArray(projects)) throw new Error(i18n.t("taskCenter.invalidSource"));
     return projects.flatMap((project) => project.nodes.flatMap((node): TaskCenterItem[] => {
         const metadata = node.metadata;
-        if (!["image", "video", "text", "audio"].includes(node.type) || !metadata || metadata.status === "idle") return [];
+        if (!["image", "video", "text", "audio"].includes(node.type) || !metadata) return [];
+        const imageTaskRecordIds = [...new Set([metadata.imageTaskRecordId, ...(metadata.images || []).map((image) => image.imageTaskRecordId)].filter((id): id is string => typeof id === "string" && Boolean(id)))];
+        if (metadata.status === "idle" && !imageTaskRecordIds.length && !metadata.videoSubmissionUnknown) return [];
         // Uploaded media and text notes have no generation metadata and are not tasks.
-        if (!metadata.videoTaskId && !metadata.videoSubmissionUnknown && !metadata.generationType && !(metadata.model && (metadata.images?.length || metadata.texts?.length || metadata.prompt))) return [];
+        if (!imageTaskRecordIds.length && !metadata.videoTaskId && !metadata.videoSubmissionUnknown && !metadata.generationType && !(metadata.model && (metadata.images?.length || metadata.texts?.length || metadata.prompt))) return [];
         const outputs = [...(metadata.images || []), ...(metadata.texts || [])];
         const failed = outputs.some((output) => output.status === "error");
         const pending = metadata.status === "loading" || outputs.some((output) => output.status === "loading");
-        const status: TaskCenterStatus = metadata.videoSubmissionUnknown ? "attention" : pending ? (metadata.videoTaskId ? "active" : "attention") : metadata.status === "error" ? (metadata.videoTaskId ? "attention" : "failed") : failed ? "attention" : "completed";
+        const status: TaskCenterStatus = metadata.videoSubmissionUnknown || imageTaskRecordIds.length ? "attention" : pending ? (metadata.videoTaskId ? "active" : "attention") : metadata.status === "error" ? (metadata.videoTaskId ? "attention" : "failed") : failed ? "attention" : "completed";
         return [{
             id: `canvas:${project.id}:${node.id}`,
+            recordId: node.id,
             source: "canvas",
             kind: node.type as TaskCenterItem["kind"],
             status,
@@ -130,6 +151,7 @@ function canvasItems(value: unknown, epoch: number): TaskCenterItem[] {
             taskId: metadata.videoTaskId,
             projectId: project.id,
             nodeId: node.id,
+            imageTaskRecordIds: imageTaskRecordIds.length ? imageTaskRecordIds : undefined,
             href: `/canvas/${encodeURIComponent(project.id)}?focusNode=${encodeURIComponent(node.id)}`,
             error: metadata.errorDetails || (metadata.videoSubmissionUnknown ? i18n.t("managed.imageTaskUnknown") : outputs.find((output) => output.status === "error")?.errorDetails),
             canResume: false,
@@ -146,6 +168,7 @@ export async function loadTaskCenter(): Promise<TaskCenterSnapshot> {
         readImageTasks().then((records) => records.map((record) => imageTaskItem(record, epoch))),
         readTaskCenterDocument("image-workbench").then((value) => recordValues<ImageLog>(value).map((log): TaskCenterItem => ({
             id: `image-log:${log.id}`,
+            recordId: log.id,
             source: "image-workbench",
             kind: "image",
             status: log.images?.length ? (log.failCount ? "attention" : "completed") : log.status === "failed" ? "failed" : "attention",
@@ -166,7 +189,7 @@ export async function loadTaskCenter(): Promise<TaskCenterSnapshot> {
         if (result.status === "fulfilled") snapshot.items.push(...result.value);
         else snapshot.errors[sources[index]] = result.reason instanceof Error ? result.reason.message : String(result.reason);
     });
-    // The sources have no shared reliable ID. Keep independent records instead of guessing duplicates.
+    // Keep source records independent; explicit image links support recovery without guessing duplicates.
     snapshot.items.sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
     return snapshot;
 }

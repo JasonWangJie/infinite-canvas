@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { browser } from "../../../tests/browser";
 import { mockBrowserDocuments } from "../../../tests/local-document-fixture";
 import { mockBrowserFiles } from "../../../tests/local-file-fixture";
@@ -11,6 +11,8 @@ import { createVideoGenerationTask, VideoGenerationUncertainError } from "@/serv
 import i18n from "@/i18n";
 import type { CanvasNodeData } from "@/types/canvas";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
+import * as imageStorage from "@/services/image-storage";
+import { readImageTaskRecords } from "@/services/image-task-records";
 
 const originalFetch = globalThis.fetch;
 const originalAdapter = axios.defaults.adapter;
@@ -31,6 +33,9 @@ let notifyUpload: (() => void) | undefined;
 let poll: (request: InternalAxiosRequestConfig) => Promise<AxiosResponse>;
 let browserDocuments: ReturnType<typeof mockBrowserDocuments>;
 let browserFiles: ReturnType<typeof mockBrowserFiles>;
+
+// Load the real canvas outside individual behavior tests; its first module graph is large.
+beforeAll(async () => { await import("@/pages/canvas/project"); }, 60000);
 
 function response(request: InternalAxiosRequestConfig, data: unknown): AxiosResponse {
     return { data, status: 200, statusText: "OK", headers: {}, config: request };
@@ -326,7 +331,7 @@ function videoProjects(metadata: CanvasNodeData["metadata"]): CanvasProject[] {
 }
 
 async function retryCanvasVideo(fixture: Awaited<ReturnType<typeof canvasVideoFixture>>) {
-    const button = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((item) => item.textContent === i18n.t("canvas.node.retry"));
+    const button = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((item) => [i18n.t("canvas.node.retry"), i18n.t("managed.resumeImage")].includes(item.textContent || ""));
     expect(Boolean(button)).toBe(true);
     await fixture.act(async () => button!.click());
 }
@@ -511,5 +516,206 @@ test("undo preserves a known video task for GET-only recovery and can still remo
         await undoCanvasVideo(fixture);
         expect(fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata?.videoTaskId).toBe("known-video");
         expect(requests).toHaveLength(3);
+    } finally { await fixture.close(); }
+});
+function imageProjects(metadata: CanvasNodeData["metadata"] = { status: "error", prompt: "new image" }) {
+    const model = "gateway::image-model";
+    useConfigStore.setState({ config: { ...config, model, imageModel: model, channels: [{ ...config.channels[0], models: [{ name: "image-model", capability: "image", endpointTypes: ["image-generation"] }] }] } });
+    const projects = videoProjects({ ...metadata, model });
+    projects[0].nodes[0].type = "image";
+    return projects;
+}
+
+test("canvas image persists its original intent and unknown recovery never POSTs after undo or navigation", async () => {
+    poll = async (request) => {
+        const saved = (documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects.find((project) => project.id === "a")!;
+        const recordId = saved.nodes[0].metadata?.imageTaskRecordId;
+        expect(Boolean(recordId)).toBe(true);
+        expect((await readImageTaskRecords())[recordId!].status).toBe("pending");
+        throw new axios.AxiosError("please retry later", "ERR_BAD_RESPONSE", request, undefined, { ...response(request, { error: { message: "please retry later" } }), status: 504 });
+    };
+    const fixture = await canvasVideoFixture(imageProjects());
+    try {
+        await retryCanvasVideo(fixture);
+        expect(requests).toEqual([{ method: "post", url: "/api/ai/v1/images/generations" }]);
+        expect(fixture.container.textContent).toContain(i18n.t("managed.imageTaskUnknown"));
+        expect(fixture.container.textContent).not.toContain("please retry later");
+        const id = fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata?.imageTaskRecordId;
+        await undoCanvasVideo(fixture);
+        expect(fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata?.imageTaskRecordId).toBe(id);
+        await retryCanvasVideo(fixture);
+        await fixture.act(async () => { await fixture.router.navigate("/canvas/b"); });
+        await fixture.act(async () => { await fixture.router.navigate("/canvas/a"); });
+        await retryCanvasVideo(fixture);
+        expect(requests).toHaveLength(1);
+    } finally { await fixture.close(); }
+});
+
+test("canvas image recovers a received result after local image storage failed without paying again", async () => {
+    const stored = { url: "blob:recovered-image", storageKey: "image:recovered", width: 320, height: 160, bytes: 5, mimeType: "image/png" };
+    const upload = spyOn(imageStorage, "uploadImage").mockRejectedValueOnce(new Error("image storage unavailable")).mockResolvedValue(stored);
+    const read = spyOn(imageStorage, "readStoredImage").mockResolvedValue(stored);
+    poll = async (request) => response(request, { data: [{ b64_json: "aW1hZ2U=" }] });
+    const fixture = await canvasVideoFixture(imageProjects());
+    try {
+        await retryCanvasVideo(fixture);
+        const before = fixture.useCanvasStore.getState().openProject("a")?.nodes[0];
+        expect(before?.metadata?.status).toBe("error");
+        expect((await readImageTaskRecords())[before!.metadata!.imageTaskRecordId!].status).toBe("succeeded");
+        await retryCanvasVideo(fixture);
+        const recovered = fixture.useCanvasStore.getState().openProject("a")?.nodes[0];
+        expect(recovered?.metadata).toMatchObject({ content: stored.url, storageKey: stored.storageKey, status: "success" });
+        expect(recovered?.metadata?.imageTaskRecordId).toBeUndefined();
+        expect(recovered!.width / recovered!.height).toBe(2);
+        expect(requests).toHaveLength(1);
+        expect(upload).toHaveBeenCalledTimes(2);
+        expect(read).toHaveBeenCalledTimes(1);
+    } finally { await fixture.close(); upload.mockRestore(); read.mockRestore(); }
+});
+
+test("canvas image blocks POST if its intent cannot be linked to the saved canvas", async () => {
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => String(input) === "/api/data/canvas" && init?.method === "PUT"
+        ? Response.json({ error: { message: "QuotaExceededError" } }, { status: 503 })
+        : transport(input, init)) as typeof fetch;
+    const fixture = await canvasVideoFixture(imageProjects());
+    try {
+        await retryCanvasVideo(fixture);
+        expect(requests).toEqual([]);
+        expect(fixture.container.textContent).toContain("QuotaExceededError");
+        expect(Object.values(await readImageTaskRecords()).map((record) => record.status)).toEqual(["failed"]);
+    } finally { await fixture.close(); }
+});
+
+test("canvas image confirmed rejection clears the intent and remains retryable", async () => {
+    poll = async (request) => { throw new axios.AxiosError("rejected", "ERR_BAD_REQUEST", request, undefined, { ...response(request, { error: { message: "rejected" } }), status: 400 }); };
+    const fixture = await canvasVideoFixture(imageProjects());
+    try {
+        await retryCanvasVideo(fixture);
+        expect(fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata?.imageTaskRecordId).toBeUndefined();
+        await retryCanvasVideo(fixture);
+        expect(requests).toHaveLength(2);
+    } finally { await fixture.close(); }
+});
+
+test.each(["project", "session", "delete"])("a %s change while saving a canvas image intent stops its paid POST", async (change) => {
+    const fixture = await canvasVideoFixture(imageProjects());
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let saving!: () => void;
+    const started = new Promise<void>((resolve) => { saving = resolve; });
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+        if (String(input) === "/api/data/canvas" && init?.method === "PUT") { saving(); await gate; }
+        return transport(input, init);
+    }) as typeof fetch;
+    try {
+        await retryCanvasVideo(fixture);
+        await started;
+        if (change === "project") await fixture.act(async () => { await fixture.router.navigate("/canvas/b"); });
+        else if (change === "session") await fixture.act(async () => { endCanvasSession(); });
+        else {
+            await fixture.act(async () => { window.dispatchEvent(new browser.KeyboardEvent("keydown", { key: "a", ctrlKey: true, bubbles: true })); });
+            await fixture.act(async () => { window.dispatchEvent(new browser.KeyboardEvent("keydown", { key: "Delete", bubbles: true })); });
+        }
+        await fixture.act(async () => { release(); });
+        expect(requests).toEqual([]);
+        if (change === "delete") expect(fixture.useCanvasStore.getState().openProject("a")?.nodes).toHaveLength(0);
+        if (change === "project") expect(fixture.useCanvasStore.getState().openProject("b")?.nodes[0].metadata?.content).toBe("blob:mock-original-b");
+    } finally { release(); await fixture.close(); }
+});
+
+test("canvas logout queues the latest viewport before its debounce and ignores ended sessions", async () => {
+    const projects = videoProjects({ status: "idle" });
+    projects[0].viewport = { x: 70, y: 50, k: 2 };
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const reset = fixture.container.querySelector<HTMLButtonElement>(`button[aria-label='${i18n.t("canvas.resetView")}']`)!;
+        await fixture.act(async () => reset.click());
+        expect(fixture.useCanvasStore.getState().openProject("a")?.viewport.k).toBe(2);
+        await fixture.act(async () => { window.dispatchEvent(new CustomEvent("canvas-before-logout")); });
+        expect(fixture.useCanvasStore.getState().openProject("a")?.viewport.k).toBe(1);
+        await fixture.act(async () => {
+            endCanvasSession();
+            fixture.useCanvasStore.setState({ hydrated: true, projects, deletedProjects: [] });
+            window.dispatchEvent(new CustomEvent("canvas-before-logout"));
+        });
+        expect(fixture.useCanvasStore.getState().openProject("a")?.viewport.k).toBe(2);
+    } finally { await fixture.close(); }
+});
+
+test("canvas batch images persist a separate intent per slot and querying an unknown slot cannot submit again", async () => {
+    const projects = imageProjects({ status: "idle", prompt: "batch", generationMode: "image", count: 2 });
+    projects[0].nodes[0].type = "config";
+    projects[0].nodes[0].position.x = -240;
+    poll = async (request) => {
+        const saved = (documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects.find((project) => project.id === "a")!;
+        const child = saved.nodes.find((node) => node.type === "image")!;
+        expect(Boolean(child)).toBe(true);
+        expect(saved.connections).toHaveLength(1);
+        const ids = child.metadata!.images!.map((image) => image.imageTaskRecordId);
+        expect(ids.every(Boolean)).toBe(true);
+        expect(new Set(ids).size).toBe(2);
+        throw new axios.AxiosError("response lost", "ERR_NETWORK", request);
+    };
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((button) => button.textContent === i18n.t("canvas.configNode.generate"));
+        expect(Boolean(generate)).toBe(true);
+        await fixture.act(async () => generate!.click());
+        const child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.type === "image")!;
+        expect(child.metadata!.images!.map((image) => image.status)).toEqual(["error", "error"]);
+        expect(new Set(child.metadata!.images!.map((image) => image.imageTaskRecordId)).size).toBe(2);
+        expect(requests).toHaveLength(2);
+        const query = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.resumeImage"));
+        expect(Boolean(query)).toBe(true);
+        await fixture.act(async () => query!.click());
+        expect(requests).toHaveLength(2);
+    } finally { await fixture.close(); }
+});
+
+test.each(["execution_unknown", "succeeded"])("batch %s recovery retains the successful primary and skipped sibling remains recoverable", async (status) => {
+    const primary = { id: "primary", status: "success" as const, content: "blob:original-primary", naturalWidth: 100, naturalHeight: 100, bytes: 5, mimeType: "image/png" };
+    const failed = (id: string) => ({ id, status: "error" as const, content: "", naturalWidth: 0, naturalHeight: 0, bytes: 0, mimeType: "", imageTaskRecordId: id });
+    const projects = imageProjects({ status: "success", content: primary.content, prompt: "batch", primaryImageId: primary.id, images: [primary, failed("slot-1"), failed("slot-2")] });
+    documents["image-tasks"] = { revision: 1, value: Object.fromEntries(["slot-1", "slot-2"].map((id) => [id, { id, task_id: null, status, value: status === "succeeded" ? { result: { data: [{ url: `data:image/png;base64,${id}` }] } } : {} }])) };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const stored = (key: string) => ({ url: `blob:${key}`, storageKey: key, width: 320, height: 160, bytes: 5, mimeType: "image/png" });
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async (value) => { await gate; return stored(`image:${String(value).split(",")[1]}`); });
+    const read = spyOn(imageStorage, "readStoredImage").mockImplementation(async (key) => stored(key));
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const expand = fixture.container.querySelector<HTMLButtonElement>(`button[aria-label='${i18n.t("canvas.node.batchCollapsed")}']`)!;
+        expect(Boolean(expand)).toBe(true);
+        await fixture.act(async () => expand.click());
+        const queries = () => [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].filter((button) => button.textContent === i18n.t("managed.resumeImage"));
+        expect(queries()).toHaveLength(2);
+        await fixture.act(async () => { for (const query of queries()) query.click(); });
+        if (status === "succeeded") expect(upload).toHaveBeenCalledTimes(1);
+        else expect(upload).not.toHaveBeenCalled();
+        await fixture.act(async () => { release(); });
+        let node = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+        expect(node.metadata?.content).toBe(primary.content);
+        expect(node.metadata?.images?.[0]).toEqual(primary);
+        expect(node.metadata?.images?.[2].imageTaskRecordId).toBe("slot-2");
+        expect(queries()).toHaveLength(status === "succeeded" ? 1 : 2);
+        await fixture.act(async () => queries().at(-1)!.click());
+        node = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+        expect(node.metadata?.content).toBe(primary.content);
+        expect(node.metadata?.primaryImageId).toBe(primary.id);
+        expect(node.metadata?.images?.[0]).toEqual(primary);
+        expect(node.metadata?.images?.slice(1).map((image) => image.status)).toEqual(status === "succeeded" ? ["success", "success"] : ["error", "error"]);
+        expect(requests).toEqual([]);
+    } finally { release(); await fixture.close(); upload.mockRestore(); read.mockRestore(); }
+});
+
+test("canvas resumes a removed video model by original task GET and keeps its original model metadata", async () => {
+    useConfigStore.setState({ config: { ...config, channels: [], models: [] } });
+    const fixture = await canvasVideoFixture(videoProjects({ status: "loading", prompt: "video", model: "gateway::removed-model", videoTaskId: "task-existing", videoTaskProvider: "openai" }));
+    try {
+        expect(requests.every((request) => request.method === "get")).toBe(true);
+        expect(requests.length).toBeGreaterThan(0);
+        expect(fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata).toMatchObject({ model: "gateway::removed-model", status: "success", content: "blob:mock-video" });
     } finally { await fixture.close(); }
 });

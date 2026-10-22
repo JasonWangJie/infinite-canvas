@@ -23,6 +23,9 @@ export default {
         saveUnconfirmed: "画布保存未获得确认，请重试保存",
     },
     tasks: {
+        copyDiagnostics: "复制诊断",
+        copyDiagnosticsHint: "仅复制任务状态和关联记录标识，不含提示词、错误详情或媒体",
+        imageTaskRecord: "图片记录：{{id}}",
         title: "任务中心",
         description: "集中查看生成记录，继续查询原任务并打开对应画布或工作台",
         refresh: "刷新列表",
@@ -137,6 +140,13 @@ export default {
         invalidCanvas: "画布数据格式无效，原稿仍保留，请下载草稿 JSON。",
     },
     managed: {
+        modelsLoading: "正在读取可用模型…",
+        modelsUnavailable: "模型列表暂时不可用，已保存的本地内容仍可查看",
+        logoutSaving: "正在保存并退出",
+        logoutSavingHint: "正在保存本地修改，请稍候。",
+        logoutSaveFailed: "本地修改尚未保存，已停止退出。请先恢复或导出草稿。",
+        gatewayModels: "New API · 当前可用模型 {{count}} 个",
+        asyncImageUnsupported: "所选模型不支持后台异步生图，可使用同步生成。",
         imageBatchIncompleteNotice: "剩余请求尚未确认；刷新或关闭页面后，可能无法继续接收结果，请勿重复提交",
         imageBatchPartialNotice: "已保留成功图片；{{failed}} 次失败，{{unknown}} 次结果未知，请勿重复提交未知请求",
         imageBatchSaveFailed: "本次生成记录尚未保存，已收到的结果保留在当前草稿中，请恢复保存，勿重新提交整批",
@@ -188,6 +198,7 @@ export default {
     },
     theme: { toggle: "切换主题" },
     common: {
+        close: "关闭",
         cancel: "取消",
         save: "保存",
         edit: "编辑",
@@ -217,7 +228,7 @@ export default {
         video: { title: "视频设置", quality: "清晰度", size: "尺寸", seconds: "秒数", mode: "模式", modes: { frames: "首尾帧模式", reference: "全能参考模式" }, resolution: "分辨率", ratio: "比例", duration: "时长", smart: "智能", output: "输出", generateAudio: "生成声音", watermark: "添加水印", adaptive: "自适应", sizes: { landscape: "横屏", portrait: "竖屏", square: "方形", widescreen: "宽屏", tall: "长图", auto: "自动" }, ratios: { landscape: "横屏", portrait: "竖屏", square: "方形", standardLandscape: "标准横屏", standardPortrait: "标准竖屏", cinematic: "宽银幕", adaptive: "自适应" } },
         audio: { title: "音频设置", voice: "声音", format: "格式", speed: "语速", instructions: "声音指令", instructionsPlaceholder: "例如：自然、温暖、适合旁白。" },
         text: { title: "文本设置", reasoning: "推理强度", count: "生成次数" },
-        model: { select: "选择模型", assign: "请先在渠道里为{{capability}}指定模型", noMatch: "暂无匹配的{{capability}}模型", addFirst: "请先到配置里添加渠道和模型", capabilities: { image: "生图", video: "视频", text: "文本", audio: "音频" } },
+        model: { select: "选择模型", assign: "请在配置中选择可用的{{capability}}模型", noMatch: "暂无匹配的{{capability}}模型", addFirst: "请在配置中刷新可用模型，并检查网关授权", capabilities: { image: "生图", video: "视频", text: "文本", audio: "音频" } },
     },
     generation: { pending: ["正在创建图片", "马上就好了", "再等等", "正在整理细节"] },
     imageReferences: { label: "图片{{index}}", separator: "、", promptPrefix: "参考图片编号：{{labels}}。请按这些编号理解提示词中的图片引用。\n\n{{prompt}}" },
@@ -238,7 +249,7 @@ export default {
             anyModel: "（当前选中的模型）",
         },
     },
-    apiErrors: { requestFailed: "请求失败", requestCanceled: "请求已取消", baseUrlRequired: "请先配置 Base URL", apiKeyRequired: "请先配置 API Key", authenticationFailed: "鉴权失败，请检查 API Key、套餐权限或模型权限", rateLimited: "请求被限流或额度不足，请稍后重试", notFound: "接口地址不存在（404），请检查 Base URL 和模型选择", badGateway: "网关错误（502），接口服务暂时不可用，请稍后重试", serviceBusy: "服务繁忙（503），请稍后重试", httpFailed: "请求失败（HTTP {{status}}），请检查 Base URL 和 API Key 是否正确", htmlError: "服务返回了 HTML 错误页面（{{preview}}）", imageTimeout: "生图请求超时，接口长时间没有返回，请稍后重试或更换渠道", audioModelRequired: "请先配置音频模型", audioGenerationFailed: "音频生成失败", scriptNoAudio: "模型调用脚本没有返回音频", geminiAudioUnsupported: "Gemini 调用格式暂不支持音频生成，请使用 OpenAI 格式渠道", invalidImageSizeFormat: "图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024", positiveImageRatio: "图像比例必须是正数，例如 9:16", imageRatioLimit: "图像宽高比不能超过 3:1，请调整尺寸", positiveImageDimensions: "图像尺寸必须是正整数，例如 1024x1024", imageDimensionStep: "图像尺寸的宽高必须是 16 的倍数，请调整尺寸", imageEdgeLimit: "图像尺寸最长边不能超过 3840px，请调整尺寸", imagePixelLimit: "图像总像素需在 655360 到 8294400 之间，请调整尺寸", unknownImageResponse: "接口返回了未知格式的数据（字段：{{fields}}），请检查模型或接口兼容性", noImageReturned: "接口没有返回图片，请检查提示词是否触发安全审核或模型是否支持该操作", geminiRejected: "Gemini 拒绝了本次请求：{{reason}}", geminiNoImage: "Gemini 接口没有返回图片", maskModelUnsupported: "蒙版编辑暂不支持该模型，请使用其他渠道", noContent: "没有返回内容", modelReadFailed: "读取模型失败", videoTimeout: "{{provider}}视频生成超时，请稍后重试", pluginVideoExpired: "插件视频任务已失效，请重新生成", scriptNoVideo: "模型调用脚本没有返回视频", noPlayableVideo: "视频接口没有返回可播放的视频", noVideoTaskId: "视频接口没有返回任务 ID", videoTaskCreateFailed: "视频任务创建失败", videoGenerationFailed: "视频生成失败", videoTaskQueryFailed: "视频任务查询失败", videoPromptRequired: "请输入视频提示词，或连接参考图片/视频/音频", referenceImageReadFailed: "参考图读取失败，请换一张图片或重新上传", invalidReferenceVideo: "参考视频必须是公网 URL、资产 ID，或本地已保存的视频", invalidReferenceAudio: "参考音频必须是公网 URL、资产 ID，或本地已保存的音频", videoModelRequired: "请先配置视频模型", geminiVideoUnsupported: "Gemini 调用格式暂不支持视频生成，请使用 OpenAI 格式渠道", noVideoTask: "接口没有返回视频任务", videoDownloadFailed: "视频下载失败", localAssetReadFailed: "读取本地资产失败" },
+    apiErrors: { requestFailed: "请求失败", requestCanceled: "请求已取消", baseUrlRequired: "请先配置 Base URL", apiKeyRequired: "请先配置 API Key", authenticationFailed: "鉴权失败，请检查 API Key、套餐权限或模型权限", rateLimited: "请求被限流或额度不足，请稍后重试", notFound: "接口地址不存在（404），请检查 Base URL 和模型选择", badGateway: "网关错误（502），接口服务暂时不可用，请稍后重试", serviceBusy: "服务繁忙（503），请稍后重试", httpFailed: "请求失败（HTTP {{status}}），请检查 Base URL 和 API Key 是否正确", htmlError: "服务返回了 HTML 错误页面（{{preview}}）", imageTimeout: "生图请求超时，执行结果尚未确认，请查看原任务记录，勿重复提交", audioModelRequired: "请先配置音频模型", audioGenerationFailed: "音频生成失败", scriptNoAudio: "模型调用脚本没有返回音频", geminiAudioUnsupported: "Gemini 调用格式暂不支持音频生成，请使用 OpenAI 格式渠道", invalidImageSizeFormat: "图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024", positiveImageRatio: "图像比例必须是正数，例如 9:16", imageRatioLimit: "图像宽高比不能超过 3:1，请调整尺寸", positiveImageDimensions: "图像尺寸必须是正整数，例如 1024x1024", imageDimensionStep: "图像尺寸的宽高必须是 16 的倍数，请调整尺寸", imageEdgeLimit: "图像尺寸最长边不能超过 3840px，请调整尺寸", imagePixelLimit: "图像总像素需在 655360 到 8294400 之间，请调整尺寸", unknownImageResponse: "接口返回了未知格式的数据（字段：{{fields}}），请检查模型或接口兼容性", noImageReturned: "接口没有返回图片，请检查提示词是否触发安全审核或模型是否支持该操作", geminiRejected: "Gemini 拒绝了本次请求：{{reason}}", geminiNoImage: "Gemini 接口没有返回图片", maskModelUnsupported: "蒙版编辑暂不支持该模型，请使用其他渠道", noContent: "没有返回内容", modelReadFailed: "读取模型失败", videoTimeout: "{{provider}}视频生成超时，请稍后重试", pluginVideoExpired: "插件视频任务已失效，请重新生成", scriptNoVideo: "模型调用脚本没有返回视频", noPlayableVideo: "视频接口没有返回可播放的视频", noVideoTaskId: "视频接口没有返回任务 ID", videoTaskCreateFailed: "视频任务创建失败", videoGenerationFailed: "视频生成失败", videoTaskQueryFailed: "视频任务查询失败", videoPromptRequired: "请输入视频提示词，或连接参考图片/视频/音频", referenceImageReadFailed: "参考图读取失败，请换一张图片或重新上传", invalidReferenceVideo: "参考视频必须是公网 URL、资产 ID，或本地已保存的视频", invalidReferenceAudio: "参考音频必须是公网 URL、资产 ID，或本地已保存的音频", videoModelRequired: "请先配置视频模型", geminiVideoUnsupported: "Gemini 调用格式暂不支持视频生成，请使用 OpenAI 格式渠道", noVideoTask: "接口没有返回视频任务", videoDownloadFailed: "视频下载失败", localAssetReadFailed: "读取本地资产失败" },
     prompts: {
         title: "提示词中心",
         library: "提示词库",
@@ -383,6 +394,9 @@ export default {
         home: "返回首页",
     },
     workbench: {
+        referenceImportFailed: "部分参考图导入失败：{{files}}",
+        importingReferences: "正在读取参考图…",
+        modelUnavailable: "所选模型暂不可用或不支持当前操作，请在配置中刷新模型并重新选择。",
         historySearch: "搜索标题、提示词或模型",
         historyStatus: "历史状态",
         historyAllStatuses: "全部状态",
@@ -592,6 +606,10 @@ export default {
         },
     },
     navigation: {
+        loadingPage: "正在加载页面…",
+        pageLoadFailed: "页面加载失败",
+        pageLoadFailedHint: "可以返回首页，或刷新页面重试。未保存的修改请先恢复或导出。",
+        backHome: "返回首页",
         tasks: "任务中心",
         canvas: "我的画布",
         image: "生图工作台",
@@ -641,8 +659,8 @@ export default {
     config: {
         title: "配置与用户偏好",
         invalidFile: "配置文件格式不正确",
-        description: "渠道聚合、模型选择、同步与本地存储",
-        modalDescription: "渠道聚合、默认模型、同步与本地存储",
+        description: "网关可用模型、生成偏好与浏览器本地存储",
+        modalDescription: "网关可用模型、默认模型与浏览器本地存储",
         tabs: {
             channels: "渠道",
             localProxy: "本地代理",
@@ -677,7 +695,7 @@ export default {
             records: "{{count}} 条",
             refresh: "刷新统计",
             readFailed: "读取本地存储失败",
-            stores: { appState: "应用状态", images: "图片文件", imagePreviews: "图片缩略图", media: "音视频文件", imageLogs: "生图记录", videoLogs: "视频记录", agentMessages: "Agent 消息", promptCache: "提示词缓存" },
+            stores: { documents: "本地业务文档", files: "本地媒体文件", appState: "应用状态", images: "图片文件", imagePreviews: "图片缩略图", media: "音视频文件", imageLogs: "生图记录", videoLogs: "视频记录", agentMessages: "Agent 消息", promptCache: "提示词缓存" },
         },
         promptSources: {
             add: "新增来源",

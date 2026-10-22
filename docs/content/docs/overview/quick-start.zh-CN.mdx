@@ -1,48 +1,38 @@
 ---
 title: 快速开始
-description: 用最少步骤把无限画布跑起来
+description: 启动 New API 受管模式的无限画布
 ---
 
 # 快速开始
 
-如果你只是想先把项目跑起来，优先部署或启动 `web/` 前端。
+当前分支需要 `web/` 前端、`canvas-server/` 中的 Canvas BFF，以及支持 Canvas 授权集成的 New API。只部署静态前端不能完成登录和模型调用。
 
-## Vercel 部署
+## 准备环境
 
-在 Vercel 中导入仓库即可，根目录 `vercel.json` 会构建 `web/`。当前版本的 AI 请求由浏览器前台直连用户自己的 OpenAI 兼容地址，不需要额外配置服务端。
+- 在 New API 注册画布应用，配置客户端 ID、双方一致的应用密钥，以及精确回调地址：`<CANVAS_ORIGIN>/auth/callback`。
+- 参考 `canvas-server/.env.example` 配置变量。`CANVAS_ORIGIN` 是画布的精确公开源地址；`NEW_API_URL` 供 BFF 访问，`NEW_API_PUBLIC_URL` 供浏览器访问。
+- 实际密钥放在 Git 与镜像之外。重启时保留会话加密密钥和 BFF 数据卷；代理超时由部署者按 New API 的实际策略明确设置。
+- 生产环境使用 HTTPS；本机开发允许回环 HTTP，具体步骤见[本地开发](/docs/development/local-development)。
 
-## 本地启动
+## 启动服务
 
-```bash
-git clone git@github.com:basketikun/infinite-canvas.git
-cd infinite-canvas
-cd web
-bun install
-bun run dev
-```
+开发环境按[本地开发说明](/docs/development/local-development)在两个终端分别启动 BFF 和 Vite。Vite 将 `/auth`、`/api` 同源转发到 BFF。
 
-启动后访问：
-
-```text
-http://localhost:3000
-```
-
-## Docker 启动
-
-如果你需要基于当前源码构建镜像：
+使用受管 Docker 拓扑时，先在仓库外准备环境文件，再从仓库根目录执行：
 
 ```bash
-docker build -t infinite-canvas .
-docker run --rm -p 3000:3000 infinite-canvas
+docker compose --env-file /path/to/canvas.env -f docker-compose.managed.yml up -d --build
 ```
 
-## 首次使用建议
+入口代理与数据卷要求见[Docker 部署](/docs/overview/docker)。默认 `docker-compose.yml`、单独静态镜像、Vercel 配置与 Render 快捷入口都不包含完整受管服务。Docker 静态资源路径、真实 HTTPS 双站授权及生产升级回退仍待验收。
 
-- 先打开右上角配置弹窗，填入自己的 `Base URL`、`API Key` 和模型名。
-- 如果需要提示词仓库内容，打开 `/prompts` 会由浏览器前端直连拉取并缓存到 IndexedDB。
-- 如果需要跨设备同步画布、素材和生成记录，可在配置弹窗中填写 WebDAV。
+## 首次使用
 
-## 说明
+1. 登录 New API，从其画布入口完成授权。
+2. 选择当前账号可用的模型。渠道和模型权限在 New API 管理，浏览器不填写 API Key 或任意服务地址。
+3. 创建画布、导入本地参考文件并生成结果。提示词目录及其媒体通过已授权的 BFF 接口读取。
+4. 使用完整资源包导出进行自主备份，或在不同浏览器间转移数据。
 
-- 当前画布项目和“我的素材”主要保存在浏览器本地，WebDAV 同步需要用户自行配置。
-- AI API Key 保存在浏览器本地，并由前端直接请求 OpenAI 兼容接口。
+项目、素材、配置、生成记录及媒体保存在当前浏览器的 `infinite-canvas` IndexedDB，按授权用户隔离；退出保留已保存数据，清理站点数据会删除这些本地记录与文件。当前没有云同步或 WebDAV。BFF 仅持久化登录与授权状态，生成请求和参考媒体仍经 New API 处理。
+
+受管模式不开放本地代理、本机 Agent、任意模型脚本或远程插件安装；随应用打包的 SVG、Markdown、便签和隔离 HTML 节点可正常使用。

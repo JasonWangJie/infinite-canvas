@@ -1,10 +1,10 @@
+import { browser } from "./browser";
 import { mockBrowserDocuments } from "./local-document-fixture";
 import { mockBrowserFiles } from "./local-file-fixture";
-import { afterEach, beforeEach, expect, jest, spyOn, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, expect, jest, spyOn, test } from "bun:test";
 import { StrictMode, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
-import { browser } from "./browser";
 import i18n from "../src/i18n";
 import { endCanvasSession, readCanvasSession, sessionEpoch } from "../src/services/api/canvas-client";
 import { placeResultsInCanvas, type CanvasResultPlacement } from "../src/lib/canvas/result-to-canvas";
@@ -32,6 +32,12 @@ let requests: string[];
 function project(): CanvasProject {
     return { id: "canvas", title: "Existing canvas", createdAt: "2026-01-01", updatedAt: "2026-01-01", nodes: [{ id: "existing", type: "text", title: "Keep me", position: { x: -400, y: 0 }, width: 300, height: 200, metadata: { content: "original text" } }], connections: [], chatSessions: [], activeChatId: null, backgroundMode: "lines", showImageInfo: false, viewport: { x: 0, y: 0, k: 1 } };
 }
+
+beforeAll(async () => {
+    // Load the page before fake timers and the first interaction's test budget.
+    await import("antd");
+    await import("../src/pages/canvas/project");
+});
 
 beforeEach(async () => {
     documents = mockBrowserDocuments();
@@ -72,25 +78,28 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-    if (root) await act(async () => root!.unmount());
-    root = undefined;
-    container?.remove();
-    container = undefined;
-    pluginSpy.mockRestore();
-    boundsSpy.mockRestore();
-    imageSpy?.mockRestore();
-    imageSpy = undefined;
-    endCanvasSession();
-    useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
-    jest.clearAllTimers();
-    jest.useRealTimers();
-    documents.restore();
-    files.restore();
-    globalThis.fetch = originalFetch;
-    browser.matchMedia = originalMatchMedia;
-    for (const [key, descriptor] of previous) {
-        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-        else Reflect.deleteProperty(globalThis, key);
+    try {
+        if (root) await act(async () => root!.unmount());
+    } finally {
+        root = undefined;
+        container?.remove();
+        container = undefined;
+        pluginSpy?.mockRestore();
+        boundsSpy?.mockRestore();
+        imageSpy?.mockRestore();
+        imageSpy = undefined;
+        endCanvasSession();
+        useCanvasStore.setState({ projects: [], deletedProjects: [], hydrated: false });
+        jest.clearAllTimers();
+        jest.useRealTimers();
+        documents?.restore();
+        files?.restore();
+        globalThis.fetch = originalFetch;
+        browser.matchMedia = originalMatchMedia;
+        for (const [key, descriptor] of previous || []) {
+            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+            else Reflect.deleteProperty(globalThis, key);
+        }
     }
 });
 

@@ -5,29 +5,23 @@ description: 使用 Docker Compose 部署无限画布
 
 # Docker 部署
 
-如果你希望在自己的机器或服务器上运行项目，可以直接使用 Docker Compose。
+## 受管应用
 
-## 使用发布镜像
+先准备支持 Canvas 授权集成的 New API，前提见[快速开始](/docs/overview/quick-start)。将 `canvas-server/.env.example` 复制到仓库外的私有环境文件，填写配置后执行：
 
 ```bash
 git clone git@github.com:basketikun/infinite-canvas.git
 cd infinite-canvas
-docker compose up -d
+docker compose --env-file /path/to/canvas.env -f docker-compose.managed.yml up -d --build
 ```
 
-启动后访问：
+该拓扑通过 3000 端口上的 Nginx 提供 Vite 静态前端，并启动仅内部访问的 3001 端口 Canvas BFF。BFF 必须能够访问 `NEW_API_URL`，浏览器必须能够访问 `NEW_API_PUBLIC_URL`。
 
-```text
-http://localhost:3000
-```
+在 3000 端口前配置 HTTPS 入口并保留公开 Host，将 `CANVAS_ORIGIN` 设置为该精确公开源地址；在 New API 注册 `<CANVAS_ORIGIN>/auth/callback`，客户端 ID 与密钥需双方一致。`CANVAS_PROXY_READ_TIMEOUT` 按网关实际允许的生成及流式请求时长设置，Compose 要求显式填写，不提供额外经验默认值。
 
-## 本地构建镜像
+`canvas_private_data` 数据卷仅保存 BFF 授权状态，不保存项目或媒体；重启时保留该卷和 `CANVAS_SESSION_ENCRYPTION_KEY`。浏览器业务数据保存在按授权用户隔离的 IndexedDB，退出保留已保存数据；生成请求和参考媒体仍经 New API。
 
-如果需要基于当前源码构建镜像：
-
-```bash
-docker compose -f docker-compose.local.yml up -d --build
-```
+根目录 `docker-compose.yml`、`docker-compose.local.yml` 和单独静态镜像不包含完整受管服务。Docker 静态资源路径、真实 HTTPS 双站授权及生产升级回退仍待验收；部署后先检查登录、模型列表及本地保存重载，再验收付费生成。
 
 ## 文档站镜像
 
@@ -49,43 +43,8 @@ docker compose -f docker-compose.local.yml up -d --build
 
 ## 数据说明
 
-当前主应用镜像只启动 Next.js。画布、我的素材、生成记录和 AI API Key 默认保存在浏览器本地；第三方提示词由浏览器前端直连拉取，不需要额外挂载数据目录。
+文档站与 Vite 主应用、Canvas BFF 分开部署，启动文档站不会建立画布授权或模型转发能力。浏览器不持有服务商 API Key，提示词目录通过 BFF 读取，当前不提供 WebDAV 或云同步。
 
 ## 统计分析（可选）
 
-项目**默认不接入任何统计**：不设置下列环境变量时，页面不会加载任何统计脚本，也不会发送任何外部请求。你在自己的部署上想查看流量时，设置对应环境变量即可，无需修改代码或重新构建镜像——镜像启动时会据此生成运行期配置。
-
-统计按「每家一个独立变量」配置：**填了谁就启用谁，可同时启用多家**（例如 GA4 + 百度一起开）。仅支持 GA4 与百度，两者都只接受 ID，脚本地址由代码固定拼接，不接受任意脚本地址或内联 JS。
-
-| 变量 | 说明 |
-| --- | --- |
-| `ANALYTICS_GA4_ID` | Google Analytics 4 衡量 ID（`G-XXXX`） |
-| `ANALYTICS_BAIDU_ID` | 百度统计站点 ID（`hm.js?` 后面那串 hash） |
-
-在 `docker-compose.yml` 的 `environment` 中配置（文件内已附注释示例），下例同时启用 GA4 与百度：
-
-```yaml
-services:
-  app:
-    image: ghcr.io/basketikun/infinite-canvas:latest
-    ports:
-      - "3000:3000"
-    environment:
-      ANALYTICS_GA4_ID: G-XXXXXXXXXX
-      ANALYTICS_BAIDU_ID: e8263761cc5c32f5f7a855b8203b965a
-```
-
-或使用 `docker run`：
-
-```bash
-docker run -d -p 3000:3000 \
-  -e ANALYTICS_GA4_ID=G-XXXXXXXXXX \
-  -e ANALYTICS_BAIDU_ID=e8263761cc5c32f5f7a855b8203b965a \
-  ghcr.io/basketikun/infinite-canvas:latest
-```
-
-单页应用的路由切换会自动向所有已启用的统计上报 pageview。
-
-<Callout type="warn">
-请只在你自己的站点上配置统计 ID，不要把 ID 提交进仓库；fork 或自托管本项目的用户默认不会产生任何统计。
-</Callout>
+受管 Compose 默认未启用统计，Content Security Policy 也禁止外部脚本和连接。独立静态镜像的统计环境变量不能直接保证在该拓扑中生效，不要为照搬旧部署示例放宽受管安全策略。

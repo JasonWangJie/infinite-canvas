@@ -62,7 +62,7 @@ function videoTaskFailed(message: string) {
 
 export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
     const selectedModel = (config.model || config.videoModel).trim();
-    const requestConfig = resolveModelRequestConfig(config, selectedModel);
+    const requestConfig = resolveModelRequestConfig(config, selectedModel, "video");
     assertVideoConfig(requestConfig, requestConfig.model);
     if (requestConfig.apiFormat === "gemini") throw new Error("受管画布视频生成需要 New API 的 OpenAI 视频兼容接口");
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
@@ -70,9 +70,8 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
 
 export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
     if (task.provider !== "openai") throw new Error("此视频任务使用受管画布未开放的协议，请通过 New API 视频兼容模型重新生成");
-    const requestConfig = resolveModelRequestConfig(config, task.model);
-    assertVideoConfig(requestConfig, requestConfig.model);
-    return pollOpenAIVideoTask(requestConfig, task, options);
+    // Existing tasks are authorized by the gateway; model removal only blocks new submissions.
+    return pollOpenAIVideoTask(config, task, options);
 }
 
 export async function storeGeneratedVideo(result: VideoGenerationResult): Promise<UploadedFile> {

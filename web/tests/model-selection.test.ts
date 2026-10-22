@@ -1,3 +1,4 @@
+import "./browser";
 import { afterAll, beforeEach, expect, test } from "bun:test";
 import type { AiConfig, ModelCapability } from "../src/stores/use-config-store";
 import type { CanvasNodeData } from "../src/types/canvas";
@@ -59,7 +60,7 @@ test("removing a model from an existing provider prevents retry even with valid 
     expect(ready(selected, selected.model)).toBe(false);
 });
 
-test("task recovery rejects a missing provider instead of querying the first provider", () => {
+test("new generation rejects a missing provider instead of selecting the first provider", () => {
     expect(ready(config, "removed::video-a")).toBe(false);
     expect(ready(config, "unknown-video")).toBe(false);
 });

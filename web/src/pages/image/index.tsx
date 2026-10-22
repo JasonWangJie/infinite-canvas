@@ -5,6 +5,7 @@ import { createRecordStore, writeDocument } from "@/services/canvas-data";
 import { saveAs } from "file-saver";
 import { useLocation } from "react-router-dom";
 import { useWorkbenchHistoryFilter } from "@/hooks/use-workbench-history-filter";
+import { readClipboardImages, useReferenceImageImport } from "@/hooks/use-reference-image-import";
 import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
 import { readTaskCenterDocument } from "@/services/task-center";
 import { useTranslation } from "react-i18next";
@@ -16,7 +17,7 @@ import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
-import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { modelOptionLabel, modelMatchesCapability, supportsAsyncImageGeneration, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
@@ -86,6 +87,8 @@ export default function ImagePage() {
     const latestLoad = useRef(0);
     const loadedSearch = useRef<string | null>(null);
     const interactionVersion = useRef(0);
+    const historyInteraction = useRef(0);
+    const cancelHistoryPreview = () => { historyInteraction.current += 1; };
     const [logsLoaded, setLogsLoaded] = useState(false);
     const [navigationError, setNavigationError] = useState("");
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
@@ -131,8 +134,13 @@ export default function ImagePage() {
     const agentTaskIdRef = useRef<string | undefined>(undefined);
 
     const model = effectiveConfig.imageModel || effectiveConfig.model;
-    const canGenerate = Boolean(prompt.trim());
+    const modelReady = isAiConfigReady(effectiveConfig, model) && modelMatchesCapability(effectiveConfig, model, "image");
+    const asyncSupported = supportsAsyncImageGeneration(effectiveConfig, model);
+    const { importing: importingReferences, importReferences } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images]), `${location.key}:${interactionVersion.current}`);
+    const canGenerate = Boolean(prompt.trim()) && modelReady && !importingReferences;
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
+
+    useEffect(() => { if (!asyncSupported) setAsyncMode(false); }, [asyncSupported]);
 
     useEffect(() => {
         if (!running || !startedAt) return;
@@ -162,39 +170,13 @@ export default function ImagePage() {
     }, [results]);
 
     const addReferences = async (files?: FileList | null) => {
-        const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
-        const nextReferences = await Promise.all(
-            imageFiles.map(async (file) => {
-                const image = await uploadImage(file);
-                return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-            }),
-        );
-        setReferences((value) => [...value, ...nextReferences]);
+        await importReferences(Array.from(files || []));
     };
 
-    const addReferencesFromClipboard = async () => {
-        try {
-            const items = await navigator.clipboard.read();
-            const blobs = await Promise.all(items.flatMap((item) => item.types.filter((type) => type.startsWith("image/")).map((type) => item.getType(type))));
-            if (!blobs.length) {
-                message.error(t("imageWorkbench.clipboardEmpty"));
-                return;
-            }
-            const nextReferences = await Promise.all(
-                blobs.map(async (blob, index) => {
-                    const image = await uploadImage(blob);
-                    return { id: nanoid(), name: `clipboard-${index + 1}.png`, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-                }),
-            );
-            setReferences((value) => [...value, ...nextReferences]);
-            message.success(t("imageWorkbench.clipboardAdded", { count: nextReferences.length }));
-        } catch {
-            message.error(t("imageWorkbench.clipboardEmpty"));
-        }
-    };
+    const addReferencesFromClipboard = () => importReferences(readClipboardImages);
 
     const generate = async () => {
-        if (submittingAsync.current || runningRef.current) return;
+        if (submittingAsync.current || runningRef.current || importingReferences) return;
         const epoch = sessionEpoch();
         const agentTaskId = agentTaskIdRef.current;
         agentTaskIdRef.current = undefined;
@@ -204,8 +186,8 @@ export default function ImagePage() {
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.promptRequired") });
             return;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
-            message.warning(t("workbench.configFirst"));
+        if (!modelReady) {
+            message.warning(t("workbench.modelUnavailable"));
             openConfigDialog(true);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.configIncomplete") });
             return;
@@ -228,7 +210,7 @@ export default function ImagePage() {
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
 
-        if (asyncMode && !agentTaskId) {
+        if (asyncMode && asyncSupported && !agentTaskId) {
             if (submittingAsync.current) return;
             submittingAsync.current = true;
             try {
@@ -286,10 +268,11 @@ export default function ImagePage() {
     // Handle image-generation commands from the Agent panel by setting the prompt and optionally starting generation.
     useEffect(() => {
         if (!imageCommand || imageCommand.nonce === processedCommandRef.current) return;
+        cancelHistoryPreview();
         processedCommandRef.current = imageCommand.nonce;
         clearImageCommand();
         if (typeof imageCommand.prompt === "string") setPrompt(imageCommand.prompt);
-        if (imageCommand.run && running) {
+        if (imageCommand.run && (running || importingReferences)) {
             if (imageCommand.taskId) updateAgentTask(imageCommand.taskId, { status: "failed", error: t("imageWorkbench.busy") });
             return;
         }
@@ -297,7 +280,7 @@ export default function ImagePage() {
             agentTaskIdRef.current = imageCommand.taskId;
             setAutoRunToken((value) => value + 1);
         }
-    }, [imageCommand, clearImageCommand, running, updateAgentTask]);
+    }, [imageCommand, clearImageCommand, running, importingReferences, updateAgentTask]);
 
     useEffect(() => {
         if (!autoRunToken) return;
@@ -409,6 +392,15 @@ export default function ImagePage() {
 
     const previewGenerationLog = async (log: GenerationLog) => {
         if (runningRef.current) return;
+        const version = interactionVersion.current, epoch = sessionEpoch(), search = locationSearch.current;
+        const interaction = ++historyInteraction.current;
+        try {
+            log = await normalizeLog(log, true);
+        } catch (error) {
+            if (mounted.current && epoch === sessionEpoch() && version === interactionVersion.current && search === locationSearch.current && interaction === historyInteraction.current) setNavigationError(error instanceof Error ? error.message : String(error));
+            return;
+        }
+        if (!mounted.current || epoch !== sessionEpoch() || version !== interactionVersion.current || search !== locationSearch.current || interaction !== historyInteraction.current) return;
         interactionVersion.current += 1;
         setSelectedResultIds([]);
         setPreviewLog(log);
@@ -441,8 +433,9 @@ export default function ImagePage() {
             message.error(t("imageWorkbench.promptRequired"));
             return null;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
-            message.warning(t("workbench.configFirst"));
+        if (importingReferences) return null;
+        if (!modelReady) {
+            message.warning(t("workbench.modelUnavailable"));
             openConfigDialog(true);
             return null;
         }
@@ -519,7 +512,7 @@ export default function ImagePage() {
 
     const resultsViewVersion = interactionVersion.current;
     return (
-        <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
+        <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100" onClickCapture={cancelHistoryPreview} onKeyDownCapture={cancelHistoryPreview} onInputCapture={cancelHistoryPreview} onDropCapture={cancelHistoryPreview}>
             {navigationError ? <p role="alert" className="px-4 pt-3 text-sm text-destructive">{navigationError}</p> : null}
             {linkedLogId && running && navigationRef.current !== `${location.key}:${linkedLogId}` ? <p role="status" className="px-4 pt-3 text-sm text-muted-foreground">{t("workbench.historyWaitForGeneration")}</p> : null}
             <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-3 lg:grid-cols-[300px_minmax(0,1fr)] lg:overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)]">
@@ -574,10 +567,10 @@ export default function ImagePage() {
                                 <div className="mb-2 flex items-center justify-between gap-3">
                                     <span className="text-base font-semibold">{t("imageWorkbench.references")}</span>
                                     <div className="flex gap-2">
-                                        <Button size="small" icon={<ClipboardPaste className="size-3.5" />} onClick={() => void addReferencesFromClipboard()}>
+                                        <Button size="small" disabled={importingReferences} icon={<ClipboardPaste className="size-3.5" />} onClick={() => void addReferencesFromClipboard()}>
                                             {t("workbench.clipboard")}
                                         </Button>
-                                        <Button size="small" icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
+                                        <Button size="small" loading={importingReferences} icon={<Upload className="size-3.5" />} onClick={() => fileInputRef.current?.click()}>
                                             {t("workbench.upload")}
                                         </Button>
                                     </div>
@@ -625,7 +618,8 @@ export default function ImagePage() {
                                             </button>
                                         </div>
                                     ))}
-                                    {!references.length ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{isReferenceDragActive ? t("imageWorkbench.dropReferences") : t("imageWorkbench.noReferences")}</div> : null}
+                                    {importingReferences ? <span role="status" className="self-center text-sm text-muted-foreground">{t("workbench.importingReferences")}</span> : null}
+                                    {!references.length && !importingReferences ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{isReferenceDragActive ? t("imageWorkbench.dropReferences") : t("imageWorkbench.noReferences")}</div> : null}
                                 </div>
                             </div>
 
@@ -644,10 +638,12 @@ export default function ImagePage() {
                         </div>
 
                         <div className="mt-auto pt-6">
-                            <Checkbox checked={asyncMode} disabled={running} onChange={(event) => setAsyncMode(event.target.checked)}>
+                            {!modelReady ? <p role="status" className="mb-2 text-sm text-muted-foreground">{t("workbench.modelUnavailable")} <Button type="link" size="small" onClick={() => openConfigDialog(false)}>{t("workbench.settings")}</Button></p> : null}
+                            <Checkbox checked={asyncMode && asyncSupported} disabled={running || !asyncSupported} onChange={(event) => setAsyncMode(event.target.checked)}>
                                 {t("managed.asyncImage")}
                             </Checkbox>
                             {asyncMode ? <p className="my-2 text-xs text-muted-foreground">{t("managed.asyncImageHint")}</p> : null}
+                            {!asyncSupported && modelReady ? <p className="my-2 text-xs text-muted-foreground">{t("managed.asyncImageUnsupported")}</p> : null}
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
                                 {t("workbench.generate")}
                             </Button>
@@ -947,11 +943,27 @@ function LogPanel({
 
 function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: GenerationLog; selected: boolean; active: boolean; onSelectedChange: (checked: boolean) => void; onClick: () => void }) {
     const { t } = useTranslation();
-    useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
-    const thumbnails = log.images.filter((image) => image.dataUrl).slice(0, 4);
+    const cardRef = useRef<HTMLButtonElement>(null);
+    const [thumbnails, setThumbnails] = useState<string[]>([]);
+    useEffect(() => {
+        let alive = true;
+        const epoch = sessionEpoch();
+        setThumbnails([]);
+        const load = async () => {
+            const urls = await Promise.all(log.images.slice(0, 4).map(async (image) => (await ensureImagePreview(image.storageKey)) || resolveImageUrl(image.storageKey, image.dataUrl)));
+            if (alive && epoch === sessionEpoch()) setThumbnails(urls.filter(Boolean));
+        };
+        const observer = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
+            if (entries.some((entry) => entry.isIntersecting)) { observer?.disconnect(); void load().catch(() => {}); }
+        }) : null;
+        if (observer && cardRef.current) observer.observe(cardRef.current);
+        else void load().catch(() => {});
+        return () => { alive = false; observer?.disconnect(); };
+    }, [log.images]);
 
     return (
         <button
+            ref={cardRef}
             type="button"
             className={`block w-full rounded-lg border p-2 text-left transition ${active ? "border-stone-900 bg-blue-50 dark:border-stone-100 dark:bg-blue-950/20" : "border-stone-200 bg-background hover:bg-stone-50 dark:border-stone-800 dark:hover:bg-stone-900"}`}
             onClick={onClick}
@@ -963,8 +975,8 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                         <div className="truncate text-sm font-semibold leading-5">{log.title}</div>
                         {thumbnails.length ? (
                             <div className="mt-2 flex gap-1 overflow-hidden">
-                                {thumbnails.map((image) => (
-                                    <img key={image.id} src={previewUrlFor(image.storageKey) || image.dataUrl} alt="" className="size-8 shrink-0 rounded-md object-cover" />
+                                {thumbnails.map((url, index) => (
+                                    <img key={index} src={url} alt="" loading="lazy" className="size-8 shrink-0 rounded-md object-cover" />
                                 ))}
                             </div>
                         ) : null}
@@ -999,20 +1011,18 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
 async function readStoredLogs() {
     const stored = await readTaskCenterDocument("image-workbench");
     const logs = stored && typeof stored === "object" && !Array.isArray(stored) ? Object.values(stored) as GenerationLog[] : [];
-    return (await Promise.all(logs.map(normalizeLog))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    return (await Promise.all(logs.map((log) => normalizeLog(log)))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 
-async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
+async function normalizeLog(log: Partial<GenerationLog>, loadMedia = false): Promise<GenerationLog> {
     const references = await Promise.all(
         (log.references || []).map(async (item) => {
-            void ensureImagePreview(item.storageKey);
-            return { ...item, dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl) };
+            return { ...item, dataUrl: !loadMedia && item.storageKey ? "" : await resolveImageUrl(item.storageKey, item.dataUrl) };
         }),
     );
     const images = await Promise.all(
         (log.images || []).map(async (item) => {
-            void ensureImagePreview(item.storageKey);
-            return { ...item, dataUrl: await resolveImageUrl(item.storageKey, item.dataUrl) };
+            return { ...item, dataUrl: !loadMedia && item.storageKey ? "" : await resolveImageUrl(item.storageKey, item.dataUrl) };
         }),
     );
     const config = normalizeLogConfig(log);

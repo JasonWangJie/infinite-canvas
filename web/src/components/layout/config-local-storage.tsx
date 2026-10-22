@@ -7,6 +7,8 @@ import { useTranslation } from "react-i18next";
 import { readLocalStorageUsage, type LocalStorageUsage } from "@/services/local-storage-usage";
 
 const storeLabelKeys: Record<string, string> = {
+    documents: "documents",
+    files: "files",
     app_state: "appState",
     image_files: "images",
     image_previews: "imagePreviews",
@@ -118,7 +120,7 @@ function StorageMetric({ icon, label, value, hint }: { icon: ReactNode; label: s
 
 function storeLabel(name: string, t: TFunction) {
     const key = storeLabelKeys[name];
-    return key ? t(`config.localStorage.stores.${key}`) : name;
+    return key ? t(`config.localStorage.stores.${key}`, { defaultValue: name === "documents" ? "本地业务文档" : name === "files" ? "本地媒体文件" : name }) : name;
 }
 
 function formatStorageBytes(bytes: number | null) {
