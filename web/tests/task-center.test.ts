@@ -162,11 +162,15 @@ test("synchronous image batches retain progress and partial outcomes without off
     expect(partial.summary).toContain(i18n.t("managed.imageBatchPartialNotice", records[1].value.batch));
     expect(partial.error).toBe("one rejected; one response lost");
     requests = [];
-    for (const item of items) {
+    for (const item of items.filter((entry) => entry.recordId !== "unsaved")) {
         expect(item.canResume).toBe(false);
         expect(await resumeTaskCenterItem(item)).toBe(item);
     }
     expect(requests).toEqual([]);
+    const unsaved = items.find((entry) => entry.recordId === "unsaved")!;
+    expect(unsaved).toMatchObject({ canResume: true, resumeAction: "save" });
+    expect((await resumeTaskCenterItem(unsaved)).status).toBe("completed");
+    expect(requests.every((request) => request.endsWith(" /api/data/image-tasks"))).toBe(true);
 });
 
 test("refresh reads remote changes without advancing a cached editor revision", async () => {
@@ -271,4 +275,63 @@ test("a task removed from video history cannot be recreated by a stale resume bu
     await expect(resumeTaskCenterItem(item)).rejects.toThrow();
     expect(requests).toEqual(["GET /api/data/video-workbench"]);
     expect(documents["video-workbench"].value).toEqual({});
+});
+
+test("explicit image record IDs group requests under their history without hiding attention or guessing duplicates", async () => {
+    const logs = documents["image-workbench"].value as Record<string, object>;
+    logs["image-1"] = { ...logs["image-1"], status: "attention", recoverableCount: 1, requestCount: 2, imageTaskRecordIds: ["async/1", "async/1", "missing"] };
+    const records = documents["image-tasks"].value as Record<string, ImageTaskRecord>;
+    records["async/1"] = { ...records["async/1"], status: "succeeded", value: { model: "image-model", result: { data: [{ url: "/api/result-media/original" }] } } };
+    records.unrelated = { ...records["async/1"], id: "unrelated" };
+    const snapshot = await loadTaskCenter();
+    const parent = snapshot.items.find((entry) => entry.source === "image-workbench")!;
+    expect(parent.status).toBe("attention");
+    expect(parent.relatedTasks?.map((entry) => entry.recordId)).toEqual(["async/1"]);
+    expect(parent.relatedTasks?.[0].status).toBe("completed");
+    expect(parent.imageTaskRecordIds).toEqual(["async/1", "missing"]);
+    expect(snapshot.items.filter((entry) => entry.source === "image-tasks").map((entry) => entry.recordId)).toEqual(["unrelated"]);
+    expect(parent.summary).toContain("2");
+    expect(JSON.parse(taskCenterDiagnostics(parent)).relatedTasks[0].recordId).toBe("async/1");
+});
+
+test("a missing history source keeps its original image requests independently recoverable", async () => {
+    const baseRoute = route;
+    route = async (path, init) => path === "/api/data/image-workbench" ? Response.json({ error: { message: "history unavailable" } }, { status: 503 }) : baseRoute(path, init);
+    const snapshot = await loadTaskCenter();
+    expect(snapshot.errors["image-workbench"]).toBe("history unavailable");
+    expect(snapshot.items.find((entry) => entry.recordId === "async/1")).toMatchObject({ source: "image-tasks", canResume: true, resumeAction: "query" });
+});
+
+test("unknown records stay attention and local storage recovery never queries a paid task", async () => {
+    documents["image-tasks"].value = {
+        unknown: { id: "unknown", task_id: null, status: "execution_unknown", value: {} },
+        known: { id: "known", task_id: "known-task", status: "execution_unknown", value: {} },
+        storage: { id: "storage", task_id: "known-task", status: "storage_pending", value: {} },
+    };
+    const items = (await loadTaskCenter()).items.filter((entry) => entry.source === "image-tasks");
+    expect(items.find((entry) => entry.recordId === "unknown")).toMatchObject({ status: "attention", canResume: false });
+    expect(items.find((entry) => entry.recordId === "known")).toMatchObject({ status: "attention", canResume: true, resumeAction: "query" });
+    const storage = items.find((entry) => entry.recordId === "storage")!;
+    expect(storage).toMatchObject({ status: "attention", canResume: true, resumeAction: "save" });
+    requests = [];
+    expect(await resumeTaskCenterItem(storage)).toMatchObject({ status: "active", resumeAction: "query" });
+    expect(requests.every((request) => request.endsWith(" /api/data/image-tasks"))).toBe(true);
+});
+
+test("diagnostics include only UUID request identifiers and finite timings, including related requests", async () => {
+    const requestId = "62ae80c0-2c42-4ca1-8c5d-c43fe27a23a9";
+    documents["image-tasks"].value = { original: {
+        id: "original", task_id: null, status: "execution_unknown", value: {
+            model: "private model", endpoint: "https://private.example", result: { error_message: "private error", data: [{ url: "private media" }] }, localImages: { 0: "image:private" },
+            requests: [{ requestId, durationMs: 123.5, body: "private prompt" }, { requestId: "https://private.example/token", durationMs: 456 }, { requestId, durationMs: -1 }],
+            lastQuery: { requestId, durationMs: 75, error: "private response" },
+            mediaTimings: { 0: { readMediaMs: 25, decodeMs: 7, localSaveMs: 9, storageKey: "image:private" }, "image:private": { readMediaMs: 88 }, 1: { readMediaMs: -1, decodeMs: "private text" } },
+        },
+    } };
+    const record = (await loadTaskCenter()).items.find((entry) => entry.recordId === "original")!;
+    const diagnostic = JSON.parse(taskCenterDiagnostics(record));
+    expect(diagnostic.requests).toEqual([{ requestId, durationMs: 123.5 }, { durationMs: 456 }]);
+    expect(diagnostic.lastQuery).toEqual({ requestId, durationMs: 75 });
+    expect(diagnostic.media).toEqual([{ index: 0, readMediaMs: 25, decodeMs: 7, localSaveMs: 9 }]);
+    expect(JSON.stringify(diagnostic)).not.toContain("private");
 });

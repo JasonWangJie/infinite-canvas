@@ -3,9 +3,11 @@ import { App } from "antd";
 import { nanoid } from "nanoid";
 import { useTranslation } from "react-i18next";
 import { onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
-import { uploadImage } from "@/services/image-storage";
+import { resolveImageUrl, uploadImage } from "@/services/image-storage";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
+
+type ReferenceSource = File | { name: string; dataUrl: string; storageKey?: string; type?: string };
 
 export async function readClipboardImages() {
     const items = await navigator.clipboard.read();
@@ -21,9 +23,9 @@ export function useReferenceImageImport(onImported: (images: ReferenceImage[]) =
     const active = useRef<AbortController | null>(null);
     const currentContext = useRef(context);
     currentContext.current = context;
+    const cancelImport = () => { active.current?.abort(); active.current = null; setImporting(false); };
     useEffect(() => {
-        const cancel = () => { active.current?.abort(); active.current = null; setImporting(false); };
-        const unsubscribe = onSessionEnd(cancel);
+        const unsubscribe = onSessionEnd(cancelImport);
         return () => { unsubscribe(); active.current?.abort(); active.current = null; };
     }, []);
     useEffect(() => {
@@ -32,7 +34,7 @@ export function useReferenceImageImport(onImported: (images: ReferenceImage[]) =
         setImporting(false);
     }, [context]);
 
-    const importReferences = async (source: Iterable<File> | (() => Promise<File[]>)) => {
+    const importReferences = async (source: Iterable<ReferenceSource> | (() => Promise<ReferenceSource[]>)) => {
         if (active.current) return;
         const controller = new AbortController(), epoch = sessionEpoch();
         active.current = controller;
@@ -41,10 +43,14 @@ export function useReferenceImageImport(onImported: (images: ReferenceImage[]) =
         try {
             const files = typeof source === "function" ? await source() : Array.from(source);
             if (!current()) return;
-            const images = files.filter((file) => file.type.startsWith("image/"));
+            const images = files.filter((file) => !(file instanceof File) || file.type.startsWith("image/"));
             if (images.length !== files.length) message.warning(t("videoWorkbench.unsupportedFiles"));
             const results = await Promise.allSettled(images.map(async (file) => {
-                const image = await uploadImage(file, { signal: controller.signal });
+                if (!(file instanceof File) && file.storageKey) {
+                    const dataUrl = await resolveImageUrl(file.storageKey, file.dataUrl);
+                    return { id: nanoid(), name: file.name, type: file.type || "image/png", dataUrl, storageKey: file.storageKey };
+                }
+                const image = await uploadImage(file instanceof File ? file : file.dataUrl, { signal: controller.signal });
                 return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
             }));
             if (!current()) return;
@@ -61,5 +67,5 @@ export function useReferenceImageImport(onImported: (images: ReferenceImage[]) =
             }
         }
     };
-    return { importing, importReferences };
+    return { importing, importReferences, cancelImport };
 }

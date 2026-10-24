@@ -5,7 +5,7 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
-import { loadTaskCenter, resumeTaskCenterItem, taskCenterDiagnostics, type TaskCenterItem, type TaskCenterSource, type TaskCenterStatus } from "@/services/task-center";
+import { loadTaskCenter, resumeTaskCenterItem, taskCenterDiagnostics, taskCenterMeasurements, type TaskCenterItem, type TaskCenterSource, type TaskCenterStatus } from "@/services/task-center";
 import { refreshCanvasTaskTarget } from "@/stores/canvas/use-canvas-store";
 import { useCopyText } from "@/hooks/use-copy-text";
 
@@ -31,6 +31,7 @@ export default function TasksPage() {
     const active = useRef(new Set<string>());
     const opening = useRef<AbortController | null>(null);
     const generation = useRef(0);
+    const snapshotVersion = useRef(0);
     const query = params.get("q") || "";
     const source = sources.find((value) => value === params.get("source")) || "all";
     const status = statuses.find((value) => value === params.get("status")) || "all";
@@ -39,12 +40,13 @@ export default function TasksPage() {
         if (loadingRef.current || active.current.size) return;
         const version = generation.current;
         const epoch = sessionEpoch();
+        const snapshot = ++snapshotVersion.current;
         loadingRef.current = true;
         setLoading(true);
         setLoadError("");
         try {
             const result = await loadTaskCenter();
-            if (!mounted.current || version !== generation.current || epoch !== sessionEpoch()) return;
+            if (!mounted.current || version !== generation.current || epoch !== sessionEpoch() || snapshot !== snapshotVersion.current) return;
             setItems(result.items);
             setErrors(result.errors);
             setActionErrors({});
@@ -87,9 +89,12 @@ export default function TasksPage() {
 
     const visibleItems = useMemo(() => {
         const keyword = query.trim().toLocaleLowerCase();
-        return items.filter((item) => (source === "all" || item.source === source)
-            && (status === "all" || item.status === status)
-            && (!keyword || [item.title, item.prompt, item.model, item.taskId, item.id].join(" ").toLocaleLowerCase().includes(keyword)));
+        return items.filter((item) => {
+            const records = [item, ...(item.relatedTasks || [])];
+            return (source === "all" || records.some((record) => record.source === source))
+                && (status === "all" || records.some((record) => record.status === status))
+                && (!keyword || records.some((record) => [record.title, record.prompt, record.model, record.taskId, record.id].join(" ").toLocaleLowerCase().includes(keyword)));
+        });
     }, [items, query, source, status]);
 
     const updateFilter = (key: string, value: string) => {
@@ -109,9 +114,13 @@ export default function TasksPage() {
         setBusy([...active.current]);
         setActionErrors((current) => ({ ...current, [item.id]: "" }));
         try {
-            const updated = await resumeTaskCenterItem(item);
+            await resumeTaskCenterItem(item);
             if (!mounted.current || version !== generation.current || epoch !== sessionEpoch()) return;
-            setItems((current) => current.map((row) => row.id === item.id ? updated : row));
+            const snapshot = ++snapshotVersion.current;
+            const updated = await loadTaskCenter();
+            if (!mounted.current || version !== generation.current || epoch !== sessionEpoch() || snapshot !== snapshotVersion.current) return;
+            setItems(updated.items);
+            setErrors(updated.errors);
             message.success(t("tasks.updated"));
         } catch (error) {
             if (mounted.current && version === generation.current && epoch === sessionEpoch()) {
@@ -148,6 +157,14 @@ export default function TasksPage() {
             }
         }
     };
+
+    const taskActions = (item: TaskCenterItem) => (
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <Button type="text" icon={<Copy className="size-3.5" />} title={t("tasks.copyDiagnosticsHint")} onClick={() => { if (item.sessionEpoch === sessionEpoch()) copyText(taskCenterDiagnostics(item)); }}>{t("tasks.copyDiagnostics")}</Button>
+            {item.canResume ? <Button icon={<Play className="size-3.5" />} title={t(item.resumeAction === "save" ? "tasks.restoreSaveHint" : "tasks.resumeHint", { defaultValue: "仅保存已收到的结果，不重新生成。" })} loading={busy.includes(item.id)} disabled={loading} onClick={() => void resume(item)}>{item.resumeAction === "save" ? t("tasks.restoreSave", { defaultValue: "恢复本地保存" }) : t("tasks.resume")}</Button> : null}
+            {item.source === "canvas" ? <Button type="link" icon={<ArrowUpRight className="size-3.5" />} loading={busy.includes(`${item.id}:open`)} disabled={Boolean(opening.current)} onClick={() => void openCanvasSource(item)}>{t("tasks.openSource")}</Button> : <Link to={item.href} className="inline-flex min-h-8 items-center gap-1 px-2 text-sm" style={{ color: token.colorLink }}>{item.status === "attention" && !item.canResume ? t("tasks.verifyStatus", { defaultValue: "核实原记录" }) : t("tasks.openSource")}<ArrowUpRight className="size-3.5" /></Link>}
+        </div>
+    );
 
     return (
         <main className="h-full overflow-y-auto px-4 py-6 sm:px-6" style={{ color: token.colorText, background: token.colorBgLayout }}>
@@ -194,12 +211,24 @@ export default function TasksPage() {
                                         {hasTimestamp ? <time dateTime={timestamp.toISOString()}>{timestamp.toLocaleString(i18n.resolvedLanguage)}</time> : null}
                                     </div>
                                     {actionErrors[item.id] || item.error ? <p role="alert" className="mt-2 break-words text-sm" style={{ color: token.colorError }}>{actionErrors[item.id] || item.error}</p> : null}
+                                    <TaskMeasurements item={item} />
                                 </div>
-                                <div className="flex shrink-0 flex-wrap items-center gap-2">
-                                    <Button type="text" icon={<Copy className="size-3.5" />} title={t("tasks.copyDiagnosticsHint")} onClick={() => { if (item.sessionEpoch === sessionEpoch()) copyText(taskCenterDiagnostics(item)); }}>{t("tasks.copyDiagnostics")}</Button>
-                                    {item.canResume ? <Button icon={<Play className="size-3.5" />} title={t("tasks.resumeHint")} loading={busy.includes(item.id)} disabled={loading} onClick={() => void resume(item)}>{t("tasks.resume")}</Button> : null}
-                                    {item.source === "canvas" ? <Button type="link" icon={<ArrowUpRight className="size-3.5" />} loading={busy.includes(`${item.id}:open`)} disabled={Boolean(opening.current)} onClick={() => void openCanvasSource(item)}>{t("tasks.openSource")}</Button> : <Link to={item.href} className="inline-flex min-h-8 items-center gap-1 px-2 text-sm" style={{ color: token.colorLink }}>{t("tasks.openSource")}<ArrowUpRight className="size-3.5" /></Link>}
-                                </div>
+                                {taskActions(item)}
+                                {item.relatedTasks?.length ? <details className="w-full min-w-0" open={source === "image-tasks" || Boolean(query)}>
+                                    <summary className="cursor-pointer text-sm" style={{ color: token.colorTextSecondary }}>{t("tasks.relatedRequests", { defaultValue: "查看关联请求（{{count}}）", count: item.relatedTasks.length })}</summary>
+                                    <ul className="mt-2 border-l pl-3" style={{ borderColor: token.colorBorderSecondary }}>
+                                        {item.relatedTasks.map((related) => <li key={related.id} data-task-id={related.id} className="flex flex-wrap items-start justify-between gap-2 py-3">
+                                            <div className="min-w-0 flex-1 basis-64">
+                                                <Tag color={statusColors[related.status]}>{t(`tasks.status.${related.status}`)}</Tag>
+                                                <span className="break-all text-xs">{related.model} · {related.taskId || related.recordId}</span>
+                                                {related.summary ? <p className="mt-1 break-words text-sm" style={{ color: token.colorTextSecondary }}>{related.summary}</p> : null}
+                                                {actionErrors[related.id] || related.error ? <p role="alert" className="mt-1 break-words text-sm" style={{ color: token.colorError }}>{actionErrors[related.id] || related.error}</p> : null}
+                                                <TaskMeasurements item={related} />
+                                            </div>
+                                            {taskActions(related)}
+                                        </li>)}
+                                    </ul>
+                                </details> : null}
                             </li>
                             );
                         })}
@@ -209,4 +238,20 @@ export default function TasksPage() {
             </div>
         </main>
     );
+}
+
+function TaskMeasurements({ item }: { item: TaskCenterItem }) {
+    const { t } = useTranslation();
+    const { token } = theme.useToken();
+    const { requests, lastQuery, media } = taskCenterMeasurements(item);
+    if (!requests && !lastQuery && !media) return null;
+    const milliseconds = (value?: number) => value === undefined ? "—" : `${Math.round(value)} ms`;
+    return <details className="mt-2 text-xs" style={{ color: token.colorTextSecondary }}>
+        <summary className="cursor-pointer">{t("tasks.timings", { defaultValue: "查看耗时与请求标识" })}</summary>
+        <ul className="mt-1 space-y-1">
+            {requests?.map((request, index) => <li key={index} className="break-all">{t("tasks.requestTiming", { defaultValue: "请求 {{index}}：{{time}}", index: index + 1, time: milliseconds(request.durationMs) })}{request.requestId ? ` · ${request.requestId}` : ""}</li>)}
+            {lastQuery ? <li className="break-all">{t("tasks.queryTiming", { defaultValue: "最近查询：{{time}}", time: milliseconds(lastQuery.durationMs) })}{lastQuery.requestId ? ` · ${lastQuery.requestId}` : ""}</li> : null}
+            {media?.map((entry) => <li key={entry.index}>{t("tasks.mediaTiming", { defaultValue: "图片 {{index}}：读取 {{read}} · 解码 {{decode}} · 本地保存 {{save}}", index: entry.index + 1, read: milliseconds(entry.readMediaMs), decode: milliseconds(entry.decodeMs), save: milliseconds(entry.localSaveMs) })}</li>)}
+        </ul>
+    </details>;
 }

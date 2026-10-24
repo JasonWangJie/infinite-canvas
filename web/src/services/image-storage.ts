@@ -5,7 +5,8 @@ import { deletePrivateFile, uploadPrivateFile } from "@/services/canvas-data";
 
 import { readBrowserFile, resolveBrowserFileUrl } from "@/services/browser-files";
 
-export type UploadedImage = { url: string; storageKey?: string; width: number; height: number; bytes: number; mimeType: string };
+export type ImageStorageTimings = { readMediaMs: number; decodeMs: number; localSaveMs: number };
+export type UploadedImage = { url: string; storageKey?: string; width: number; height: number; bytes: number; mimeType: string; timings?: ImageStorageTimings };
 type ImageReadOptions = { signal?: AbortSignal };
 const previewUrls = new Map<string, string>();
 const previewListeners = new Set<() => void>();
@@ -18,17 +19,22 @@ onSessionEnd(() => {
 
 export async function uploadImage(input: string | Blob, options?: ImageReadOptions): Promise<UploadedImage> {
     const epoch = sessionEpoch();
+    const started = performance.now();
     const blob = typeof input === "string" ? await readPrivateBlob(input, options?.signal) : input;
+    const readMediaMs = performance.now() - started;
     const url = URL.createObjectURL(blob);
     try {
+        const decodeStarted = performance.now();
         const image = new Image();
         image.src = url;
         await image.decode();
         if (!image.naturalWidth || !image.naturalHeight) throw new Error(i18n.t("common.imageReadFailed"));
         options?.signal?.throwIfAborted();
         if (epoch !== sessionEpoch()) throw new Error("登录会话已改变");
+        const decodeMs = performance.now() - decodeStarted;
+        const saveStarted = performance.now();
         const file = await uploadPrivateFile(blob, "image");
-        return { url: file.url, storageKey: file.storageKey, width: image.naturalWidth, height: image.naturalHeight, bytes: file.bytes, mimeType: file.mimeType };
+        return { url: file.url, storageKey: file.storageKey, width: image.naturalWidth, height: image.naturalHeight, bytes: file.bytes, mimeType: file.mimeType, timings: { readMediaMs, decodeMs, localSaveMs: performance.now() - saveStarted } };
     } finally {
         URL.revokeObjectURL(url);
     }

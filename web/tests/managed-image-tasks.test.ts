@@ -271,6 +271,29 @@ test.each(["deleted", "replaced", "failed"])("a query finishing after its task w
     expect(calls).toEqual(["GET /api/ai/v1/images/tasks_async/asyncimg_task1"]);
 });
 
+test("failed queries keep the task pending and preserve their original error even if diagnostic saving fails", async () => {
+    seedTasks([record]);
+    let queries = 0;
+    const ids = ["77e196e8-ab33-4c90-a17a-3e11f9369a01", "77e196e8-ab33-4c90-a17a-3e11f9369a02"];
+    globalThis.fetch = (async (_url, init) => {
+        expect(init?.method || "GET").toBe("GET");
+        return Response.json({ error: { message: "Query temporarily unavailable" } }, { status: 503, headers: { "X-Request-Id": ids[queries++] } });
+    }) as typeof fetch;
+    await expect(refreshImageTask(record)).rejects.toThrow("Query temporarily unavailable");
+    const [saved] = await readImageTasks();
+    expect(saved.status).toBe("pending");
+    expect(saved.value.result).toBeUndefined();
+    expect(saved.value.lastQuery).toEqual({ requestId: ids[0], durationMs: expect.any(Number) });
+    const persisted = structuredClone(documents["image-tasks"]);
+    documentTransport = (async (url, init) => init?.method === "PUT" ? Response.json({ error: { message: "Local storage unavailable" } }, { status: 503 }) : saveDocumentFixture(url, init)) as typeof fetch;
+    await expect(refreshImageTask(record)).rejects.toThrow("Query temporarily unavailable");
+    expect(documents["image-tasks"]).toEqual(persisted);
+    const [draft] = await readImageTasks();
+    expect(draft.status).toBe("pending");
+    expect(draft.value.lastQuery).toEqual({ requestId: ids[1], durationMs: expect.any(Number) });
+    expect(queries).toBe(2);
+});
+
 test("a query with an older cached write baseline retains CAS protection for another tab's completed result", async () => {
     seedTasks([record]);
     await readDocument("image-tasks");
@@ -518,6 +541,26 @@ test("updating a removed image task neither restores it nor blocks subsequent ta
     expect(await readImageTasks()).toEqual([next]);
 });
 
+test("concurrent result reads share local files and preserve image metadata and media timings", async () => {
+    const ready = { ...record, status: "succeeded", value: { result: { data: [{ url: "/api/result-media/first" }, { url: "/api/result-media/second" }] } } };
+    seedTasks([ready]);
+    const downloads: string[] = [];
+    globalThis.fetch = (async (url) => {
+        downloads.push(String(url));
+        return new Response("image", { headers: { "Content-Type": "image/png" } });
+    }) as typeof fetch;
+    const [first, second] = await Promise.all([imageTaskImages(ready), imageTaskImages(ready)]);
+    expect(first).toEqual(second);
+    expect(first.map((image) => image.storageKey)).toEqual(["image:file-1", "image:file-2"]);
+    expect(first.every((image) => image.width > 0 && image.height > 0 && image.bytes > 0 && image.mimeType === "image/png")).toBe(true);
+    await imageTaskImages(ready);
+    expect(fileWrites).toEqual(["image:file-1", "image:file-2"]);
+    expect(downloads).toHaveLength(2);
+    const [saved] = await readImageTasks();
+    expect(Object.keys(saved.value.mediaTimings || {})).toEqual(["0", "1"]);
+    for (const timing of Object.values(saved.value.mediaTimings || {})) expect(Object.values(timing).every((value) => Number.isFinite(value) && value >= 0)).toBe(true);
+});
+
 test("confirmed image task recovery restores generation outcomes without declaring empty results successful", async () => {
     const rows: Array<{ id: string; batch?: ImageTaskBatch; taskId?: string; images?: boolean; expected: string }> = [
         { id: "running", batch: { total: 3, completed: 1, failed: 0, unknown: 0 }, images: true, expected: "running" },
@@ -582,6 +625,28 @@ test("opening already stored image results reuses their local files without down
         expect(images).toHaveLength(1);
         expect(images[0].dataUrl).toBe("local-file:image%3Aexisting");
     }
+    expect(fileWrites).toEqual([]);
+});
+
+test.each(["deleted", "replaced"])("cached results are rejected when the task is %s during decoding without writing the record", async (change) => {
+    const stored: ImageTaskRecord = { ...record, status: "succeeded", value: { result: { data: [{ url: "/api/result-media/stored" }] }, localImages: { 0: "image:existing" } } };
+    seedTasks([stored]);
+    files.set("image:existing", new Blob(["saved image"], { type: "image/png" }));
+    const started = Promise.withResolvers<void>();
+    const decoded = Promise.withResolvers<void>();
+    Object.defineProperty(globalThis, "Image", { configurable: true, value: class {
+        src = ""; naturalWidth = 1; naturalHeight = 1;
+        async decode() { started.resolve(); await decoded.promise; }
+    } });
+    const opening = imageTaskImages(stored);
+    await started.promise;
+    const replacement = { ...stored, value: { ...stored.value, localImages: { 0: "image:replacement" } } };
+    documents["image-tasks"] = { revision: 2, value: change === "deleted" ? {} : { [stored.id]: replacement } };
+    const latest = structuredClone(documents["image-tasks"]);
+    decoded.resolve();
+    await expect(opening).rejects.toThrow(change === "deleted" ? i18n.t("taskCenter.recordRemoved") : i18n.t("taskCenter.recordChanged", { defaultValue: "任务记录已变化，请刷新后重新查看结果" }));
+    expect(documents["image-tasks"]).toEqual(latest);
+    expect(getDocumentBaseline("image-tasks")).toBeUndefined();
     expect(fileWrites).toEqual([]);
 });
 
@@ -737,6 +802,7 @@ test("a late list snapshot cannot replace a completed image task shown by the pa
     try {
         await panel.click(i18n.t("managed.refreshTasks"));
         await panel.click(i18n.t("managed.resumeImage"));
+        await panel.click(i18n.t("managed.showCompletedTasks", { count: 1 }));
         expect(panel.container.textContent).toContain(i18n.t("managed.viewResults"));
         await act(async () => releaseList(Response.json({ value: { [record.id]: record }, revision: 1 })));
         expect(panel.container.textContent).toContain(i18n.t("managed.viewResults"));
@@ -747,6 +813,24 @@ test("a late list snapshot cannot replace a completed image task shown by the pa
         expect(opened).toHaveLength(1);
         expect(opened[0]).toHaveLength(1);
         expect(opened[0][0].dataUrl).toBe("local-file:image%3Afile-1");
+    } finally {
+        await panel.close();
+    }
+});
+
+test("completed tasks stay folded while unknown requests remain visible without resubmit actions", async () => {
+    seedTasks([
+        { ...record, id: "complete", status: "succeeded", value: { result: { data: [{ url: "/api/result-media/done" }] } } },
+        { ...record, id: "unknown", task_id: null, status: "unknown" },
+    ]);
+    const panel = await renderTaskPanel();
+    try {
+        expect(panel.container.textContent).toContain(i18n.t("managed.taskAttention"));
+        expect(panel.container.textContent).toContain(i18n.t("managed.imageTaskUnknown"));
+        expect(panel.container.textContent).not.toContain(i18n.t("managed.viewResults"));
+        expect([...panel.container.querySelectorAll("button")].map((button) => button.textContent)).not.toContain(i18n.t("managed.resumeImage"));
+        await panel.click(i18n.t("managed.showCompletedTasks", { count: 1 }));
+        expect(panel.container.textContent).toContain(i18n.t("managed.viewResults"));
     } finally {
         await panel.close();
     }

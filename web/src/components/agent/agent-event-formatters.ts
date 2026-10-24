@@ -340,7 +340,7 @@ function siteToolSummary(name: string, result: unknown, input: unknown) {
     if (name === "assets_add") return tr("assetAdded");
     if (name === "generation_get_status") {
         const summary = data.summary && typeof data.summary === "object" ? (data.summary as Record<string, unknown>) : {};
-        return tr("generationStatus", { total: numberField(data, "total"), queued: numberField(summary, "queued"), running: numberField(summary, "running"), succeeded: numberField(summary, "succeeded"), failed: numberField(summary, "failed") });
+        return tr("generationStatus", { total: numberField(data, "total"), queued: numberField(summary, "queued"), running: numberField(summary, "running"), succeeded: numberField(summary, "succeeded"), failed: numberField(summary, "failed") }) + (numberField(summary, "attention") ? ` · ${tr("generationAttention", { count: numberField(summary, "attention"), defaultValue: "待处理 {{count}}" })}` : "");
     }
     if (name === "workbench_image_generate" || name === "workbench_video_generate") return typeof data.note === "string" ? data.note : tr("workbenchExecuted");
     if (name === "workbench_image_get_config" || name === "workbench_video_get_config") return tr("workbenchConfigRead");

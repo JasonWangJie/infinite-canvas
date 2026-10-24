@@ -5,7 +5,7 @@ import { sessionEpoch } from "@/services/api/canvas-client";
 import { getDocumentDraft, subscribeDocumentSaves } from "@/services/canvas-data";
 import { imageTaskHasResult, imageTaskImages, imageTaskPending, readImageTasks, refreshImageTask, type ImageTaskRecord } from "@/services/api/image-tasks";
 
-export function ImageTaskPanel({ revision, onOpen, generating = false, selectedTaskId }: { revision: number; onOpen: (images: { id: string; dataUrl: string }[]) => Promise<void>; generating?: boolean; selectedTaskId?: string | null }) {
+export function ImageTaskPanel({ revision, onOpen, generating = false, activeRecordIds = [], selectedTaskId }: { revision: number; onOpen: (images: Awaited<ReturnType<typeof imageTaskImages>>, recordId: string) => Promise<void>; generating?: boolean; activeRecordIds?: string[]; selectedTaskId?: string | null }) {
     const { t } = useTranslation();
     const { message } = App.useApp();
     const selectedCard = useRef<HTMLDivElement>(null);
@@ -13,6 +13,7 @@ export function ImageTaskPanel({ revision, onOpen, generating = false, selectedT
     const [errors, setErrors] = useState<Record<string, string>>({});
     const [busy, setBusy] = useState<string[]>([]);
     const [loading, setLoading] = useState(false);
+    const [showCompleted, setShowCompleted] = useState(false);
     const mounted = useRef(false);
     const latestLoad = useRef(0);
     const active = useRef(new Set<string>());
@@ -134,7 +135,7 @@ export function ImageTaskPanel({ revision, onOpen, generating = false, selectedT
         setBusy([...active.current]);
         try {
             const images = await imageTaskImages(record);
-            if (mounted.current && epoch === sessionEpoch()) await onOpen(images);
+            if (mounted.current && epoch === sessionEpoch()) await onOpen(images, record.id);
         } catch (error) {
             if (mounted.current && epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : String(error));
         } finally {
@@ -143,16 +144,20 @@ export function ImageTaskPanel({ revision, onOpen, generating = false, selectedT
         }
     };
 
+    const completed = (record: ImageTaskRecord) => imageTaskHasResult(record) && !["storage_failed", "storage_pending"].includes(record.status) && (!record.value.batch || (record.value.batch.completed >= record.value.batch.total && !record.value.batch.failed && !record.value.batch.unknown));
+    const completedCount = records.filter(completed).length;
+    const visible = records.filter((record) => showCompleted || !completed(record) || record.id === selectedTaskId || Boolean(errors[record.id]));
     if (!records.length && !loading && !errors.list && !selectedTaskId) return null;
     return (
         <div className="mb-4 space-y-2">
             <div className="flex items-center justify-between gap-2">
                 <h3 className="font-semibold">{t("managed.imageTasks")}</h3>
-                <Button size="small" loading={loading} onClick={() => void refresh()}>
+                <Button type="text" size="small" loading={loading} onClick={() => void refresh()}>
                     {t("managed.refreshTasks")}
                 </Button>
             </div>
-            <p className="text-xs text-muted-foreground">{t("managed.imageTasksHint")}</p>
+            {visible.length ? <p className="text-xs text-muted-foreground">{t("managed.imageTasksHint")}</p> : null}
+            {completedCount ? <Button type="text" size="small" aria-expanded={showCompleted} onClick={() => setShowCompleted((value) => !value)}>{t(showCompleted ? "managed.hideCompletedTasks" : "managed.showCompletedTasks", { count: completedCount, defaultValue: showCompleted ? "收起已完成任务" : "查看已完成任务（{{count}}）" })}</Button> : null}
             {selectedTaskId && !loading && !errors.list && !records.some((record) => record.id === selectedTaskId) ? <p role="status" className="text-sm text-muted-foreground">{t("workbench.historySourceMissing")}</p> : null}
             {errors.list ? (
                 <p role="alert" className="text-sm text-destructive">
@@ -160,14 +165,16 @@ export function ImageTaskPanel({ revision, onOpen, generating = false, selectedT
                 </p>
             ) : null}
             <div className="max-h-64 space-y-2 overflow-y-auto">
-                {records.map((record) => {
+                {visible.map((record) => {
                     const ready = imageTaskHasResult(record);
                     const batch = record.value.batch;
                     const partial = Boolean(batch && (batch.failed || batch.unknown));
-                    const running = record.status === "running";
+                    const running = generating && activeRecordIds.includes(record.id);
                     const storagePending = ["storage_failed", "storage_pending"].includes(record.status);
                     const recoverable = !batch && (storagePending || imageTaskPending(record));
-                    const status = storagePending ? "taskStorageFailed" : running ? "taskRunning" : ready ? partial ? "taskPartial" : "taskReady" : ["failed", "cancelled", "canceled", "expired"].includes(record.status) ? "taskFailed" : "taskPending";
+                    const incomplete = Boolean(batch && batch.completed < batch.total);
+                    const unknown = !ready && !record.task_id && !storagePending && !running && !["failed", "cancelled", "canceled", "expired"].includes(record.status);
+                    const status = storagePending ? "taskStorageFailed" : running ? "taskRunning" : incomplete || unknown ? "taskAttention" : ready ? partial ? "taskPartial" : "taskReady" : ["failed", "cancelled", "canceled", "expired"].includes(record.status) ? "taskFailed" : "taskPending";
                     return (
                         <div key={record.id} ref={record.id === selectedTaskId ? selectedCard : undefined} aria-current={record.id === selectedTaskId ? "true" : undefined} className={`flex items-start justify-between gap-3 border-b border-border py-2 ${record.id === selectedTaskId ? "border-l-2 border-l-primary pl-2" : ""}`}>
                             <div className="min-w-0">
@@ -175,7 +182,7 @@ export function ImageTaskPanel({ revision, onOpen, generating = false, selectedT
                                     {record.value.model || t("workbench.model")}
                                     {record.created_at ? ` · ${new Date(record.created_at * 1000).toLocaleString()}` : ""}
                                 </div>
-                                <Tag color={storagePending || (ready && partial && !running) ? "warning" : running ? "processing" : undefined}>{t(`managed.${status}`)}</Tag>
+                                <Tag color={storagePending || incomplete || unknown || (ready && partial && !running) ? "warning" : running ? "processing" : undefined}>{t(`managed.${status}`, { defaultValue: "需处理" })}</Tag>
                                 {batch ? <p role="status" className="text-xs text-muted-foreground">{t("managed.imageBatchSummary", batch)}</p> : null}
                                 {batch && batch.completed < batch.total ? <p className="text-xs text-muted-foreground">{t("managed.imageBatchIncompleteNotice")}</p> : null}
                                 {ready && partial ? <p className="text-xs text-muted-foreground">{t("managed.imageBatchPartialNotice", batch)}</p> : null}
@@ -184,7 +191,7 @@ export function ImageTaskPanel({ revision, onOpen, generating = false, selectedT
                                         {errors[record.id] || record.value.result?.error_message}
                                     </p>
                                 ) : null}
-                                {!ready && !record.task_id && !storagePending && !running && record.status !== "failed" ? <p className="text-xs text-muted-foreground">{t("managed.imageTaskUnknown")}</p> : null}
+                                {unknown ? <p className="text-xs text-muted-foreground">{t("managed.imageTaskUnknown")}</p> : null}
                             </div>
                             {ready ? (
                                 <Button size="small" disabled={generating} loading={busy.includes(record.id)} onClick={() => void open(record)}>

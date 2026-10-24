@@ -8,6 +8,7 @@ import { useWorkbenchHistoryFilter } from "@/hooks/use-workbench-history-filter"
 import { readClipboardImages, useReferenceImageImport } from "@/hooks/use-reference-image-import";
 import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
 import { readTaskCenterDocument } from "@/services/task-center";
+import { getDocumentBaseline, getDocumentSaveState, subscribeDocumentSaves } from "@/services/canvas-data";
 import { useTranslation } from "react-i18next";
 
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
@@ -19,7 +20,7 @@ import { canvasThemes } from "@/lib/canvas-theme";
 import { clampVideoSeconds } from "@/lib/media-size";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { resolveMediaUrl } from "@/services/file-storage";
-import { resolveImageUrl, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
+import { resolveImageUrl, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews } from "@/services/image-storage";
 import { createVideoGenerationTask, VideoGenerationUncertainError, type VideoGenerationTask } from "@/services/api/video";
 import { assertAssetSaveReady, useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
@@ -61,6 +62,11 @@ export default function VideoPage() {
     const dragDepthRef = useRef(0);
     const activeLogIdsRef = useRef<Set<string>>(new Set());
     const savingAssetIds = useRef(new Set<string>());
+    const [savingAssetKeys, setSavingAssetKeys] = useState<string[]>([]);
+    const assets = useAssetStore((state) => state.assets);
+    useSyncExternalStore(subscribeDocumentSaves, () => getDocumentSaveState("assets"));
+    const savedAssets = (getDocumentBaseline("assets") as { state?: { assets?: typeof assets } } | undefined)?.state?.assets || [];
+    const savedAssetKeys = new Set(savedAssets.flatMap((asset) => asset.kind === "video" && asset.data.storageKey && assets.some((current) => current.id === asset.id) ? [asset.data.storageKey] : []));
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
@@ -94,7 +100,7 @@ export default function VideoPage() {
 
     const model = effectiveConfig.videoModel || effectiveConfig.model;
     const modelReady = isAiConfigReady(effectiveConfig, model) && modelMatchesCapability(effectiveConfig, model, "video");
-    const { importing: importingReferences, importReferences } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images].slice(0, 7)), `${location.key}:${interactionVersion.current}`);
+    const { importing: importingReferences, importReferences, cancelImport } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images].slice(0, 7)), `${location.key}:${interactionVersion.current}`);
     const canGenerate = Boolean(prompt.trim()) && modelReady && !importingReferences;
 
     useEffect(() => {
@@ -189,7 +195,7 @@ export default function VideoPage() {
                 setResults([{ id: failedLog.id, status: failedLog.status, log: failedLog, error: errorMessage }]);
                 setLogs((items) => items.some((item) => item.id === failedLog.id) ? items.map((item) => item.id === failedLog.id ? failedLog : item) : [failedLog, ...items]);
             }
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: failedLog.status === "failed" ? "failed" : "running", successCount: 0, failCount: failedLog.status === "failed" ? 1 : 0, error: errorMessage });
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: failedLog.status === "failed" ? "failed" : "attention", successCount: 0, failCount: failedLog.status === "failed" ? 1 : 0, error: errorMessage });
             try {
                 await saveLog(failedLog);
             } catch (storageError) {
@@ -257,10 +263,12 @@ export default function VideoPage() {
 
     const saveResultToAssets = async (video: GeneratedVideo) => {
         const epoch = sessionEpoch(), key = `${epoch}:${video.id}`;
-        if (savingAssetIds.current.has(key)) return;
+        if (savingAssetIds.current.has(key) || savedAssetKeys.has(video.storageKey)) return;
         savingAssetIds.current.add(key);
+        setSavingAssetKeys((keys) => [...keys, key]);
         try {
             assertAssetSaveReady(epoch);
+            if (useAssetStore.getState().assets.some((asset) => asset.kind === "video" && asset.data.storageKey === video.storageKey)) throw new Error(t("assets.formSaveUnconfirmed"));
             await addAssetsAndSave([{
                 kind: "video",
                 title: t("videoWorkbench.resultTitle"),
@@ -275,21 +283,23 @@ export default function VideoPage() {
             if (epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : t("assets.formSaveUnconfirmed"));
         } finally {
             savingAssetIds.current.delete(key);
+            if (mounted.current && epoch === sessionEpoch()) setSavingAssetKeys((keys) => keys.filter((item) => item !== key));
         }
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
+        if (importingReferences) return;
+        setAssetPickerOpen(false);
         if (payload.kind === "text") {
             setPrompt(payload.content);
         } else if (payload.kind === "image") {
-            const stored = await uploadImage(payload.dataUrl);
-            setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }].slice(0, 7));
+            await importReferences([{ name: payload.title, dataUrl: payload.dataUrl, storageKey: payload.storageKey }]);
         }
-        setAssetPickerOpen(false);
     };
 
     const createSession = () => {
         if (runningRef.current) return;
+        cancelImport();
         interactionVersion.current += 1;
         setPrompt("");
         setReferences([]);
@@ -362,7 +372,7 @@ export default function VideoPage() {
             setLogs((items) => items.map((item) => (item.id === next.id ? next : item)));
             if (linkedAgentTaskId)
                 updateAgentTask(linkedAgentTaskId, {
-                    status: next.status === "success" ? "succeeded" : next.status === "failed" ? "failed" : "running",
+                    status: next.status === "success" ? "succeeded" : next.status === "failed" ? "failed" : "attention",
                     successCount: next.status === "success" ? 1 : 0,
                     failCount: next.status === "failed" ? 1 : 0,
                     error: next.error,
@@ -460,7 +470,7 @@ export default function VideoPage() {
                                         <Button size="small" icon={<BookOpen className="size-3.5" />} onClick={() => setPromptDialogOpen(true)}>
                                             {t("workbench.viewPrompts")}
                                         </Button>
-                                        <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => setAssetPickerOpen(true)}>
+                                        <Button size="small" disabled={importingReferences} icon={<FolderPlus className="size-3.5" />} onClick={() => setAssetPickerOpen(true)}>
                                             {t("workbench.viewAssets")}
                                         </Button>
                                     </div>
@@ -505,7 +515,7 @@ export default function VideoPage() {
                                             </button>
                                         </div>
                                     ))}
-                                    {importingReferences ? <span role="status" className="self-center text-sm text-muted-foreground">{t("workbench.importingReferences")}</span> : null}
+                                    {importingReferences ? <span role="status" className="self-center text-sm text-muted-foreground">{t("workbench.importingReferences")} <Button type="text" size="small" onClick={cancelImport}>{t("common.cancel")}</Button></span> : null}
                                     {!references.length && !importingReferences ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{referenceDragTarget ? t("videoWorkbench.dropReferences") : t("videoWorkbench.noImages")}</div> : null}
                                 </div>
                             </div>
@@ -542,7 +552,7 @@ export default function VideoPage() {
                             <div className="grid gap-4">
                                 {results.map((result) =>
                                     result.status === "success" && result.video ? (
-                                        <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} />
+                                        <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} savingAsset={savingAssetKeys.includes(`${sessionEpoch()}:${result.video.id}`)} savedAsset={savedAssetKeys.has(result.video.storageKey)} />
                                     ) : result.status === "failed" || result.status === "paused" || result.status === "unknown" ? (
                                         <FailedVideoCard key={result.id} paused={result.status === "paused"} unknown={result.status === "unknown"} error={result.error || t(result.status === "unknown" ? "managed.imageTaskUnknown" : "workbench.generationFailed")} disabled={running} onRetry={() => retryResult(result)} />
                                     ) : (
@@ -614,7 +624,7 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
     );
 }
 
-function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedVideo; onDownload: (video: GeneratedVideo) => void; onSaveAsset: (video: GeneratedVideo) => void }) {
+function ResultVideoCard({ video, onDownload, onSaveAsset, savingAsset, savedAsset }: { video: GeneratedVideo; onDownload: (video: GeneratedVideo) => void; onSaveAsset: (video: GeneratedVideo) => void; savingAsset: boolean; savedAsset: boolean }) {
     const { t } = useTranslation();
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
@@ -629,8 +639,8 @@ function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedV
                 </div>
                 <div className="flex flex-wrap gap-1">
                     <ResultToCanvasButton result={{ ...video, kind: "video", title: t("videoWorkbench.resultTitle") }} />
-                    <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => onSaveAsset(video)}>
-                        {t("common.addToAssets")}
+                    <Button size="small" loading={savingAsset} disabled={savedAsset} icon={<FolderPlus className="size-3.5" />} onClick={() => onSaveAsset(video)}>
+                        {savedAsset ? t("common.addedToAssets") : t("common.addToAssets")}
                     </Button>
                     <Button size="small" icon={<Download className="size-3.5" />} onClick={() => onDownload(video)}>
                         {t("common.download")}

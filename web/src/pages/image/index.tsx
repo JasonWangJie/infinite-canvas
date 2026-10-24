@@ -1,9 +1,9 @@
 import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Select, Tag, Tooltip, Typography } from "antd";
-import { createRecordStore, writeDocument } from "@/services/canvas-data";
+import { getDocumentBaseline, getDocumentSaveState, subscribeDocumentSaves, writeDocument } from "@/services/canvas-data";
 import { saveAs } from "file-saver";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useWorkbenchHistoryFilter } from "@/hooks/use-workbench-history-filter";
 import { readClipboardImages, useReferenceImageImport } from "@/hooks/use-reference-image-import";
 import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
@@ -22,8 +22,10 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { ImageGenerationUncertainError, requestAsyncImageGeneration, requestEdit, requestGeneration } from "@/services/api/image";
+import { imageTaskImages } from "@/services/api/image-tasks";
+import { readImageTaskRecords } from "@/services/image-task-records";
 import { ImageTaskPanel } from "./image-task-panel";
-import { ensureImagePreview, getImagePreviewRevision, previewUrlFor, readStoredImage, resolveImageUrl, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
+import { ensureImagePreview, getImagePreviewRevision, previewUrlFor, resolveImageUrl, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { assertAssetSaveReady, useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
@@ -39,12 +41,15 @@ type GeneratedImage = {
     height: number;
     bytes: number;
     mimeType?: string;
+    imageTaskRecordId?: string;
 };
 
 type GenerationResult = {
     id: string;
     status: "pending" | "success" | "failed" | "recoverable";
-    image?: GeneratedImage;
+    images?: GeneratedImage[];
+    recordId?: string;
+    partialFailureCount?: number;
     error?: string;
 };
 
@@ -61,9 +66,13 @@ type GenerationLog = {
     successCount: number;
     failCount: number;
     imageCount: number;
+    requestCount: number;
+    recoverableCount: number;
+    imageTaskRecordIds: string[];
+    recoverableRecordIds: string[];
     size: string;
     quality: string;
-    status: "success" | "failed";
+    status: "success" | "failed" | "attention";
     images: GeneratedImage[];
 };
 
@@ -71,14 +80,13 @@ type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "
 
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
-const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
-const RESULT_ACTION_BUTTON_CLASS = "min-w-0 px-1.5 [&_.ant-btn-icon]:shrink-0 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate";
-const logStore = createRecordStore("image-workbench");
+const RESULT_ACTION_BUTTON_CLASS = "shrink-0 px-2 [&_.ant-btn-icon]:shrink-0";
 
 export default function ImagePage() {
     const { message } = App.useApp();
     const { t } = useTranslation();
     const location = useLocation();
+    const navigate = useNavigate();
     const locationSearch = useRef(location.search);
     locationSearch.current = location.search;
     const linkedLogId = new URLSearchParams(location.search).get("log");
@@ -100,12 +108,17 @@ export default function ImagePage() {
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAssetsAndSave = useAssetStore((state) => state.addAssetsAndSave);
+    const assets = useAssetStore((state) => state.assets);
+    useSyncExternalStore(subscribeDocumentSaves, () => getDocumentSaveState("assets"));
     const savingAssetIds = useRef(new Set<string>());
+    const [savingAssetKeys, setSavingAssetKeys] = useState<string[]>([]);
+    const savedAssets = (getDocumentBaseline("assets") as { state?: { assets?: typeof assets } } | undefined)?.state?.assets || [];
+    const savedAssetKeys = new Set(savedAssets.flatMap((asset) => asset.kind === "image" && asset.data.storageKey && assets.some((current) => current.id === asset.id) ? [asset.data.storageKey] : []));
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
     const [results, setResults] = useState<GenerationResult[]>([]);
     const [selectedResultIds, setSelectedResultIds] = useState<string[]>([]);
-    const successfulResults = results.flatMap((result, index) => result.status === "success" && result.image ? [{ image: result.image, index }] : []);
+    const successfulResults = results.flatMap((result) => result.images || []).map((image, index) => ({ image, index }));
     const selectedResults = successfulResults.filter(({ image }) => selectedResultIds.includes(image.id));
     const allResultsSelected = Boolean(successfulResults.length) && selectedResults.length === successfulResults.length;
     const [logs, setLogs] = useState<GenerationLog[]>([]);
@@ -136,7 +149,7 @@ export default function ImagePage() {
     const model = effectiveConfig.imageModel || effectiveConfig.model;
     const modelReady = isAiConfigReady(effectiveConfig, model) && modelMatchesCapability(effectiveConfig, model, "image");
     const asyncSupported = supportsAsyncImageGeneration(effectiveConfig, model);
-    const { importing: importingReferences, importReferences } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images]), `${location.key}:${interactionVersion.current}`);
+    const { importing: importingReferences, importReferences, cancelImport } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images]), `${location.key}:${interactionVersion.current}`);
     const canGenerate = Boolean(prompt.trim()) && modelReady && !importingReferences;
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
 
@@ -165,7 +178,7 @@ export default function ImagePage() {
     }, [visibleLogs]);
 
     useEffect(() => {
-        const available = new Set(results.flatMap((result) => result.status === "success" && result.image ? [result.image.id] : []));
+        const available = new Set(results.flatMap((result) => (result.images || []).map((image) => image.id)));
         setSelectedResultIds((ids) => ids.every((id) => available.has(id)) ? ids : ids.filter((id) => available.has(id)));
     }, [results]);
 
@@ -230,34 +243,17 @@ export default function ImagePage() {
             return;
         }
 
-        const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
-
-        const result = await Promise.allSettled(tasks);
-        if (epoch !== sessionEpoch()) return;
-        const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
-        const successCount = successImages.length;
-        const failCount = generationCount - successCount;
-        const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
-        const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? t("workbench.generationFailed") : undefined;
-        if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
-
         try {
-            saveLog(
-                buildLog({
-                    prompt: text,
-                    model,
-                    config: { ...snapshot.config, count: String(generationCount) },
-                    references: snapshot.references,
-                    durationMs: performance.now() - batchStartedAt,
-                    successCount,
-                    failCount,
-                    status: successCount ? "success" : "failed",
-                    images: successImages,
-                }),
-            );
-            if (mounted.current) successCount ? message.success(t("imageWorkbench.generated")) : message.error(failed?.reason instanceof Error ? failed.reason.message : t("workbench.generationFailed"));
-        } finally {
+            const { log, error } = await runImageBatch(snapshot, generationCount, batchStartedAt);
+            if (epoch !== sessionEpoch()) return;
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: log.status === "attention" ? "attention" : log.successCount ? "succeeded" : "failed", successCount: log.successCount, failCount: log.failCount, error });
             if (mounted.current) {
+                if (log.status === "success") message.success(t("imageWorkbench.generated"));
+                else if (log.status === "attention") message.warning(error || t("imageWorkbench.needsAttention", { defaultValue: "部分请求需要处理，请查看原任务与本地保存状态。" }));
+                else message.error(error || t("workbench.generationFailed"));
+            }
+        } finally {
+            if (mounted.current && epoch === sessionEpoch()) {
                 runningRef.current = false;
                 setRunning(false);
                 setTaskRevision((value) => value + 1);
@@ -292,19 +288,17 @@ export default function ImagePage() {
         saveAs(image.dataUrl, `image-${index + 1}.png`);
     };
 
-    const addResultToReferences = async (image: GeneratedImage, index: number) => {
-        const stored = await uploadImage(image.dataUrl);
-        setReferences((value) => [...value, { id: nanoid(), name: `result-${index + 1}.png`, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
-        message.success(t("imageWorkbench.addedReference"));
-    };
+    const addResultToReferences = (image: GeneratedImage, index: number) => importReferences([{ name: `result-${index + 1}.png`, dataUrl: image.dataUrl, storageKey: image.storageKey, type: image.mimeType }]);
 
     const saveResultToAssets = async (image: GeneratedImage, index: number) => {
         const epoch = sessionEpoch(), key = `${epoch}:${image.id}`;
-        if (savingAssetIds.current.has(key)) return;
+        if (savingAssetIds.current.has(key) || (image.storageKey && savedAssetKeys.has(image.storageKey))) return;
         savingAssetIds.current.add(key);
+        setSavingAssetKeys((keys) => [...keys, key]);
         try {
             assertAssetSaveReady(epoch);
-            const stored = await uploadImage(image.dataUrl);
+            if (image.storageKey && useAssetStore.getState().assets.some((asset) => asset.kind === "image" && asset.data.storageKey === image.storageKey)) throw new Error(t("assets.formSaveUnconfirmed"));
+            const stored = image.storageKey ? { ...image, url: image.dataUrl, mimeType: image.mimeType || "image/png" } : await uploadImage(image.dataUrl);
             await addAssetsAndSave([{
                 kind: "image",
                 title: t("imageWorkbench.resultTitle", { count: index + 1 }),
@@ -319,23 +313,25 @@ export default function ImagePage() {
             if (epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : t("assets.formSaveUnconfirmed"));
         } finally {
             savingAssetIds.current.delete(key);
+            if (mounted.current && epoch === sessionEpoch()) setSavingAssetKeys((keys) => keys.filter((item) => item !== key));
         }
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
+        if (importingReferences) return;
+        setAssetPickerOpen(false);
         if (payload.kind === "text") {
             setPrompt(payload.content);
         } else if (payload.kind === "image") {
-            const stored = await uploadImage(payload.dataUrl);
-            setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
+            await importReferences([{ name: payload.title, dataUrl: payload.dataUrl, storageKey: payload.storageKey }]);
         } else {
             message.warning(t("imageWorkbench.unsupportedAsset"));
         }
-        setAssetPickerOpen(false);
     };
 
     const createSession = () => {
         if (runningRef.current) return;
+        cancelImport();
         interactionVersion.current += 1;
         setPrompt("");
         setReferences([]);
@@ -372,12 +368,6 @@ export default function ImagePage() {
         }
     };
 
-    const saveLog = (log: GenerationLog) => {
-        void logStore.setItem(log.id, serializeLog(log)).then(() => mounted.current ? refreshLogs() : undefined).catch((error) => {
-            if (mounted.current) message.error(error instanceof Error ? error.message : String(error));
-        });
-    };
-
     const refreshLogs = async () => {
         const epoch = sessionEpoch();
         const load = ++latestLoad.current;
@@ -411,7 +401,10 @@ export default function ImagePage() {
         if (log.config.quality) updateConfig("quality", log.config.quality);
         if (log.config.size) updateConfig("size", log.config.size);
         if (log.config.count) updateConfig("count", log.config.count);
-        setResults(log.images.map((image) => ({ id: image.id, status: "success", image })));
+        setResults([
+            ...log.images.map((image) => ({ id: image.id, status: "success" as const, images: [image] })),
+            ...Array.from({ length: log.recoverableCount }, (_, index) => ({ id: `${log.id}:recovery:${index}`, status: "recoverable" as const, recordId: log.recoverableRecordIds[index] })),
+        ]);
     };
 
     useEffect(() => {
@@ -442,66 +435,102 @@ export default function ImagePage() {
         return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
     };
 
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
+    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, onIntentSaved: (id: string) => Promise<void>): Promise<GenerationResult> => {
         const epoch = sessionEpoch();
         const version = interactionVersion.current;
         const itemStartedAt = performance.now();
         let received = false;
+        let recordId: string | undefined;
+        let partialFailureCount = 0, partialUnknown = false, partialMessage: string | undefined;
+        let result: GenerationResult;
         try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
+            const options = {
+                onIntentSaved: async (id: string) => {
+                    recordId = id;
+                    if (mounted.current && epoch === sessionEpoch() && version === interactionVersion.current) setResults((value) => updateResultAt(value, index, { recordId: id }));
+                    await onIntentSaved(id);
+                },
+                onPartial: (batch: { failed: number; unknown: number }) => {
+                    partialFailureCount = batch.failed;
+                    partialUnknown = batch.unknown > 0;
+                    partialMessage = t("managed.imageBatchPartialNotice", batch);
+                },
+            };
+            const returned = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references, options) : await requestGeneration(snapshot.config, snapshot.text, options);
             if (epoch !== sessionEpoch()) throw new Error(t("saveRecovery.sessionChanged"));
             received = true;
-            const image = result[0];
-            if (!image) throw new Error(t("imageWorkbench.missingResult"));
-            const stored = await uploadImage(image.dataUrl);
-            const nextImage: GeneratedImage = {
-                id: image.id,
-                dataUrl: stored.url,
-                ...(stored.storageKey ? { storageKey: stored.storageKey } : {}),
-                durationMs: performance.now() - itemStartedAt,
-                width: stored.width,
-                height: stored.height,
-                bytes: stored.bytes,
-                mimeType: stored.mimeType,
-            };
-            if (mounted.current && epoch === sessionEpoch() && version === interactionVersion.current) setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
-            return nextImage;
+            if (!returned.length || !recordId) throw new Error(t("imageWorkbench.missingResult"));
+            const stored = await imageTaskImages({ id: recordId });
+            const images = await Promise.all(stored.map(async (image) => ({ ...image, imageTaskRecordId: recordId, dataUrl: await resolveImageUrl(image.storageKey, image.dataUrl), durationMs: performance.now() - itemStartedAt })));
+            result = { id: nanoid(), status: partialUnknown ? "recoverable" : "success", images, recordId, partialFailureCount, error: partialMessage };
         } catch (error) {
-            if (mounted.current && epoch === sessionEpoch() && version === interactionVersion.current) setResults((value) => updateResultAt(value, index, { status: received || error instanceof ImageGenerationUncertainError ? "recoverable" : "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
-            throw error;
+            const saveFailed = ["image-tasks", "image-workbench"].some((domain) => ["error", "conflict"].includes(getDocumentSaveState(domain).status));
+            result = { id: nanoid(), recordId, status: received || saveFailed || error instanceof ImageGenerationUncertainError ? "recoverable" : "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") };
         }
+        if (mounted.current && epoch === sessionEpoch() && version === interactionVersion.current) setResults((value) => updateResultAt(value, index, result));
+        return result;
+    };
+
+    const runImageBatch = async (snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, count: number, started: number, retryIndex?: number) => {
+        const epoch = sessionEpoch(), version = interactionVersion.current;
+        const slots: GenerationResult[] = Array.from({ length: count }, () => ({ id: nanoid(), status: "pending" }));
+        const log = buildLog({ prompt: snapshot.text, model: snapshot.config.model, config: { ...snapshot.config, count: String(count) }, references: snapshot.references, requestCount: count });
+        let created = false;
+        const summarize = () => {
+            log.images = slots.flatMap((slot) => slot.images || []);
+            log.imageCount = log.successCount = log.images.length;
+            log.failCount = slots.reduce((count, slot) => count + (slot.status === "failed" ? 1 : slot.partialFailureCount || 0), 0);
+            log.recoverableCount = slots.filter((slot) => slot.status === "pending" || slot.status === "recoverable").length;
+            log.recoverableRecordIds = slots.flatMap((slot) => slot.recordId && (slot.status === "pending" || slot.status === "recoverable") ? [slot.recordId] : []);
+            log.status = log.recoverableCount || (log.failCount && log.imageCount) ? "attention" : log.failCount ? "failed" : "success";
+            log.durationMs = performance.now() - started;
+        };
+        const save = async () => {
+            if (epoch !== sessionEpoch()) throw new Error(t("saveRecovery.sessionChanged"));
+            summarize();
+            const next = serializeLog(log), create = !created;
+            created = true;
+            await writeDocument("image-workbench", (value) => {
+                const records = (value || {}) as Record<string, GenerationLog>;
+                return create || records[log.id] ? { ...records, [log.id]: next } : records;
+            });
+        };
+        await Promise.all(slots.map(async (_, index) => {
+            const resultIndex = retryIndex ?? index;
+            slots[index] = await runGenerationSlot(resultIndex, snapshot, async (id) => {
+                slots[index] = { ...slots[index], recordId: id };
+                log.imageTaskRecordIds = [...log.imageTaskRecordIds, id];
+                await save();
+            });
+            if (epoch !== sessionEpoch()) return;
+            try { await save(); } catch (error) {
+                slots[index] = { ...slots[index], status: "recoverable", error: error instanceof Error ? error.message : String(error) };
+                if (mounted.current && version === interactionVersion.current) setResults((value) => updateResultAt(value, resultIndex, slots[index]));
+                // Retain the received images and the attention status in the failed draft.
+                await save().catch(() => {});
+            }
+        }));
+        summarize();
+        if (mounted.current && epoch === sessionEpoch()) await refreshLogs().catch(() => {});
+        return { log, error: slots.find((slot) => slot.error)?.error };
     };
 
     const retryResult = async (index: number) => {
-        if (runningRef.current) return;
+        if (runningRef.current || results[index]?.status !== "failed") return;
         const epoch = sessionEpoch();
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
         setPreviewLog(null);
-        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
+        setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, images: undefined }));
         interactionVersion.current += 1;
         runningRef.current = true;
         setRunning(true);
         const retryStartedAt = performance.now();
         try {
-            const image = await runGenerationSlot(index, snapshot);
+            const { log, error } = await runImageBatch(snapshot, 1, retryStartedAt, index);
             if (epoch !== sessionEpoch()) return;
-            saveLog(
-                buildLog({
-                    prompt: snapshot.text,
-                    model,
-                    config: { ...snapshot.config, count: "1" },
-                    references: snapshot.references,
-                    durationMs: performance.now() - retryStartedAt,
-                    successCount: 1,
-                    failCount: 0,
-                    status: "success",
-                    images: [image],
-                }),
-            );
-            if (mounted.current) message.success(t("workbench.retrySuccess"));
-        } catch {
-            // runGenerationSlot has already marked the result as failed.
+            if (mounted.current && log.status === "success") message.success(t("workbench.retrySuccess"));
+            else if (mounted.current && error) message.warning(error);
         } finally {
             if (mounted.current && epoch === sessionEpoch()) {
                 runningRef.current = false;
@@ -511,6 +540,7 @@ export default function ImagePage() {
     };
 
     const resultsViewVersion = interactionVersion.current;
+    let visibleResultIndex = 0;
     return (
         <div className="flex h-full flex-col overflow-hidden bg-stone-50 text-stone-900 dark:bg-stone-950 dark:text-stone-100" onClickCapture={cancelHistoryPreview} onKeyDownCapture={cancelHistoryPreview} onInputCapture={cancelHistoryPreview} onDropCapture={cancelHistoryPreview}>
             {navigationError ? <p role="alert" className="px-4 pt-3 text-sm text-destructive">{navigationError}</p> : null}
@@ -555,7 +585,7 @@ export default function ImagePage() {
                                         <Button size="small" icon={<BookOpen className="size-3.5" />} onClick={() => setPromptDialogOpen(true)}>
                                             {t("workbench.viewPrompts")}
                                         </Button>
-                                        <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => setAssetPickerOpen(true)}>
+                                        <Button size="small" disabled={importingReferences} icon={<FolderPlus className="size-3.5" />} onClick={() => setAssetPickerOpen(true)}>
                                             {t("workbench.viewAssets")}
                                         </Button>
                                     </div>
@@ -618,7 +648,7 @@ export default function ImagePage() {
                                             </button>
                                         </div>
                                     ))}
-                                    {importingReferences ? <span role="status" className="self-center text-sm text-muted-foreground">{t("workbench.importingReferences")}</span> : null}
+                                    {importingReferences ? <span role="status" className="self-center text-sm text-muted-foreground">{t("workbench.importingReferences")} <Button type="text" size="small" onClick={cancelImport}>{t("common.cancel")}</Button></span> : null}
                                     {!references.length && !importingReferences ? <div className="flex min-w-full items-center justify-center text-sm text-stone-500">{isReferenceDragActive ? t("imageWorkbench.dropReferences") : t("imageWorkbench.noReferences")}</div> : null}
                                 </div>
                             </div>
@@ -654,22 +684,24 @@ export default function ImagePage() {
                         <ImageTaskPanel
                             revision={taskRevision}
                             generating={running}
+                            activeRecordIds={running ? results.flatMap((result) => result.status === "pending" && result.recordId ? [result.recordId] : []) : []}
                             selectedTaskId={new URLSearchParams(location.search).get("task")}
-                            onOpen={async (images) => {
+                            onOpen={async (images, recordId) => {
                                 if (runningRef.current || resultsViewVersion !== interactionVersion.current || location.search !== locationSearch.current) return;
                                 const epoch = sessionEpoch();
                                 const version = resultsViewVersion;
                                 const stored = await Promise.all(
                                     images.map(async (image) => {
-                                        const privateFile = /^local-file:([^/?#]+)$/.exec(image.dataUrl);
-                                        const file = privateFile ? await readStoredImage(decodeURIComponent(privateFile[1])) : await uploadImage(image.dataUrl);
                                         return {
                                             id: image.id,
                                             status: "success" as const,
-                                            image: { id: image.id, dataUrl: file.url, storageKey: file.storageKey, durationMs: 0, width: file.width, height: file.height, bytes: file.bytes, mimeType: file.mimeType },
+                                            images: [{ ...image, imageTaskRecordId: recordId, dataUrl: await resolveImageUrl(image.storageKey, image.dataUrl), durationMs: 0 }],
                                         };
                                     }),
                                 );
+                                if (!mounted.current || epoch !== sessionEpoch() || runningRef.current || version !== interactionVersion.current || location.search !== locationSearch.current) return;
+                                await restoreImageHistory(recordId, stored.flatMap((result) => result.images));
+                                await refreshLogs();
                                 if (!mounted.current || epoch !== sessionEpoch() || runningRef.current || version !== interactionVersion.current || location.search !== locationSearch.current) return;
                                 setPreviewLog(null);
                                 setSelectedResultIds([]);
@@ -693,18 +725,14 @@ export default function ImagePage() {
                             </div>
                         </div>
                         {results.length ? (
-                            <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
-                                {results.map((result, index) =>
-                                    result.status === "success" && result.image ? (
-                                        <ResultImageCard key={result.id} image={result.image} index={index} selected={selectedResultIds.includes(result.image.id)} onSelectedChange={(checked) => setSelectedResultIds((ids) => checked ? [...new Set([...ids, result.image!.id])] : ids.filter((id) => id !== result.image!.id))} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
-                                    ) : result.status === "recoverable" ? (
-                                        <FailedImageCard key={result.id} error={result.error || t("managed.imageTaskUnknown")} recovery onRetry={() => setTaskRevision((value) => value + 1)} />
-                                    ) : result.status === "failed" ? (
-                                        <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => retryResult(index)} />
-                                    ) : (
-                                        <PendingImageCard key={result.id} />
-                                    ),
-                                )}
+                            <div className="grid gap-4 [grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr))]">
+                                {results.flatMap((result, index) => {
+                                    const cards = (result.images || []).map((image) => <ResultImageCard key={image.id} image={image} index={visibleResultIndex++} selected={selectedResultIds.includes(image.id)} onSelectedChange={(checked) => setSelectedResultIds((ids) => checked ? [...new Set([...ids, image.id])] : ids.filter((id) => id !== image.id))} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} importingReferences={importingReferences} savingAsset={savingAssetKeys.includes(`${sessionEpoch()}:${image.id}`)} savedAsset={Boolean(image.storageKey && savedAssetKeys.has(image.storageKey))} />);
+                                    if (result.status === "recoverable") cards.push(<FailedImageCard key={result.id} error={result.error || t("managed.imageTaskUnknown")} recovery onRetry={() => result.recordId ? navigate(`/image?task=${encodeURIComponent(result.recordId)}`) : setTaskRevision((value) => value + 1)} />);
+                                    if (result.status === "failed") cards.push(<FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => retryResult(index)} />);
+                                    if (result.status === "pending") cards.push(<PendingImageCard key={result.id} />);
+                                    return cards;
+                                })}
                             </div>
                         ) : (
                             <div className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700 lg:min-h-[560px]">
@@ -777,6 +805,9 @@ function ResultImageCard({
     onEdit,
     onDownload,
     onSaveAsset,
+    importingReferences,
+    savingAsset,
+    savedAsset,
 }: {
     image: GeneratedImage;
     index: number;
@@ -785,13 +816,16 @@ function ResultImageCard({
     onEdit: (image: GeneratedImage, index: number) => void;
     onDownload: (image: GeneratedImage, index: number) => void;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
+    importingReferences: boolean;
+    savingAsset: boolean;
+    savedAsset: boolean;
 }) {
     const { t } = useTranslation();
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
     return (
         <div className={`overflow-hidden rounded-lg border bg-background ${selected ? "border-primary ring-1 ring-primary" : "border-stone-200 dark:border-stone-800"}`}>
             <div className="relative">
-                <Image src={previewUrlFor(image.storageKey) || image.dataUrl} preview={{ src: image.dataUrl }} alt={t("imageWorkbench.resultAlt", { count: index + 1 })} className="aspect-square object-cover" />
+                <Image width="100%" src={previewUrlFor(image.storageKey) || image.dataUrl} preview={{ src: image.dataUrl }} alt={t("imageWorkbench.resultAlt", { count: index + 1 })} className="max-h-80 w-full object-contain" />
                 <Checkbox checked={selected} aria-label={t("resultToCanvas.selectResult", { count: index + 1 })} className="!absolute right-2 top-2 rounded bg-background/90 p-1.5" onChange={(event) => onSelectedChange(event.target.checked)} />
             </div>
             <div className="space-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
@@ -802,15 +836,15 @@ function ResultImageCard({
                     <span>{formatBytes(image.bytes)}</span>
                     <span>{formatDuration(image.durationMs)}</span>
                 </div>
-                <div className="grid min-w-0 grid-cols-2 gap-2">
-                    <ResultToCanvasButton result={{ ...image, kind: "image", url: image.dataUrl, title: t("imageWorkbench.resultTitle", { count: index + 1 }) }} />
+                <div className="flex min-w-0 flex-wrap gap-2">
+                    <div className="min-w-0 basis-full"><ResultToCanvasButton result={{ ...image, kind: "image", url: image.dataUrl, title: t("imageWorkbench.resultTitle", { count: index + 1 }) }} /></div>
                     <Tooltip title={t("common.addToAssets")}>
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)}>
-                            {t("common.addToAssets")}
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" loading={savingAsset} disabled={savedAsset} icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)}>
+                            {savedAsset ? t("common.addedToAssets") : t("common.addToAssets")}
                         </Button>
                     </Tooltip>
                     <Tooltip title={t("imageWorkbench.addReference")}>
-                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" icon={<PenLine className="size-3.5" />} onClick={() => void onEdit(image, index)}>
+                        <Button className={RESULT_ACTION_BUTTON_CLASS} size="small" disabled={importingReferences} icon={<PenLine className="size-3.5" />} onClick={() => void onEdit(image, index)}>
                             {t("imageWorkbench.addReference")}
                         </Button>
                     </Tooltip>
@@ -908,6 +942,7 @@ function LogPanel({
                         { value: "all", label: t("workbench.historyAllStatuses") },
                         { value: "success", label: t("workbench.success") },
                         { value: "failed", label: t("workbench.failed") },
+                        { value: "attention", label: t("workbench.attention", { defaultValue: "待处理" }) },
                     ]} />
                     <Button disabled={!filter.query && filter.status === "all"} onClick={() => updateFilter("image", { query: "", status: "all" })}>{t("workbench.historyClearFilters")}</Button>
                 </div>
@@ -992,9 +1027,11 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                                 {t("workbench.failCount", { count: log.failCount })}
                             </Tag>
                         ) : null}
+                        {log.recoverableCount ? <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="orange">{t("imageWorkbench.recoverableCount", { count: log.recoverableCount, defaultValue: "待处理 {{count}}" })}</Tag> : null}
                     </div>
                     <div className="flex flex-wrap justify-end gap-1">
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none">{t("workbench.itemCount", { count: log.imageCount })}</Tag>
+                        <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none">{t("imageWorkbench.requestCount", { count: log.requestCount, defaultValue: "{{count}} 次请求" })}</Tag>
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="green">
                             {formatDuration(log.durationMs)}
                         </Tag>
@@ -1012,6 +1049,24 @@ async function readStoredLogs() {
     const stored = await readTaskCenterDocument("image-workbench");
     const logs = stored && typeof stored === "object" && !Array.isArray(stored) ? Object.values(stored) as GenerationLog[] : [];
     return (await Promise.all(logs.map((log) => normalizeLog(log)))).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+async function restoreImageHistory(recordId: string, images: GeneratedImage[]) {
+    const epoch = sessionEpoch();
+    const record = (await readImageTaskRecords())[recordId];
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    if (!record) throw new Error(i18n.t("taskCenter.recordRemoved"));
+    if (["pending", "saving", "error", "conflict"].includes(getDocumentSaveState("image-tasks").status)) throw new Error(i18n.t("browserStorage.resultSaveFailed"));
+    const batch = record.value.batch;
+    const completed = record.status === "succeeded" && (!batch || (batch.completed >= batch.total && !batch.failed && !batch.unknown));
+    await writeDocument("image-workbench", (value) => Object.fromEntries(Object.entries((value || {}) as Record<string, GenerationLog>).map(([id, log]) => {
+        if (!log.imageTaskRecordIds?.includes(recordId)) return [id, log];
+        const restored = [...log.images.filter((image) => image.imageTaskRecordId !== recordId), ...images];
+        const recoverableRecordIds = completed ? log.recoverableRecordIds.filter((id) => id !== recordId) : log.recoverableRecordIds;
+        const recoverableCount = log.recoverableCount - (log.recoverableRecordIds.length - recoverableRecordIds.length);
+        const status = recoverableCount || log.failCount ? "attention" : "success";
+        return [id, serializeLog({ ...log, images: restored, imageCount: restored.length, successCount: restored.length, recoverableRecordIds, recoverableCount, status })];
+    })));
 }
 
 async function normalizeLog(log: Partial<GenerationLog>, loadMedia = false): Promise<GenerationLog> {
@@ -1038,7 +1093,11 @@ async function normalizeLog(log: Partial<GenerationLog>, loadMedia = false): Pro
         durationMs: log.durationMs || 0,
         successCount: log.successCount ?? log.imageCount ?? 0,
         failCount: log.failCount || 0,
-        imageCount: log.imageCount || log.successCount || 0,
+        imageCount: images.length,
+        requestCount: log.requestCount || Number(config.count) || 1,
+        recoverableCount: log.recoverableCount || 0,
+        imageTaskRecordIds: log.imageTaskRecordIds || [],
+        recoverableRecordIds: log.recoverableRecordIds || [],
         size: log.size || config.size || "",
         quality: log.quality || config.quality || "",
         status: log.status || "success",
@@ -1087,21 +1146,13 @@ function buildLog({
     model,
     config,
     references,
-    durationMs,
-    successCount,
-    failCount,
-    status,
-    images,
+    requestCount,
 }: {
     prompt: string;
     model: string;
     config: GenerationLogConfig;
     references: ReferenceImage[];
-    durationMs: number;
-    successCount: number;
-    failCount: number;
-    status: GenerationLog["status"];
-    images: GeneratedImage[];
+    requestCount: number;
 }): GenerationLog {
     const logConfig = {
         model: config.model,
@@ -1119,13 +1170,17 @@ function buildLog({
         model,
         config: logConfig,
         references,
-        durationMs,
-        successCount,
-        failCount,
-        imageCount: Number(logConfig.count) || successCount,
+        durationMs: 0,
+        successCount: 0,
+        failCount: 0,
+        imageCount: 0,
+        requestCount,
+        recoverableCount: requestCount,
+        imageTaskRecordIds: [],
+        recoverableRecordIds: [],
         size: logConfig.size,
         quality: logConfig.quality,
-        status,
-        images,
+        status: "attention",
+        images: [],
     };
 }

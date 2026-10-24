@@ -14,7 +14,7 @@ export type WorkbenchCommand = {
 export type WorkbenchGenerationTask = {
     id: string;
     kind: "image" | "video";
-    status: "queued" | "running" | "succeeded" | "failed";
+    status: "queued" | "running" | "succeeded" | "failed" | "attention";
     prompt?: string;
     createdAt: string;
     updatedAt: string;

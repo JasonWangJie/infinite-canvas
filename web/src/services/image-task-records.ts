@@ -1,5 +1,7 @@
 import i18n from "@/i18n";
 import { sessionEpoch } from "@/services/api/canvas-client";
+import type { GenerationRequestMeasurement } from "@/services/generation-diagnostics";
+import type { ImageStorageTimings } from "@/services/image-storage";
 import { equalDocument, flushDocument, getDocumentBaseline, getDocumentDraft, getDocumentSaveState, readSavedDocument, resolveDocumentConflict, retryDocument, writeDocument } from "@/services/canvas-data";
 
 export type ImageTaskResult = {
@@ -17,7 +19,7 @@ export type ImageTaskRecord = {
     status: string;
     created_at?: number;
     has_result?: boolean;
-    value: { model?: string; endpoint?: string; retryAfter?: number; result?: ImageTaskResult; localImages?: Record<string, string>; batch?: ImageTaskBatch };
+    value: { model?: string; endpoint?: string; retryAfter?: number; result?: ImageTaskResult; localImages?: Record<string, string>; batch?: ImageTaskBatch; requests?: GenerationRequestMeasurement[]; lastQuery?: GenerationRequestMeasurement; mediaTimings?: Record<string, ImageStorageTimings> };
 };
 
 function taskRecords(value: unknown): Record<string, ImageTaskRecord> {

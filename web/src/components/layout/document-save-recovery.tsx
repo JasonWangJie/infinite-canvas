@@ -1,12 +1,12 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
-import { Alert, App, Button } from "antd";
+import { Alert, App, Button, Modal } from "antd";
 import { useMatch, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
-import { sessionEpoch } from "@/services/api/canvas-client";
+import { onSessionEnd, sessionEpoch } from "@/services/api/canvas-client";
 import { prepareCanvasConflictCopies } from "@/lib/canvas/save-recovery";
-import { getDocumentDraft, getDocumentSaveStates, retryDocument, subscribeDocumentSaves, type DocumentSaveState } from "@/services/canvas-data";
+import { assertDocumentRecoveryBackupCurrent, captureDocumentRecoveryBackup, getDocumentDraft, getDocumentSaveStates, retryDocument, subscribeDocumentSaves, type DocumentRecoveryBackup, type DocumentSaveState } from "@/services/canvas-data";
 import { recoverImageTaskRecords } from "@/services/image-task-records";
 import { applyCanvasDocument, flushCanvasSave, useCanvasStore } from "@/stores/canvas/use-canvas-store";
 
@@ -22,11 +22,20 @@ const domainLabels: Record<string, string> = {
 };
 
 export function DocumentSaveRecovery() {
+    const { t } = useTranslation();
+    const { message } = App.useApp();
     const states = useSyncExternalStore(subscribeDocumentSaves, getDocumentSaveStates, getDocumentSaveStates);
+    const [backup, setBackup] = useState<DocumentRecoveryBackup | null>(null);
+    const [exporting, setExporting] = useState(false);
+    const [reloadError, setReloadError] = useState("");
+    const reloading = useRef(false);
+    const exportingRef = useRef(false);
     const unsaved = states.some((state) => state.status !== "saved" && state.status !== "idle");
+    useEffect(() => onSessionEnd(() => { setBackup(null); setReloadError(""); }), []);
     useEffect(() => {
         if (!unsaved) return;
         const warn = (event: BeforeUnloadEvent) => {
+            if (reloading.current) return;
             event.preventDefault();
             event.returnValue = "";
         };
@@ -34,12 +43,61 @@ export function DocumentSaveRecovery() {
         return () => window.removeEventListener("beforeunload", warn);
     }, [unsaved]);
     const failures = states.filter((state) => state.status === "error" || state.status === "conflict");
-    if (!failures.length) return null;
+    const exportAll = async () => {
+        if (exportingRef.current) return;
+        const epoch = sessionEpoch();
+        exportingRef.current = true;
+        setExporting(true);
+        setReloadError("");
+        try {
+            flushSync(() => {
+                (document.activeElement as HTMLElement | null)?.blur?.();
+                window.dispatchEvent(new CustomEvent("canvas-before-logout"));
+            });
+            const next = await captureDocumentRecoveryBackup();
+            const { saveAs } = await import("file-saver");
+            assertDocumentRecoveryBackupCurrent(next);
+            saveAs(new Blob([JSON.stringify({ app: "infinite-canvas", version: 1, exportedAt: new Date().toISOString(), documents: next.documents }, null, 2)], { type: "application/json" }), "infinite-canvas-unsaved-drafts.json");
+            if (epoch === sessionEpoch()) setBackup(next);
+        } catch (error) {
+            if (epoch === sessionEpoch()) message.error(error instanceof Error ? error.message : t("saveRecovery.actionFailed"));
+        } finally {
+            exportingRef.current = false;
+            if (epoch === sessionEpoch()) setExporting(false);
+        }
+    };
+    const reloadSaved = () => {
+        if (!backup || exportingRef.current) return;
+        try {
+            assertDocumentRecoveryBackupCurrent(backup);
+            reloading.current = true;
+            window.location.reload();
+        } catch (error) {
+            setReloadError(error instanceof Error ? error.message : t("saveRecovery.actionFailed"));
+        } finally {
+            reloading.current = false;
+        }
+    };
+    if (!failures.length && !backup) return null;
     return (
         <div id="document-save-recovery" tabIndex={-1} className="max-h-[35dvh] shrink-0 overflow-y-auto outline-none">
             {failures.map((state) => (
                 <DocumentSaveIssue key={state.domain} state={state} />
             ))}
+            {failures.length ? <Button className="m-2" size="small" loading={exporting} onClick={() => void exportAll()}>{t("saveRecovery.exportAllReload", { defaultValue: "导出本页全部未保存草稿并重新加载" })}</Button> : null}
+            <Modal open={Boolean(backup)} title={t("saveRecovery.reloadTitle", { defaultValue: "确认备份后重新读取已保存版本" })} onCancel={() => setBackup(null)} mask={{ closable: false }} footer={[
+                <Button key="cancel" disabled={exporting} onClick={() => setBackup(null)}>{t("saveRecovery.keepDrafts", { defaultValue: "保留本页草稿" })}</Button>,
+                <Button key="export" loading={exporting} onClick={() => void exportAll()}>{t("saveRecovery.exportAgain", { defaultValue: "重新导出全部草稿" })}</Button>,
+                <Button key="reload" danger disabled={exporting} onClick={reloadSaved}>{t("saveRecovery.confirmReload", { defaultValue: "已保存备份，放弃本页草稿并重新加载" })}</Button>,
+            ]}>
+                <div className="space-y-3">
+                    <p>{t("saveRecovery.reloadDownloadHint", { defaultValue: "浏览器已发起下载，请确认备份文件已保存到本机后再继续。取消会保留所有草稿。" })}</p>
+                    <p>{t("saveRecovery.reloadDomains", { defaultValue: "备份包含以下未保存数据：{{names}}。", names: Object.keys(backup?.documents || {}).map((domain) => t(domainLabels[domain] || "saveRecovery.otherData")).join("、") })}</p>
+                    <p>{t("saveRecovery.reloadRisk", { defaultValue: "重新加载会放弃本页所有未保存状态，并读取浏览器中已保存的版本；不会覆盖已保存数据。尚未到达的生成响应和未提交的表单输入可能丢失。" })}</p>
+                    <p>{t("saveRecovery.reloadMediaHint", { defaultValue: "JSON 备份包含草稿及媒体引用，不包含媒体文件。有画布草稿时，请先使用“导出画布资源包”保留完整资源。" })}</p>
+                    {reloadError ? <p role="alert" className="text-destructive">{reloadError}</p> : null}
+                </div>
+            </Modal>
         </div>
     );
 }

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { LOGIN_TRANSACTION_SECONDS, SESSION_IDLE_SECONDS, SESSION_SECONDS, type ServerConfig } from "./config.ts";
@@ -6,7 +6,8 @@ import { Gateway, GatewayError, publicMediaResponse, publicResourceResponse, typ
 import { CredentialVault, digest, equalSecret, randomSecret, SESSION_COOKIE, TRANSACTION_COOKIE } from "./security.ts";
 import { CanvasStorage, type LoginRow, type SessionRow } from "./storage.ts";
 
-type Env = { Variables: { session: SessionRow; apiKey: string } };
+type TimingStage = "authorization" | "model_validation" | "upstream_headers";
+type Env = { Variables: { session: SessionRow; apiKey: string; requestId: string; timings: Partial<Record<TimingStage, number>> } };
 export type SecurityAuditEvent = { timestamp: string; component: string; app: string; action: string; result: "success" | "failure"; code?: string; user_id?: number; subject_ref?: string; grant_ref?: string };
 const cookieOptions = { secure: true, httpOnly: true, sameSite: "Lax" as const, path: "/" };
 const safeId = /^[A-Za-z0-9_-]+$/;
@@ -42,6 +43,11 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
     const publicResource = options.publicResource || publicResourceResponse;
     const publicMedia = options.publicMedia || publicMediaResponse;
     const app = new Hono<Env>();
+    const measure = async <T>(c: Context<Env>, stage: TimingStage, action: () => Promise<T>): Promise<T> => {
+        const start = performance.now();
+        try { return await action(); }
+        finally { c.get("timings")[stage] = performance.now() - start; }
+    };
     const audit = (action: string, result: "success" | "failure", session?: SessionRow, code?: string, grantId?: string) => {
         const user = session ? JSON.parse(session.user_json) as { id: number; subject: string } : undefined;
         const event: SecurityAuditEvent = { timestamp: new Date(now() * 1000).toISOString(), component: "infinite-canvas", app: config.clientId, action, result };
@@ -86,6 +92,11 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
     };
 
     app.use("*", async (c, next) => {
+        if (c.req.path.startsWith("/api/")) {
+            c.set("requestId", randomUUID());
+            c.set("timings", {});
+            c.header("X-Request-Id", c.get("requestId"));
+        }
         for (const [name, value] of Object.entries(securityHeaders)) c.header(name, value);
         // TLS may terminate at the dedicated Canvas Nginx ingress. Do not trust
         // arbitrary forwarded headers to select the application's public origin.
@@ -94,6 +105,11 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         // Raw streaming/file Response objects replace prepared Hono headers.
         // Apply the security policy to the final response as well.
         for (const [name, value] of Object.entries(securityHeaders)) c.header(name, value);
+        if (c.get("requestId")) {
+            c.header("X-Request-Id", c.get("requestId"));
+            const timing = Object.entries(c.get("timings")).map(([stage, duration]) => `${stage};dur=${duration.toFixed(2)}`).join(", ");
+            if (timing) c.header("Server-Timing", timing);
+        }
     });
 
     app.onError((error, c) => {
@@ -164,56 +180,55 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
     });
 
     app.use("/api/*", async (c, next) => {
-        const origin = c.req.header("Origin");
-        const site = c.req.header("Sec-Fetch-Site");
-        if ((origin && origin !== config.origin) || (site && !["same-origin", "none"].includes(site))) throw new GatewayError("ORIGIN_FORBIDDEN", 403, "请求来源不受允许");
-        const cookie = getCookie(c, SESSION_COOKIE);
-        const session = cookie ? storage.session(digest(cookie)) : null;
-        if (!session) throw new GatewayError("AUTH_REQUIRED", 401, "请从 New API 进入 AI 无限画布");
-        c.set("session", session);
-        const expectedSession = c.req.header("X-Canvas-Session-Tag");
-        if (expectedSession && !equalSecret(expectedSession, digest(`canvas-public-session-tag\0${session.hash}`))) throw new GatewayError("SESSION_CHANGED", 401, "画布登录身份已切换，请重新加载");
-        const writing = !["GET", "HEAD", "OPTIONS"].includes(c.req.method);
-        if (writing && (origin !== config.origin || !equalSecret(c.req.header("X-CSRF-Token") || "", session.csrf))) throw new GatewayError("CSRF_INVALID", 403, "请求校验失败，请刷新画布");
-        // Local logout must remain available during a gateway outage. It still
-        // requires the current cookie, session tag, origin and CSRF token.
-        if (c.req.method === "POST" && c.req.path === "/api/logout") {
-            await next();
-            return;
-        }
-        if (session.expires_at <= now() || session.last_active + SESSION_IDLE_SECONDS <= now()) {
-            storage.retire(session);
-            void revokePending();
-            throw new GatewayError("AUTH_EXPIRED", 401, "画布会话已过期，请重新授权");
-        }
-        // Polling, streaming reads and background bootstrap do not count as user activity.
-        const activity = c.req.header("X-Canvas-Activity") === "1" || writing && c.req.path !== "/api/logout";
-        const activityAt = now();
-        let state: GrantState;
-        try {
-            state = await gateway.control<GrantState>("introspect", { grant_id: session.grant_id, activity });
-        } catch (error) {
-            if (error instanceof GatewayError && error.status === 401) {
+        await measure(c, "authorization", async () => {
+            const origin = c.req.header("Origin");
+            const site = c.req.header("Sec-Fetch-Site");
+            if ((origin && origin !== config.origin) || (site && !["same-origin", "none"].includes(site))) throw new GatewayError("ORIGIN_FORBIDDEN", 403, "请求来源不受允许");
+            const cookie = getCookie(c, SESSION_COOKIE);
+            const session = cookie ? storage.session(digest(cookie)) : null;
+            if (!session) throw new GatewayError("AUTH_REQUIRED", 401, "请从 New API 进入 AI 无限画布");
+            c.set("session", session);
+            const expectedSession = c.req.header("X-Canvas-Session-Tag");
+            if (expectedSession && !equalSecret(expectedSession, digest(`canvas-public-session-tag\0${session.hash}`))) throw new GatewayError("SESSION_CHANGED", 401, "画布登录身份已切换，请重新加载");
+            const writing = !["GET", "HEAD", "OPTIONS"].includes(c.req.method);
+            if (writing && (origin !== config.origin || !equalSecret(c.req.header("X-CSRF-Token") || "", session.csrf))) throw new GatewayError("CSRF_INVALID", 403, "请求校验失败，请刷新画布");
+            // Local logout must remain available during a gateway outage. It still
+            // requires the current cookie, session tag, origin and CSRF token.
+            if (c.req.method === "POST" && c.req.path === "/api/logout") return;
+            if (session.expires_at <= now() || session.last_active + SESSION_IDLE_SECONDS <= now()) {
                 storage.retire(session);
+                void revokePending();
+                throw new GatewayError("AUTH_EXPIRED", 401, "画布会话已过期，请重新授权");
             }
-            throw error;
-        }
-        const currentUser = JSON.parse(session.user_json) as { id: number; subject: string };
-        if (!state.active || state.user?.id !== currentUser.id || typeof state.user.subject !== "string" || !safeSubject.test(state.user.subject) || state.user.subject !== currentUser.subject || session.owner !== `${new URL(config.gatewayPublicUrl).origin}|${state.user.subject}` || !state.expires_at || state.expires_at <= now()) {
-            storage.retire(session);
+            // Polling, streaming reads and background bootstrap do not count as user activity.
+            const activity = c.req.header("X-Canvas-Activity") === "1" || writing && c.req.path !== "/api/logout";
+            const activityAt = now();
+            let state: GrantState;
+            try {
+                state = await gateway.control<GrantState>("introspect", { grant_id: session.grant_id, activity }, c.get("requestId"));
+            } catch (error) {
+                if (error instanceof GatewayError && error.status === 401) {
+                    storage.retire(session);
+                }
+                throw error;
+            }
+            const currentUser = JSON.parse(session.user_json) as { id: number; subject: string };
+            if (!state.active || state.user?.id !== currentUser.id || typeof state.user.subject !== "string" || !safeSubject.test(state.user.subject) || state.user.subject !== currentUser.subject || session.owner !== `${new URL(config.gatewayPublicUrl).origin}|${state.user.subject}` || !state.expires_at || state.expires_at <= now()) {
+                storage.retire(session);
+                void revokePending();
+                const [code, message] = grantFailures[state.reason || ""] || ["AUTH_REVOKED", "授权已失效，请重新从 New API 进入画布"];
+                throw new GatewayError(code, 401, message);
+            }
+            // Passive reads never write activity. Concurrent activity can only move
+            // forwards; expiry can only shorten, and logout cannot be resurrected.
+            const updated = activity
+                ? db.query("UPDATE sessions SET last_active = MAX(last_active, ?), expires_at = MIN(expires_at, ?), user_json = ? WHERE hash = ? RETURNING *").get(activityAt, state.expires_at, JSON.stringify(state.user), session.hash) as SessionRow | null
+                : db.query("UPDATE sessions SET expires_at = MIN(expires_at, ?), user_json = ? WHERE hash = ? RETURNING *").get(state.expires_at, JSON.stringify(state.user), session.hash) as SessionRow | null;
+            if (!updated) throw new GatewayError("AUTH_REVOKED", 401, "画布会话已退出");
+            c.set("session", updated);
+            c.set("apiKey", await vault.open(session.credential, session.hash));
             void revokePending();
-            const [code, message] = grantFailures[state.reason || ""] || ["AUTH_REVOKED", "授权已失效，请重新从 New API 进入画布"];
-            throw new GatewayError(code, 401, message);
-        }
-        // Passive reads never write activity. Concurrent activity can only move
-        // forwards; expiry can only shorten, and logout cannot be resurrected.
-        const updated = activity
-            ? db.query("UPDATE sessions SET last_active = MAX(last_active, ?), expires_at = MIN(expires_at, ?), user_json = ? WHERE hash = ? RETURNING *").get(activityAt, state.expires_at, JSON.stringify(state.user), session.hash) as SessionRow | null
-            : db.query("UPDATE sessions SET expires_at = MIN(expires_at, ?), user_json = ? WHERE hash = ? RETURNING *").get(state.expires_at, JSON.stringify(state.user), session.hash) as SessionRow | null;
-        if (!updated) throw new GatewayError("AUTH_REVOKED", 401, "画布会话已退出");
-        c.set("session", updated);
-        c.set("apiKey", await vault.open(session.credential, session.hash));
-        void revokePending();
+        });
         await next();
     });
 
@@ -297,7 +312,7 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
     });
 
     app.get("/api/models", async (c) => {
-        const response = await gateway.relay("/v1/models", c.get("apiKey"), { signal: c.req.raw.signal });
+        const response = await measure(c, "upstream_headers", () => gateway.relay("/v1/models", c.get("apiKey"), { headers: { "X-Request-Id": c.get("requestId") }, signal: c.req.raw.signal }));
         if (redirectStatuses.has(response.status)) throw new GatewayError("GATEWAY_REDIRECT_REJECTED", 502, "网关不应重定向模型请求");
         return new Response(response.body, { status: response.status, headers: { "Content-Type": "application/json" } });
     });
@@ -310,12 +325,12 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         const session = c.get("session");
         const historyKind = kind === "media" && taskId.startsWith("asyncimg_") ? "images" : kind;
         const path = `/${historyKind}/${taskId}${artifact ? `/content/${artifact}` : ""}`;
-        const headers = new Headers();
+        const headers = new Headers({ "X-Request-Id": c.get("requestId") });
         for (const name of ["Range", "If-Range", "If-None-Match", "If-Modified-Since"]) {
             const value = c.req.header(name);
             if (value) headers.set(name, value);
         }
-        const response = await gateway.history(path, session.grant_id, { method: c.req.method, headers, signal: c.req.raw.signal });
+        const response = await measure(c, "upstream_headers", () => gateway.history(path, session.grant_id, { method: c.req.method, headers, signal: c.req.raw.signal }));
         if (redirectStatuses.has(response.status)) throw new GatewayError("GATEWAY_REDIRECT_REJECTED", 502, "授权内容桥不应重定向");
         const outbound = new Headers();
         for (const name of ["Content-Type", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "Retry-After"]) {
@@ -350,7 +365,7 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         const geminiSse = gemini?.[2] === "streamGenerateContent" && [...query.searchParams].length === 1 && query.searchParams.get("alt") === "sse";
         if (!allowed || query.search && !geminiSse) throw new GatewayError("AI_ENDPOINT_FORBIDDEN", 403, "画布不支持此模型接口或查询参数");
         const session = c.get("session");
-        const headers = new Headers();
+        const headers = new Headers({ "X-Request-Id": c.get("requestId") });
         // Construct an allowlist rather than copying any browser credential,
         // identity, channel, forwarding or application-proof header.
         for (const name of ["Content-Type", "Accept", "Range", "If-Range", "If-None-Match", "If-Modified-Since"]) {
@@ -364,34 +379,38 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         let body: ArrayBuffer | undefined;
         let model: string | undefined = gemini?.[1];
         if (post) {
-            const contentType = c.req.header("Content-Type") || "";
-            if (contentType.startsWith("multipart/form-data")) {
-                const form = await c.req.raw.clone().formData();
-                const value = form.get("model");
-                if (typeof value === "string") model = value;
-            } else if (contentType.startsWith("application/json")) {
-                const json = await c.req.raw.clone().json() as { model?: unknown };
-                if (gemini && json.model !== undefined && json.model !== model) throw new GatewayError("MODEL_MISMATCH", 400, "模型路径与请求参数不一致");
-                if (!gemini && typeof json.model === "string") model = json.model;
-            }
-            if (!model) throw new GatewayError("MODEL_REQUIRED", 400, "请选择要调用的模型");
-            const models = await gateway.relay("/v1/models", c.get("apiKey"), { signal: c.req.raw.signal });
-            if (!models.ok) return new Response(models.body, { status: models.status, headers: { "Content-Type": "application/json" } });
-            let listing: { data?: { id: string; supported_endpoint_types?: string[] }[] };
-            try { listing = await models.json() as typeof listing; } catch { throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关模型列表响应格式无效"); }
-            if (!listing || !Array.isArray(listing.data)) throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关模型列表响应格式无效");
-            const selected = listing.data.find((entry) => entry.id === model);
-            if (!selected) throw new GatewayError("MODEL_FORBIDDEN", 403, "当前用户无权调用此模型");
-            const endpoint = gemini ? "gemini" : path.includes("/images/") ? "image-generation" : path.includes("/videos") ? "openai-video" : path === "/v1/responses" ? "openai-response" : "openai";
-            // Audio has no separate endpoint metadata in the current gateway;
-            // retain its OpenAI category and let the gateway validate audio
-            // protocol support. Never turn a model-name guess into permission.
-            if (!Array.isArray(selected.supported_endpoint_types) || !selected.supported_endpoint_types.includes(endpoint)) throw new GatewayError("MODEL_ENDPOINT_FORBIDDEN", 403, "当前模型不支持所选调用接口");
+            const rejected = await measure(c, "model_validation", async () => {
+                const contentType = c.req.header("Content-Type") || "";
+                if (contentType.startsWith("multipart/form-data")) {
+                    const form = await c.req.raw.clone().formData();
+                    const value = form.get("model");
+                    if (typeof value === "string") model = value;
+                } else if (contentType.startsWith("application/json")) {
+                    const json = await c.req.raw.clone().json() as { model?: unknown };
+                    if (gemini && json.model !== undefined && json.model !== model) throw new GatewayError("MODEL_MISMATCH", 400, "模型路径与请求参数不一致");
+                    if (!gemini && typeof json.model === "string") model = json.model;
+                }
+                if (!model) throw new GatewayError("MODEL_REQUIRED", 400, "请选择要调用的模型");
+                const models = await gateway.relay("/v1/models", c.get("apiKey"), { headers: { "X-Request-Id": c.get("requestId") }, signal: c.req.raw.signal });
+                if (!models.ok) return new Response(models.body, { status: models.status, headers: { "Content-Type": "application/json" } });
+                let listing: { data?: { id: string; supported_endpoint_types?: string[] }[] };
+                try { listing = await models.json() as typeof listing; } catch { throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关模型列表响应格式无效"); }
+                if (!listing || !Array.isArray(listing.data)) throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关模型列表响应格式无效");
+                const selected = listing.data.find((entry) => entry.id === model);
+                if (!selected) throw new GatewayError("MODEL_FORBIDDEN", 403, "当前用户无权调用此模型");
+                const endpoint = gemini ? "gemini" : path.includes("/images/") ? "image-generation" : path.includes("/videos") ? "openai-video" : path === "/v1/responses" ? "openai-response" : "openai";
+                // Audio has no separate endpoint metadata in the current gateway;
+                // retain its OpenAI category and let the gateway validate audio
+                // protocol support. Never turn a model-name guess into permission.
+                if (!Array.isArray(selected.supported_endpoint_types) || !selected.supported_endpoint_types.includes(endpoint)) throw new GatewayError("MODEL_ENDPOINT_FORBIDDEN", 403, "当前模型不支持所选调用接口");
+            });
+            if (rejected) return rejected;
             body = await c.req.raw.arrayBuffer();
         }
         let response: Response;
         try {
-            response = await gateway.relay(path + query.search, c.get("apiKey"), { method: c.req.method, headers, body, signal: c.req.raw.signal });
+            // Fetch resolves at headers; do not consume or delay SSE for timing.
+            response = await measure(c, "upstream_headers", () => gateway.relay(path + query.search, c.get("apiKey"), { method: c.req.method, headers, body, signal: c.req.raw.signal }));
         } catch {
             throw new GatewayError("EXECUTION_UNKNOWN", 502, "请求结果未知，请查询原任务，不要重复提交付费请求");
         }
@@ -408,7 +427,7 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
             throw new GatewayError("GATEWAY_REDIRECT_REJECTED", 502, "网关重定向已被阻止，请查询原任务");
         }
         const outbound = new Headers();
-        for (const name of ["Content-Type", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "X-Request-Id", "Retry-After"]) {
+        for (const name of ["Content-Type", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "Retry-After"]) {
             const value = response.headers.get(name);
             if (value) outbound.set(name, value);
         }

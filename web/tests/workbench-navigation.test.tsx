@@ -10,9 +10,10 @@ import { mockBrowserDocuments } from "./local-document-fixture";
 import { mockBrowserFiles } from "./local-file-fixture";
 import i18n from "@/i18n";
 import { endCanvasSession, readCanvasSession } from "@/services/api/canvas-client";
-import { getDocumentDraft, readDocument, retryDocument } from "@/services/canvas-data";
+import { getDocumentDraft, readDocument, retryDocument, writeDocument } from "@/services/canvas-data";
 import { readStoredImage } from "@/services/image-storage";
 import * as imageStorage from "@/services/image-storage";
+import * as imageApi from "@/services/api/image";
 import * as fileStorage from "@/services/file-storage";
 import { defaultConfig, useConfigStore } from "@/stores/use-config-store";
 import { useWorkbenchHistoryFilterStore } from "@/stores/use-workbench-history-filter-store";
@@ -20,6 +21,7 @@ import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { deleteVideoGenerationLogs } from "@/pages/video/generation-log";
+import { runSiteTool } from "@/lib/agent/agent-site-tools";
 
 const originalFetch = globalThis.fetch;
 const originalAdapter = axios.defaults.adapter;
@@ -714,4 +716,194 @@ test("clearing result selection or switching history never keeps hidden images s
     expect(container!.querySelector<HTMLInputElement>(`input[aria-label="${i18n.t("resultToCanvas.selectResult", { count: 1 })}"]`)!.checked).toBe(false);
     expect(requests.filter((request) => request.path === "/api/data/canvas" && request.method !== "GET")).toEqual([]);
     expect(requests.filter((request) => request.method === "POST" || request.method === "DELETE")).toEqual([]);
+});
+
+type SavedImageLog = { id: string; status: string; imageCount: number; requestCount: number; successCount: number; failCount: number; recoverableCount: number; imageTaskRecordIds: string[]; recoverableRecordIds: string[]; images: { id: string; storageKey: string }[] };
+function newImageLog() {
+    return Object.values(documents["image-workbench"].value as Record<string, SavedImageLog>).find((item) => !["alpha", "beta"].includes(item.id))!;
+}
+
+test.each(["history", "new-session", "cancel"])("result references reuse local media and discard late completion after %s", async (change) => {
+    const pending = Promise.withResolvers<string>();
+    const resolveUrl = spyOn(imageStorage, "resolveImageUrl");
+    const upload = spyOn(imageStorage, "uploadImage");
+    documents["image-workbench"].value = { alpha: { ...log("alpha", "old prompt"), images: [{ id: "original", storageKey: "image:original", dataUrl: "", width: 100, height: 100, bytes: 4, durationMs: 0 }] }, beta: log("beta", "new prompt", "failed") };
+    try {
+        const router = await renderPage("/image?log=alpha");
+        resolveUrl.mockImplementationOnce(() => pending.promise);
+        await click("imageWorkbench.addReference");
+        const generate = [...container!.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === i18n.t("workbench.generate"))!;
+        expect(generate.disabled).toBe(true);
+        expect(upload).not.toHaveBeenCalled();
+        if (change === "history") await act(async () => router.navigate("/image?log=beta"));
+        else await click(change === "new-session" ? "workbench.new" : "common.cancel");
+        await act(async () => pending.resolve("blob:old-result"));
+        expect(Boolean(container!.querySelector('img[alt="result-1.png"]'))).toBe(false);
+        expect(upload).not.toHaveBeenCalled();
+    } finally { resolveUrl.mockRestore(); upload.mockRestore(); }
+});
+
+test.each(["image", "video"])("%s asset reference import shares busy state, reuses the file and cancels on new history", async (page) => {
+    const pending = Promise.withResolvers<string>();
+    const resolveUrl = spyOn(imageStorage, "resolveImageUrl");
+    const upload = spyOn(imageStorage, "uploadImage");
+    useAssetStore.setState({ hydrated: true, assets: [{ id: "picked", kind: "image", title: "saved-reference", coverUrl: "", tags: [], data: { storageKey: "image:picked", dataUrl: "blob:existing", width: 20, height: 10, bytes: 4, mimeType: "image/png" }, createdAt: "2026-01-01", updatedAt: "2026-01-01" }] });
+    try {
+        const router = await renderPage(`/${page}?log=alpha`);
+        await click("workbench.viewAssets");
+        resolveUrl.mockImplementationOnce(() => pending.promise);
+        const card = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((button) => button.textContent?.includes("saved-reference"))!;
+        await act(async () => card.click());
+        expect(container!.textContent).toContain(i18n.t("workbench.importingReferences"));
+        expect(upload).not.toHaveBeenCalled();
+        await act(async () => router.navigate(`/${page}?log=beta`));
+        await act(async () => pending.resolve("blob:picked"));
+        expect(Boolean(container!.querySelector('img[alt="saved-reference"]'))).toBe(false);
+        expect(upload).not.toHaveBeenCalled();
+    } finally { resolveUrl.mockRestore(); upload.mockRestore(); }
+});
+
+test("one image request keeps every returned image, links its intent before payment and saves an asset once", async () => {
+    let uploadCount = 0, modelCalls = 0;
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async () => importedImage(`returned-${++uploadCount}`));
+    axios.defaults.adapter = async (request) => {
+        modelCalls += 1;
+        expect(newImageLog().imageTaskRecordIds).toEqual(Object.keys(documents["image-tasks"].value as object));
+        expect(newImageLog().imageTaskRecordIds).toHaveLength(1);
+        return { config: request, status: 200, statusText: "OK", headers: {}, data: { data: [{ b64_json: "Zmlyc3Q=" }, { b64_json: "c2Vjb25k" }] } };
+    };
+    documents.assets = { value: { state: { assets: [] }, version: 0 }, revision: 1 };
+    try {
+        await useAssetStore.persist.rehydrate();
+        await renderPage("/image?log=alpha");
+        await click("workbench.generate");
+        expect(modelCalls).toBe(1);
+        expect(uploadCount).toBe(2);
+        expect(newImageLog()).toMatchObject({ status: "success", imageCount: 2, successCount: 2, requestCount: 1, failCount: 0, recoverableCount: 0, recoverableRecordIds: [] });
+        expect(newImageLog().images.map((image) => image.storageKey)).toEqual(["image:returned-1", "image:returned-2"]);
+        await selectAllResults();
+        expect(container!.textContent).toContain(i18n.t("resultToCanvas.selectedCount", { count: 2 }));
+        const adding = Promise.withResolvers<Response>();
+        const transport = globalThis.fetch;
+        globalThis.fetch = (async (input, init) => String(input) === "/api/data/assets" && init?.method === "PUT" ? transport(input, init).then((response) => adding.promise.then(() => response)) : transport(input, init)) as typeof fetch;
+        const add = [...container!.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === i18n.t("common.addToAssets"))!;
+        await act(async () => { add.click(); add.click(); });
+        expect(add.classList.contains("ant-btn-loading")).toBe(true);
+        await act(async () => adding.resolve(new Response()));
+        expect(add.disabled).toBe(true);
+        expect(add.textContent).toBe(i18n.t("common.addedToAssets"));
+        await act(async () => add.click());
+        expect(useAssetStore.getState().assets).toHaveLength(1);
+        expect(uploadCount).toBe(2);
+        expect(modelCalls).toBe(1);
+    } finally { upload.mockRestore(); }
+});
+
+test.each(["network", "local-media", "rejection"])("image history distinguishes %s from a definite failed request", async (failure) => {
+    const upload = spyOn(imageStorage, "uploadImage").mockRejectedValue(new Error("local quota reached"));
+    let calls = 0;
+    axios.defaults.adapter = async (request) => {
+        calls += 1;
+        expect(newImageLog().imageTaskRecordIds).toHaveLength(1);
+        if (failure === "network") throw new axios.AxiosError("response lost", "ERR_NETWORK", request);
+        if (failure === "rejection") throw new axios.AxiosError("rejected", "ERR_BAD_REQUEST", request, undefined, { config: request, status: 400, statusText: "Bad Request", headers: {}, data: { error: { message: "rejected" } } });
+        return { config: request, status: 200, statusText: "OK", headers: {}, data: { data: [{ b64_json: "aW1hZ2U=" }] } };
+    };
+    try {
+        const router = await renderPage("/image?log=alpha");
+        await click("workbench.generate");
+        const saved = newImageLog();
+        expect(saved).toMatchObject({ status: failure === "rejection" ? "failed" : "attention", failCount: failure === "rejection" ? 1 : 0, recoverableCount: failure === "rejection" ? 0 : 1, requestCount: 1, imageCount: 0 });
+        expect(saved.recoverableRecordIds).toEqual(failure === "rejection" ? [] : saved.imageTaskRecordIds);
+        await act(async () => router.navigate(`/image?log=${saved.id}`));
+        expect(calls).toBe(1);
+        if (failure !== "rejection") expect(container!.textContent).toContain(i18n.t("managed.imageTaskUnknown"));
+    } finally { upload.mockRestore(); }
+});
+
+test("a delayed image intent cannot save the previous account's prompt into the next account", async () => {
+    const intent = Promise.withResolvers<void>();
+    let paidCalls = 0, intentError: unknown;
+    const generation = spyOn(imageApi, "requestGeneration").mockImplementation(async (_config, _prompt, options) => {
+        await intent.promise;
+        try { await options?.onIntentSaved?.("alice-intent"); }
+        catch (error) { intentError = error; throw error; }
+        paidCalls += 1;
+        return [];
+    });
+    try {
+        await renderPage("/image?log=alpha");
+        await click("workbench.generate");
+        expect(generation).toHaveBeenCalledTimes(1);
+        const transport = globalThis.fetch;
+        globalThis.fetch = (async (input, init) => String(input) === "/api/session" ? Response.json({ ...session, user: { id: 2, subject: `ics_${"b".repeat(32)}`, username: "bob" }, session_tag: "bob-session" }) : transport(input, init)) as typeof fetch;
+        const bobHistory = { bob: log("bob", "bob's private history") };
+        await act(async () => {
+            endCanvasSession();
+            documents["image-workbench"] = { value: bobHistory, revision: 1 };
+            await readCanvasSession();
+        });
+        const afterSwitch = requests.length;
+        await act(async () => intent.resolve());
+        expect(intentError).toBeInstanceOf(Error);
+        expect((intentError as Error).message).toBe(i18n.t("saveRecovery.sessionChanged"));
+        expect(paidCalls).toBe(0);
+        expect(documents["image-workbench"].value).toEqual(bobHistory);
+        expect(requests.slice(afterSwitch).filter((request) => request.path === "/api/data/image-workbench" && request.method === "PUT")).toEqual([]);
+        expect(getDocumentDraft("image-workbench")).toBeUndefined();
+    } finally { intent.resolve(); generation.mockRestore(); }
+});
+
+test("a partial image result preserves its exact recovery record and reports attention to the agent", async () => {
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async () => importedImage("partial"));
+    const generation = spyOn(imageApi, "requestGeneration").mockImplementation(async (_config, _prompt, options) => {
+        documents["image-tasks"].value = { partial: { id: "partial", task_id: null, status: "partial", value: { batch: { total: 2, completed: 2, failed: 0, unknown: 1 }, result: { data: [{ b64_json: "aW1hZ2U=" }] } } } };
+        await options?.onIntentSaved?.("partial");
+        options?.onPartial?.({ total: 2, completed: 2, failed: 0, unknown: 1 });
+        return [{ id: "image", dataUrl: "data:image/png;base64,aW1hZ2U=" }];
+    });
+    useWorkbenchAgentStore.setState({ imageCommand: null, tasks: [] });
+    try {
+        await renderPage("/image?log=alpha");
+        let taskId: string | undefined;
+        await act(async () => { taskId = useWorkbenchAgentStore.getState().dispatchImage({ prompt: "partial image", run: true }); });
+        expect(newImageLog()).toMatchObject({ status: "attention", imageCount: 1, failCount: 0, recoverableCount: 1, imageTaskRecordIds: ["partial"], recoverableRecordIds: ["partial"] });
+        expect(useWorkbenchAgentStore.getState().tasks.find((task) => task.id === taskId)?.status).toBe("attention");
+        const status = await runSiteTool("generation_get_status", { taskId }, () => {});
+        expect(status).toMatchObject({ summary: { running: 0, attention: 1, failed: 0 } });
+        expect(generation).toHaveBeenCalledTimes(1);
+    } finally { generation.mockRestore(); upload.mockRestore(); }
+});
+
+test("advanced image settings are collapsed without hiding the common ratio, resolution and count controls", async () => {
+    await renderPage("/image?log=alpha");
+    const details = container!.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(details.textContent).toContain(i18n.t("settingsPanels.image.quality"));
+    expect(details.textContent).toContain(i18n.t("settingsPanels.image.transparent"));
+    expect(details.textContent).not.toContain(i18n.t("settingsPanels.image.resolution"));
+    expect(details.textContent).not.toContain(i18n.t("settingsPanels.image.aspectRatio"));
+    expect(details.textContent).not.toContain(i18n.t("settingsPanels.image.count"));
+    await act(async () => details.querySelector("summary")!.click());
+    expect(details.open).toBe(true);
+});
+
+test.each(["succeeded", "partial", "deleted"])("explicit result recovery updates only its linked images and preserves %s history semantics", async (state) => {
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async () => importedImage("recovered"));
+    const media = (id: string, task: string) => ({ id, imageTaskRecordId: task, storageKey: `image:${id}`, dataUrl: "", width: 20, height: 10, bytes: 4, durationMs: 0 });
+    documents["image-workbench"].value = { alpha: { ...log("alpha", "recover my result", "attention"), requestCount: 2, recoverableCount: 1, failCount: state === "partial" ? 1 : 0, imageTaskRecordIds: ["sibling", "primary"], recoverableRecordIds: ["primary"], images: [media("sibling-result", "sibling"), media("old-primary", "primary")] } };
+    documents["image-tasks"].value = { primary: { id: "primary", task_id: null, status: state === "partial" ? "partial" : "succeeded", value: { ...(state === "partial" ? { batch: { total: 3, completed: 3, failed: 1, unknown: 1 } } : {}), result: { data: [{ b64_json: "aW1hZ2U=" }] } } } };
+    try {
+        await renderPage("/image?task=primary");
+        if (state === "deleted") await act(async () => { await writeDocument("image-workbench", {}); });
+        await click("managed.viewResults");
+        const records = documents["image-workbench"].value as Record<string, SavedImageLog>;
+        if (state === "deleted") expect(Object.keys(records)).toEqual([]);
+        else {
+            expect(records.alpha.images.map((image) => image.storageKey)).toEqual(["image:sibling-result", "image:recovered"]);
+            expect(records.alpha).toMatchObject({ imageCount: 2, status: state === "partial" ? "attention" : "success", recoverableCount: state === "partial" ? 1 : 0, recoverableRecordIds: state === "partial" ? ["primary"] : [], failCount: state === "partial" ? 1 : 0 });
+        }
+        expect(upload).toHaveBeenCalledTimes(1);
+        expect(requests.some((request) => request.path.startsWith("/api/ai/") && request.method === "POST")).toBe(false);
+    } finally { upload.mockRestore(); }
 });

@@ -51,7 +51,7 @@ export const SITE_TOOL_LABELS: Record<SiteToolName, string> = {
 
 type SiteToolInput = Record<string, unknown>;
 type SiteToolContext = { canvasSnapshot?: CanvasAgentSnapshot | null };
-type GenerationStatus = "idle" | "queued" | "running" | "succeeded" | "failed";
+type GenerationStatus = "idle" | "queued" | "running" | "succeeded" | "failed" | "attention";
 type GenerationStatusItem = { id: string; source: "canvas" | "image" | "video"; status: GenerationStatus; kind?: string; title?: string; prompt?: string; projectId?: string; createdAt?: string; updatedAt?: string; successCount?: number; failCount?: number; error?: string };
 
 export async function runSiteTool(name: SiteToolName, input: SiteToolInput, navigate: NavigateFunction, context: SiteToolContext = {}): Promise<unknown> {
@@ -107,7 +107,7 @@ function getGenerationStatus(input: SiteToolInput, canvasSnapshot?: CanvasAgentS
     }
 
     tasks.sort((a, b) => generationStatusOrder(a.status) - generationStatusOrder(b.status) || (b.updatedAt || "").localeCompare(a.updatedAt || ""));
-    const summary: Record<GenerationStatus, number> = { idle: 0, queued: 0, running: 0, succeeded: 0, failed: 0 };
+    const summary: Record<GenerationStatus, number> = { idle: 0, queued: 0, running: 0, succeeded: 0, failed: 0, attention: 0 };
     tasks.forEach((task) => (summary[task.status] += 1));
     return { total: tasks.length, summary, tasks: tasks.slice(0, limit) };
 }

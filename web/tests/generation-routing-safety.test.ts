@@ -1,11 +1,12 @@
 import "./browser";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
 import { mockBrowserDocuments } from "./local-document-fixture";
 import { endCanvasSession, readCanvasSession } from "@/services/api/canvas-client";
 import { ImageGenerationUncertainError, requestAsyncImageGeneration, requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
 import { createVideoGenerationTask, pollVideoGenerationTask } from "@/services/api/video";
 import { readImageTaskRecords } from "@/services/image-task-records";
+import { startGenerationRequest } from "@/services/generation-diagnostics";
 import { defaultConfig, resolveModelForCapability, supportsAsyncImageGeneration, useConfigStore, type AiConfig } from "@/stores/use-config-store";
 
 const originalFetch = globalThis.fetch;
@@ -14,6 +15,7 @@ const session = { user: { id: 1, subject: `ics_${"a".repeat(32)}`, username: "ro
 let documents: Record<string, { value: unknown; revision: number }>;
 let fixture: ReturnType<typeof mockBrowserDocuments>;
 const requests: string[] = [];
+const requestId = "d1b198aa-7c88-4fbc-8be8-8a5bc434f946";
 
 function configure(endpoints: string[], name = "gemini-image"): AiConfig {
     const model = `gateway::${name}`;
@@ -24,7 +26,7 @@ function configure(endpoints: string[], name = "gemini-image"): AiConfig {
 
 function response(request: InternalAxiosRequestConfig, data: unknown) {
     requests.push(`${request.method?.toUpperCase()} ${request.url}`);
-    return { config: request, data, status: 200, statusText: "OK", headers: {} };
+    return { config: request, data, status: 200, statusText: "OK", headers: { "X-Request-Id": requestId } };
 }
 
 beforeEach(async () => {
@@ -58,12 +60,13 @@ test.each([408, 500, 504, 400, 429])("synchronous HTTP %i distinguishes unknown 
     const config = configure(["image-generation"]);
     axios.defaults.adapter = async (request) => {
         requests.push(`POST ${request.url}`);
-        throw new AxiosError("upstream response", "ERR_BAD_RESPONSE", request, undefined, { config: request, status, statusText: "Error", headers: {}, data: { error: { message: "upstream response" } } });
+        throw new AxiosError("upstream response", "ERR_BAD_RESPONSE", request, undefined, { config: request, status, statusText: "Error", headers: { "X-Request-Id": requestId }, data: { error: { message: "upstream response" } } });
     };
     const error = await requestGeneration(config, "draw").catch((error) => error);
     const unknown = status === 408 || status >= 500;
     expect(error instanceof ImageGenerationUncertainError).toBe(unknown);
     expect(Object.values(await readImageTaskRecords()).map((record) => record.status)).toEqual([unknown ? "execution_unknown" : "failed"]);
+    expect(Object.values(await readImageTaskRecords())[0].value.requests).toEqual([{ requestId, durationMs: expect.any(Number) }]);
     expect(requests).toEqual(["POST /api/ai/v1/images/generations"]);
 });
 
@@ -72,6 +75,7 @@ test.each(["generation", "edit", "gemini"])("an unreadable successful %s respons
     axios.defaults.adapter = async (request) => response(request, { request_id: "accepted-with-unreadable-result" });
     await expect(kind === "edit" ? requestEdit(config, "edit", []) : requestGeneration(config, "draw")).rejects.toBeInstanceOf(ImageGenerationUncertainError);
     expect(Object.values(await readImageTaskRecords()).map((record) => record.status)).toEqual(["execution_unknown"]);
+    expect(Object.values(await readImageTaskRecords())[0].value.requests).toEqual([{ requestId, durationMs: expect.any(Number) }]);
     expect(requests).toHaveLength(1);
 });
 
@@ -79,11 +83,12 @@ test.each([408, 504])("asynchronous HTTP %i keeps the original intent and never 
     const config = configure(["image-generation"]);
     globalThis.fetch = (async (url, init) => {
         requests.push(`${init?.method} ${url}`);
-        return Response.json({ error: { message: "upstream timeout" } }, { status });
+        return Response.json({ error: { message: "upstream timeout" } }, { status, headers: { "X-Request-Id": requestId } });
     }) as typeof fetch;
     await expect(requestAsyncImageGeneration(config, "draw", [], "same-intent")).rejects.toBeInstanceOf(ImageGenerationUncertainError);
     await expect(requestAsyncImageGeneration(config, "draw", [], "same-intent")).rejects.toBeInstanceOf(ImageGenerationUncertainError);
     expect((await readImageTaskRecords())["same-intent"].status).toBe("execution_unknown");
+    expect((await readImageTaskRecords())["same-intent"].value.requests).toEqual([{ requestId, durationMs: expect.any(Number) }]);
     expect(requests).toEqual(["POST /api/ai/v1/images/generations_async"]);
 });
 
@@ -94,8 +99,72 @@ test.each([
     const config = configure(endpoints);
     axios.defaults.adapter = async (request) => response(request, request.url?.includes("v1beta") ? { candidates: [{ content: { parts: [{ inlineData: { data: "aW1hZ2U=", mimeType: "image/png" } }] } }] } : { data: [{ b64_json: "aW1hZ2U=" }] });
     expect(await requestGeneration(config, "draw")).toHaveLength(1);
+    expect(Object.values(await readImageTaskRecords())[0].value.requests).toEqual([{ requestId, durationMs: expect.any(Number) }]);
     expect(requests).toEqual([`POST ${path}`]);
     expect(supportsAsyncImageGeneration(config, config.model)).toBe(endpoints.includes("image-generation"));
+});
+
+test("request measurements accept only BFF UUIDs and elapsed time", () => {
+    const clock = spyOn(performance, "now");
+    try {
+        clock.mockReturnValue(100);
+        const finish = startGenerationRequest();
+        clock.mockReturnValue(125);
+        expect(finish(requestId)).toEqual({ requestId, durationMs: 25 });
+        for (const value of ["private-token-value", "Bearer secret", { requestId }, null, undefined]) expect(finish(value)).toEqual({ durationMs: 25 });
+    } finally { clock.mockRestore(); }
+});
+
+test.each(["generation", "edit", "gemini"])("successful %s measurements share the existing result save", async (kind) => {
+    const config = configure(kind === "gemini" ? ["gemini"] : ["image-generation"]);
+    axios.defaults.adapter = async (request) => response(request, kind === "gemini" ? { candidates: [{ content: { parts: [{ inlineData: { data: "aW1hZ2U=" } }] } }] } : { data: [{ b64_json: "aW1hZ2U=" }] });
+    await (kind === "edit" ? requestEdit(config, "private-prompt-value", []) : requestGeneration(config, "private-prompt-value"));
+    const measurement = Object.values(await readImageTaskRecords())[0].value.requests;
+    expect(measurement).toEqual([{ requestId, durationMs: expect.any(Number) }]);
+    expect(measurement![0].durationMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(measurement)).not.toContain("private-prompt-value");
+    expect(documents["image-tasks"].revision).toBe(2);
+});
+
+test("Gemini batch measurements survive each partial result save without extra writes", async () => {
+    const config = { ...configure(["gemini"]), count: "2" };
+    axios.defaults.adapter = async (request) => response(request, { candidates: [{ content: { parts: [{ inlineData: { data: "aW1hZ2U=" } }] } }] });
+    expect(await requestGeneration(config, "draw")).toHaveLength(2);
+    expect(Object.values(await readImageTaskRecords())[0].value.requests).toEqual(Array.from({ length: 2 }, () => ({ requestId, durationMs: expect.any(Number) })));
+    expect(documents["image-tasks"].revision).toBe(3);
+    expect(requests).toHaveLength(2);
+});
+
+test.each([false, true])("async edit=%s measurements include JSON completion and share the task save", async (edit) => {
+    const config = configure(["image-generation"]);
+    const clock = spyOn(performance, "now");
+    try {
+        clock.mockReturnValue(100);
+        globalThis.fetch = (async (url, init) => {
+            requests.push(`${init?.method} ${url}`);
+            clock.mockReturnValue(150);
+            const accepted = Response.json({ task_id: "asyncimg_measured" }, { status: 202, headers: { "X-Request-Id": requestId } });
+            const json = accepted.json.bind(accepted);
+            accepted.json = async () => { clock.mockReturnValue(300); return json(); };
+            return accepted;
+        }) as typeof fetch;
+        const references = edit ? [{ id: "reference", name: "reference.png", type: "image/png", dataUrl: "data:image/png;base64,aW1hZ2U=" }] : [];
+        expect(await requestAsyncImageGeneration(config, "private-prompt-value", references, "measured-intent")).toBe("asyncimg_measured");
+        expect((await readImageTaskRecords())["measured-intent"].value.requests).toEqual([{ requestId, durationMs: 200 }]);
+        expect(documents["image-tasks"].revision).toBe(2);
+        expect(requests).toEqual([`POST /api/ai/v1/images/${edit ? "edits" : "generations"}_async`]);
+    } finally { clock.mockRestore(); }
+});
+
+test.each([false, true])("network failure async=%s records elapsed time without inventing a request ID", async (asyncRequest) => {
+    const config = configure(["image-generation"]);
+    axios.defaults.adapter = async (request) => { throw new AxiosError("private-network-message", "ERR_NETWORK", request); };
+    globalThis.fetch = (async () => { throw new TypeError("private-network-message"); }) as typeof fetch;
+    await expect(asyncRequest ? requestAsyncImageGeneration(config, "draw", [], "network-intent") : requestGeneration(config, "draw")).rejects.toBeInstanceOf(ImageGenerationUncertainError);
+    const record = Object.values(await readImageTaskRecords())[0];
+    expect(record.status).toBe("execution_unknown");
+    expect(record.value.requests).toEqual([{ durationMs: expect.any(Number) }]);
+    expect(documents["image-tasks"].revision).toBe(2);
 });
 
 test.each([

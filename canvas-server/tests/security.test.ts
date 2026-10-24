@@ -251,6 +251,63 @@ describe("Canvas authorization and owner isolation", () => {
         expect(f.calls.find((call) => call.path.includes("streamGenerateContent"))?.url).toBe("http://new-api.internal/v1beta/models/allowed-gemini:streamGenerateContent?alt=sse");
     });
 
+    test("correlates model stages with a fresh server request ID without exposing request or upstream header content", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        f.intercept((path) => path === "/v1/images/generations" ? Response.json({ data: [{ b64_json: "aW1hZ2U=" }] }, { headers: { "X-Request-Id": "private-upstream-value", "Server-Timing": 'private;desc="upstream-content"' } }) : undefined);
+        const previousCalls = f.calls.length;
+        const response = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations`, { method: "POST", headers: { ...headers(f, a), "X-Request-Id": "client-controlled-value" }, body: JSON.stringify({ model: "allowed-image", prompt: "private-prompt-value" }) });
+        expect(response.status).toBe(200);
+        const requestId = response.headers.get("X-Request-Id");
+        expect(requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+        expect(response.headers.get("Server-Timing")).toMatch(/^authorization;dur=\d+\.\d{2}, model_validation;dur=\d+\.\d{2}, upstream_headers;dur=\d+\.\d{2}$/);
+        const calls = f.calls.slice(previousCalls);
+        expect(calls.map((call) => call.path)).toEqual(["/api/integrations/canvas/introspect", "/v1/models", "/v1/images/generations"]);
+        for (const call of calls) expect(new Headers(call.init?.headers).get("X-Request-Id")).toBe(requestId);
+        const observable = JSON.stringify({ headers: Object.fromEntries(response.headers), audit: f.auditEvents });
+        for (const secret of ["private-upstream-value", "upstream-content", "client-controlled-value", "private-prompt-value", "ic_server-key", f.config.clientSecret, a.csrf]) expect(observable).not.toContain(secret);
+        const models = await f.app.request(`${f.config.origin}/api/models`, { headers: { Cookie: a.cookie } });
+        expect(models.headers.get("X-Request-Id")).not.toBe(requestId);
+        expect(models.headers.get("Server-Timing")).toMatch(/^authorization;dur=\d+\.\d{2}, upstream_headers;dur=\d+\.\d{2}$/);
+    });
+
+    test("exposes only stages reached before authorization or model rejection", async () => {
+        const f = setup();
+        const path = `${f.config.origin}/api/ai/v1/images/generations`;
+        const denied = await f.app.request(path, { method: "POST", headers: { Origin: f.config.origin, "X-Request-Id": "client-controlled-value" } });
+        expect(denied.status).toBe(401);
+        expect(denied.headers.get("X-Request-Id")).toMatch(/^[0-9a-f-]{36}$/);
+        expect(denied.headers.get("Server-Timing")).toMatch(/^authorization;dur=\d+\.\d{2}$/);
+        expect(f.calls).toHaveLength(0);
+        const a = await login(f, 1);
+        const forbidden = await f.app.request(path, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "private-forbidden-model", prompt: "private-prompt-value" }) });
+        expect(forbidden.status).toBe(403);
+        expect(forbidden.headers.get("X-Request-Id")).not.toBe(denied.headers.get("X-Request-Id"));
+        expect(forbidden.headers.get("Server-Timing")).toMatch(/^authorization;dur=\d+\.\d{2}, model_validation;dur=\d+\.\d{2}$/);
+        expect(f.calls.some((call) => call.path === "/v1/images/generations")).toBe(false);
+        const observable = JSON.stringify({ denied: await denied.json(), forbidden: await forbidden.json(), headers: Object.fromEntries(forbidden.headers), audit: f.auditEvents });
+        for (const secret of ["client-controlled-value", "private-forbidden-model", "private-prompt-value", "ic_server-key", f.config.clientSecret, a.csrf]) expect(observable).not.toContain(secret);
+    });
+
+    test("returns timing and SSE headers before the upstream stream ends", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        let upstream!: ReadableStreamDefaultController<Uint8Array>;
+        f.intercept((path) => path === "/v1/responses" ? new Response(new ReadableStream<Uint8Array>({ start(controller) {
+            upstream = controller;
+            controller.enqueue(new TextEncoder().encode('data: {"delta":"first"}\n\n'));
+        } }), { headers: { "Content-Type": "text/event-stream" } }) : undefined);
+        const response = await f.app.request(`${f.config.origin}/api/ai/v1/responses`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-text", stream: true }) });
+        expect(response.status).toBe(200);
+        expect(response.headers.get("Content-Type")).toBe("text/event-stream");
+        expect(response.headers.get("Server-Timing")).toMatch(/upstream_headers;dur=\d+\.\d{2}$/);
+        const reader = response.body!.getReader();
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain("first");
+        upstream.close();
+        expect((await reader.read()).done).toBe(true);
+        expect(f.calls.filter((call) => call.path === "/v1/responses")).toHaveLength(1);
+    });
+
     test("forwards original task IDs through New API ownership checks and never retries unknown paid execution", async () => {
         const f = setup();
         const a = await login(f, 1);
@@ -263,6 +320,8 @@ describe("Canvas authorization and owner isolation", () => {
         f.failPaid();
         const failed = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-image", prompt: "image" }) });
         expect(failed.status).toBe(502);
+        expect(failed.headers.get("X-Request-Id")).toMatch(/^[0-9a-f-]{36}$/);
+        expect(failed.headers.get("Server-Timing")).toMatch(/upstream_headers;dur=\d+\.\d{2}$/);
         expect(f.calls.filter((call) => call.path === "/v1/images/generations")).toHaveLength(1);
         expect((await failed.json()).error.code).toBe("EXECUTION_UNKNOWN");
         expect(existsSync(join(f.directory, "files"))).toBe(false);

@@ -139,7 +139,8 @@ test.each([false, true])("local batch writes update the image panel without mode
         document.body.append(container);
         root = createRoot(container);
         await act(async () => root!.render(<ConfigProvider theme={{ token: { motion: false } }}><App><ImageTaskPanel revision={0} onOpen={async (images) => { opened.push(...images.map((image) => image.dataUrl)); }} /></App></ConfigProvider>));
-        expect(container.textContent).toContain(i18n.t("managed.taskRunning"));
+        expect(container.textContent).toContain(i18n.t("managed.taskAttention", { defaultValue: "需处理" }));
+        expect(container.textContent).not.toContain(i18n.t("managed.taskRunning"));
         expect(container.textContent).toContain(i18n.t("managed.imageBatchIncompleteNotice"));
         expect(container.textContent).toContain(i18n.t("managed.imageBatchSummary", started.value.batch));
         expect(container.textContent).not.toContain(i18n.t("managed.taskReady"));
@@ -249,7 +250,9 @@ test("continuing a task is deduplicated and its returned status replaces the row
     expect(resume).toHaveBeenCalledTimes(1);
     expect(resume).toHaveBeenCalledWith(record);
     expect(button("tasks.refresh").disabled).toBe(true);
+    load.mockResolvedValue({ items: [{ ...record, status: "completed", canResume: false }], errors: {} });
     await act(async () => complete({ ...record, status: "completed", canResume: false }));
+    expect(load).toHaveBeenCalledTimes(2);
     expect(container!.textContent).toContain(i18n.t("tasks.status.completed"));
     expect([...container!.querySelectorAll("button")].some((element) => element.textContent === i18n.t("tasks.resume"))).toBe(false);
     expect(button("tasks.refresh").disabled).toBe(false);
@@ -310,4 +313,57 @@ test("session changes clear private rows and discard late task results", async (
     await act(async () => complete({ ...record, title: "PRIVATE OLD RESULT", status: "completed" }));
     expect(container!.textContent).not.toContain("PRIVATE OLD RESULT");
     expect(container!.querySelectorAll("[data-task-id]")).toHaveLength(0);
+});
+
+test("image-task filters find grouped history and child actions refresh the complete group", async () => {
+    const child = item();
+    const parent = item({ id: "image-log:parent", recordId: "parent", source: "image-workbench", status: "attention", title: "recover history", taskId: undefined, imageTaskRecordIds: [child.recordId], canResume: false, relatedTasks: [child], href: "/image?log=parent" });
+    load.mockResolvedValue({ items: [parent], errors: {} });
+    const router = await renderPage("/tasks?source=image-tasks&q=original-task");
+    expect(container!.querySelector('[data-task-id="image-log:parent"]')).not.toBeNull();
+    expect(container!.querySelector('details')?.open).toBe(true);
+    expect(container!.querySelector('a[href="/image?task=original"]')).not.toBeNull();
+    load.mockResolvedValue({ items: [{ ...parent, relatedTasks: [{ ...child, status: "completed", canResume: false }] }], errors: {} });
+    await act(async () => button("tasks.resume").click());
+    expect(resume).toHaveBeenCalledWith(child);
+    expect(load).toHaveBeenCalledTimes(2);
+    const parentCard = container!.querySelector('[data-task-id="image-log:parent"]')!;
+    expect(parentCard.querySelector(".ant-tag")?.textContent).toBe(i18n.t("tasks.status.attention"));
+    expect(parentCard.querySelector('[data-task-id="image-task:original"] .ant-tag')?.textContent).toBe(i18n.t("tasks.status.completed"));
+    await act(async () => container!.querySelector<HTMLAnchorElement>('a[href="/image?log=parent"]')!.click());
+    expect(router.state.location.pathname + router.state.location.search).toBe("/image?log=parent");
+});
+
+test("task actions distinguish local saving from unknown verification and show safe timings", async () => {
+    const local = item({ id: "image-task:local", recordId: "local", status: "attention", resumeAction: "save", imageTask: { id: "local", task_id: null, status: "storage_failed", value: { requests: [{ requestId: "62ae80c0-2c42-4ca1-8c5d-c43fe27a23a9", durationMs: 120 }], mediaTimings: { 0: { readMediaMs: 30, decodeMs: 5, localSaveMs: 7 } } } } });
+    const unknown = item({ id: "image-task:unknown", recordId: "unknown", status: "attention", canResume: false, taskId: undefined, href: "/image?task=unknown" });
+    load.mockResolvedValue({ items: [local, unknown], errors: {} });
+    const router = await renderPage();
+    const localCard = container!.querySelector('[data-task-id="image-task:local"]')!;
+    const action = [...localCard.querySelectorAll("button")].find((element) => element.textContent === i18n.t("tasks.restoreSave", { defaultValue: "恢复本地保存" }));
+    expect(action).toBeDefined();
+    expect(localCard.textContent).toContain("120 ms");
+    expect(localCard.textContent).toContain("30 ms");
+    await act(async () => action!.click());
+    expect(resume).toHaveBeenCalledWith(local);
+    const unknownCard = container!.querySelector('[data-task-id="image-task:unknown"]')!;
+    expect(unknownCard.querySelector("a")?.textContent).toBe(i18n.t("tasks.verifyStatus", { defaultValue: "核实原记录" }));
+    expect([...unknownCard.querySelectorAll("button")].some((element) => element.textContent === i18n.t("tasks.resume"))).toBe(false);
+    await act(async () => unknownCard.querySelector<HTMLAnchorElement>("a")!.click());
+    expect(router.state.location.pathname + router.state.location.search).toBe("/image?task=unknown");
+});
+
+test("a late post-query snapshot cannot overwrite a newer completed refresh", async () => {
+    const first = item(), second = item({ id: "image-task:second", recordId: "second" });
+    load.mockResolvedValueOnce({ items: [first, second], errors: {} });
+    let finishFirst!: (value: taskCenter.TaskCenterSnapshot) => void;
+    load.mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    load.mockResolvedValue({ items: [{ ...first, status: "completed", canResume: false }, { ...second, status: "completed", canResume: false }], errors: {} });
+    await renderPage();
+    const actions = [...container!.querySelectorAll("button")].filter((entry) => entry.textContent === i18n.t("tasks.resume"));
+    await act(async () => { actions[0].click(); });
+    await act(async () => { actions[1].click(); });
+    expect(container!.querySelector('[data-task-id="image-task:second"] .ant-tag')?.textContent).toBe(i18n.t("tasks.status.completed"));
+    await act(async () => finishFirst({ items: [first, second], errors: {} }));
+    expect(container!.querySelector('[data-task-id="image-task:second"] .ant-tag')?.textContent).toBe(i18n.t("tasks.status.completed"));
 });

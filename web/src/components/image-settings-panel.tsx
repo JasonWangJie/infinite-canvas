@@ -64,34 +64,6 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
             >
                 {showTitle ? <div className="text-lg font-semibold">{t("settingsPanels.image.title")}</div> : null}
                 <div className="space-y-2.5">
-                    <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.quality")}</SettingTitle>
-                    <div className="grid grid-cols-3 gap-2.5">
-                        {qualityOptions.map((item) => (
-                            <OptionPill key={item.value} selected={quality === item.value} theme={theme} onClick={() => onConfigChange("quality", item.value)}>
-                                {t(`settingsPanels.common.${item.labelKey}`)}
-                            </OptionPill>
-                        ))}
-                    </div>
-                </div>
-                <div className="space-y-2.5">
-                    <div className="flex items-center justify-between gap-3">
-                        <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.size")}</SettingTitle>
-                        <div className="flex items-center gap-2">
-                            <span className="text-xs font-medium" style={{ color: theme.node.muted }}>
-                                {t("settingsPanels.image.align16")}
-                            </span>
-                            <span title={t("settingsPanels.image.align16Hint")} onMouseDown={(event) => event.stopPropagation()}>
-                                <Switch size="small" checked={snapDimensionToStep} onChange={setSnapDimensionToStep} />
-                            </span>
-                        </div>
-                    </div>
-                    <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
-                        <DimensionInput prefix="W" value={dimensions.width} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
-                        <span className="text-lg opacity-45">↔</span>
-                        <DimensionInput prefix="H" value={dimensions.height} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
-                    </div>
-                </div>
-                <div className="space-y-2.5">
                     <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.resolution")}</SettingTitle>
                     <div className="grid grid-cols-4 gap-2.5">
                         {mediaScaleOptions.map((value) => (
@@ -119,17 +91,6 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         ))}
                     </div>
                 </div>
-                <div className="flex items-center justify-between gap-3">
-                    <div className="space-y-0.5">
-                        <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.transparent")}</SettingTitle>
-                        <div className="text-xs" style={{ color: theme.node.muted, opacity: 0.75 }}>
-                            {t("settingsPanels.image.transparentHint")}
-                        </div>
-                    </div>
-                    <span onMouseDown={(event) => event.stopPropagation()}>
-                        <Switch size="small" checked={transparentBackground} onChange={(checked) => onConfigChange("background", checked ? "transparent" : "")} />
-                    </span>
-                </div>
                 <div className="space-y-2.5">
                     <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.count")}</SettingTitle>
                     <div className="grid grid-cols-4 gap-2.5">
@@ -141,6 +102,51 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         <CountInput value={count} max={maxCount} theme={theme} onChange={(value) => onConfigChange("count", String(value || 1))} />
                     </div>
                 </div>
+                <details className="group space-y-4">
+                    <summary className="flex cursor-pointer list-none items-center justify-between gap-2 py-1 text-xs font-medium" style={{ color: theme.node.muted }}>
+                        {t("settingsPanels.image.advanced", { defaultValue: "高级设置" })}
+                        <span aria-hidden className="transition-transform group-open:rotate-180">⌄</span>
+                    </summary>
+                    <div className="space-y-2.5">
+                        <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.quality")}</SettingTitle>
+                        <div className="grid grid-cols-3 gap-2.5">
+                            {qualityOptions.map((item) => (
+                                <OptionPill key={item.value} selected={quality === item.value} theme={theme} onClick={() => onConfigChange("quality", item.value)}>
+                                    {t(`settingsPanels.common.${item.labelKey}`)}
+                                </OptionPill>
+                            ))}
+                        </div>
+                    </div>
+                    <div className="space-y-2.5">
+                        <div className="flex items-center justify-between gap-3">
+                            <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.size")}</SettingTitle>
+                            <div className="flex items-center gap-2">
+                                <span className="text-xs font-medium" style={{ color: theme.node.muted }}>
+                                    {t("settingsPanels.image.align16")}
+                                </span>
+                                <span title={t("settingsPanels.image.align16Hint")} onMouseDown={(event) => event.stopPropagation()}>
+                                    <Switch size="small" checked={snapDimensionToStep} onChange={setSnapDimensionToStep} />
+                                </span>
+                            </div>
+                        </div>
+                        <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2.5">
+                            <DimensionInput prefix="W" value={dimensions.width} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("width", value)} />
+                            <span className="text-lg opacity-45">↔</span>
+                            <DimensionInput prefix="H" value={dimensions.height} disabled={selectedRatio === "auto"} theme={theme} alignToStep={snapDimensionToStep} onChange={(value) => updateDimension("height", value)} />
+                        </div>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                        <div className="space-y-0.5">
+                            <SettingTitle color={theme.node.muted}>{t("settingsPanels.image.transparent")}</SettingTitle>
+                            <div className="text-xs" style={{ color: theme.node.muted, opacity: 0.75 }}>
+                                {t("settingsPanels.image.transparentHint")}
+                            </div>
+                        </div>
+                        <span onMouseDown={(event) => event.stopPropagation()}>
+                            <Switch size="small" checked={transparentBackground} onChange={(checked) => onConfigChange("background", checked ? "transparent" : "")} />
+                        </span>
+                    </div>
+                    </details>
             </div>
         </ImageSettingsTheme>
     );

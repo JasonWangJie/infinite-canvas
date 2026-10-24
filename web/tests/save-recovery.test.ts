@@ -4,7 +4,7 @@ import { mockBrowserDocuments } from "./local-document-fixture";
 import { CanvasNodeType } from "../src/types/canvas";
 import { currentSession, endCanvasSession, readCanvasSession } from "../src/services/api/canvas-client";
 import { applyCanvasDocument, flushCanvasSave, refreshCanvasTaskTarget, useCanvasStore } from "../src/stores/canvas/use-canvas-store";
-import { flushDocument, getDocumentBaseline, getDocumentDraft, getDocumentSaveState, getDocumentSaveStates, readDocument, resolveDocumentConflict, retryDocument, stageDocument, subscribeDocumentSaves, writeDocument } from "../src/services/canvas-data";
+import { assertDocumentRecoveryBackupCurrent, captureDocumentRecoveryBackup, flushDocument, getDocumentBaseline, getDocumentDraft, getDocumentSaveState, getDocumentSaveStates, readDocument, resolveDocumentConflict, retryDocument, stageDocument, subscribeDocumentSaves, writeDocument } from "../src/services/canvas-data";
 
 const originalFetch = globalThis.fetch;
 const session = { user: { id: "save-owner", subject: `ics_${"c".repeat(32)}`, username: "save-owner" }, csrf_token: "private-csrf", session_tag: "save-session", expires_at: Math.floor(Date.now() / 1000) + 3600 };
@@ -364,4 +364,70 @@ test("leaving task navigation before its response preserves both the editor and 
     await flushCanvasSave();
     expect(writes.at(-1)?.revision).toBe(2);
     expect(useCanvasStore.getState().openProject(original.id)?.title).toBe("valid next edit");
+});
+
+test("reload backups include every failed and debounced domain without changing save baselines", async () => {
+    await readDocument("assets");
+    await readDocument("config");
+    await readDocument("canvas");
+    const baseline = getDocumentBaseline("assets");
+    remote.revision += 1;
+    await expect(writeDocument("assets", { asset: "local" })).rejects.toThrow();
+    await expect(writeDocument("config", { setting: "local" })).rejects.toThrow();
+    stageDocument("canvas", { project: "latest debounced edit" });
+    const writesBefore = writes.length;
+    const backup = await captureDocumentRecoveryBackup();
+    expect(backup.documents).toEqual({ assets: { asset: "local" }, config: { setting: "local" }, canvas: { project: "latest debounced edit" } });
+    expect(() => assertDocumentRecoveryBackupCurrent(backup)).not.toThrow();
+    expect(getDocumentBaseline("assets")).toBe(baseline);
+    expect(getDocumentSaveState("assets").status).toBe("conflict");
+    expect(getDocumentDraft("canvas")).toEqual({ project: "latest debounced edit" });
+    expect(writes).toHaveLength(writesBefore);
+});
+
+test("late results and new unsaved domains invalidate an exported reload backup", async () => {
+    await readDocument("image-workbench");
+    transport = () => { throw new Error("offline"); };
+    await expect(writeDocument("image-workbench", { result: "first" })).rejects.toThrow();
+    const first = await captureDocumentRecoveryBackup();
+    await expect(writeDocument("image-workbench", { result: "late result" })).rejects.toThrow();
+    expect(first.documents).toEqual({ "image-workbench": { result: "first" } });
+    expect(() => assertDocumentRecoveryBackupCurrent(first)).toThrow();
+    const second = await captureDocumentRecoveryBackup();
+    expect(() => assertDocumentRecoveryBackupCurrent(second)).not.toThrow();
+    stageDocument("new-domain", { newDraft: true });
+    expect(() => assertDocumentRecoveryBackupCurrent(second)).toThrow();
+    expect(getDocumentDraft("image-workbench")).toEqual({ result: "late result" });
+});
+
+test("backup capture waits for queued updates and never silently skips unreadable drafts", async () => {
+    await readDocument("assets");
+    const started = deferred<void>(), finish = deferred<Response>();
+    transport = (init) => {
+        if (init?.method === "PUT") { started.resolve(); return finish.promise; }
+        return Response.json(remote);
+    };
+    const saving = writeDocument("assets", { latest: "queued" });
+    await started.promise;
+    let captured = false;
+    const backupRequest = captureDocumentRecoveryBackup().then((value) => { captured = true; return value; });
+    await Promise.resolve();
+    expect(captured).toBe(false);
+    finish.resolve(new Response("offline", { status: 500 }));
+    await expect(saving).rejects.toThrow();
+    expect((await backupRequest).documents).toEqual({ assets: { latest: "queued" } });
+    transport = () => { throw new Error("cannot load original"); };
+    await expect(writeDocument("unreadable", (value) => ({ ...value as object, edit: true }))).rejects.toThrow();
+    await expect(captureDocumentRecoveryBackup()).rejects.toThrow();
+    expect(getDocumentSaveState("unreadable").status).toBe("error");
+    expect(getDocumentDraft("assets")).toEqual({ latest: "queued" });
+});
+
+test("reload backups cannot authorize abandoning a later login session", async () => {
+    await readDocument("assets");
+    stageDocument("assets", { original: true });
+    const backup = await captureDocumentRecoveryBackup();
+    endCanvasSession();
+    await readCanvasSession();
+    expect(() => assertDocumentRecoveryBackupCurrent(backup)).toThrow();
 });

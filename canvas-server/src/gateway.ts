@@ -24,12 +24,12 @@ export class Gateway {
         this.clientProof = `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64")}`;
     }
 
-    async control<T>(operation: "exchange" | "introspect" | "revoke", body: unknown): Promise<T> {
+    async control<T>(operation: "exchange" | "introspect" | "revoke", body: unknown, requestId?: string): Promise<T> {
         let response: Response;
         try {
             response = await this.transport(`${this.config.gatewayUrl}/api/integrations/canvas/${operation}`, {
                 method: "POST",
-                headers: { Authorization: this.clientProof, "Content-Type": "application/json" },
+                headers: { Authorization: this.clientProof, "Content-Type": "application/json", ...(requestId ? { "X-Request-Id": requestId } : {}) },
                 body: JSON.stringify(body),
                 redirect: "manual",
             });

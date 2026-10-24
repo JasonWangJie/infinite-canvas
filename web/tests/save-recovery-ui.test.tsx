@@ -10,7 +10,7 @@ import i18n from "../src/i18n";
 import { DocumentSaveRecovery } from "../src/components/layout/document-save-recovery";
 import { CanvasSaveStatus } from "../src/components/canvas/canvas-save-status";
 import { endCanvasSession, readCanvasSession } from "../src/services/api/canvas-client";
-import { readDocument, writeDocument } from "../src/services/canvas-data";
+import { getDocumentBaseline, getDocumentDraft, getDocumentSaveState, readDocument, writeDocument } from "../src/services/canvas-data";
 import { flushCanvasSave, useCanvasStore, type CanvasProject } from "../src/stores/canvas/use-canvas-store";
 import { readZip } from "../src/lib/zip";
 
@@ -267,4 +267,88 @@ test("non-canvas failures export the latest original draft and remain individual
     await click("saveRecovery.retrySave");
     expect(documents.get("image-workbench")!.value).toEqual(draft);
     expect(container!.querySelector("#document-save-recovery")).toBeNull();
+});
+
+async function clickRecoveryText(text: string) {
+    const button = [...document.body.querySelectorAll("button")].find((element) => element.textContent === text);
+    expect(button).toBeDefined();
+    await act(async () => button!.click());
+}
+
+const allDraftsText = () => i18n.t("saveRecovery.exportAllReload", { defaultValue: "导出本页全部未保存草稿并重新加载" });
+const confirmReloadText = () => i18n.t("saveRecovery.confirmReload", { defaultValue: "已保存备份，放弃本页草稿并重新加载" });
+
+test("full recovery export keeps all failed drafts until the user confirms the downloaded backup", async () => {
+    await readDocument("assets");
+    await readDocument("config");
+    offline = true;
+    await expect(writeDocument("assets", { item: "local asset" })).rejects.toThrow();
+    await expect(writeDocument("config", { setting: "local config" })).rejects.toThrow();
+    const baseline = getDocumentBaseline("assets");
+    const saver = await import("file-saver");
+    const downloads: Blob[] = [];
+    saveFile = spyOn(saver, "saveAs").mockImplementation((blob: Blob | string) => { if (blob instanceof Blob) downloads.push(blob); });
+    await renderRecovery("/assets");
+    await clickRecoveryText(allDraftsText());
+    expect(downloads).toHaveLength(1);
+    expect(JSON.parse(await downloads[0].text()).documents).toEqual({ assets: { item: "local asset" }, config: { setting: "local config" } });
+    expect(document.body.textContent).toContain(i18n.t("navigation.assets"));
+    expect(document.body.textContent).toContain(i18n.t("navigation.config"));
+    expect(getDocumentBaseline("assets")).toBe(baseline);
+    expect(getDocumentSaveState("assets").status).toBe("error");
+    await clickRecoveryText(i18n.t("saveRecovery.keepDrafts", { defaultValue: "保留本页草稿" }));
+    expect(getDocumentDraft("assets")).toEqual({ item: "local asset" });
+    expect(getDocumentDraft("config")).toEqual({ setting: "local config" });
+    const leaving = new browser.Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(leaving);
+    expect(leaving.defaultPrevented).toBe(true);
+});
+
+test("full recovery refuses reload after another result arrives and export failures retain drafts", async () => {
+    await readDocument("image-workbench");
+    offline = true;
+    await expect(writeDocument("image-workbench", { result: "first" })).rejects.toThrow();
+    const saver = await import("file-saver");
+    saveFile = spyOn(saver, "saveAs").mockImplementation(() => { throw new Error("download blocked"); });
+    await renderRecovery("/image");
+    await clickRecoveryText(allDraftsText());
+    expect(document.body.textContent).toContain("download blocked");
+    expect(document.body.textContent).not.toContain(confirmReloadText());
+    expect(getDocumentDraft("image-workbench")).toEqual({ result: "first" });
+    saveFile.mockImplementation(() => {});
+    await clickRecoveryText(allDraftsText());
+    await act(async () => { await expect(writeDocument("image-workbench", { result: "arrived later" })).rejects.toThrow(); });
+    await clickRecoveryText(confirmReloadText());
+    expect(document.body.textContent).toContain(i18n.t("saveRecovery.backupChanged", { defaultValue: "导出后又有修改或生成结果到达，请重新导出全部草稿后再重新加载。" }));
+    expect(getDocumentDraft("image-workbench")).toEqual({ result: "arrived later" });
+    expect(getDocumentSaveState("image-workbench").status).toBe("error");
+});
+
+test("confirmed full recovery reloads only after blur commits are included and leaves saved data untouched", async () => {
+    await readDocument("config");
+    offline = true;
+    await expect(writeDocument("config", { text: "before blur" })).rejects.toThrow();
+    const saver = await import("file-saver");
+    let downloaded: Blob | undefined;
+    saveFile = spyOn(saver, "saveAs").mockImplementation((blob: Blob | string) => { if (blob instanceof Blob) downloaded = blob; });
+    await renderRecovery("/config");
+    const input = document.createElement("input");
+    document.body.append(input);
+    input.addEventListener("blur", () => { void writeDocument("config", { text: "committed on blur" }).catch(() => {}); });
+    input.focus();
+    await clickRecoveryText(allDraftsText());
+    input.remove();
+    expect(JSON.parse(await downloaded!.text()).documents.config).toEqual({ text: "committed on blur" });
+    const saved = documents.get("config");
+    const originalWindow = globalThis.window;
+    let reloads = 0;
+    Object.defineProperty(globalThis, "window", { configurable: true, writable: true, value: new Proxy(originalWindow, { get: (target, key) => key === "location" ? { reload: () => { reloads += 1; } } : Reflect.get(target, key) }) });
+    try {
+        await clickRecoveryText(confirmReloadText());
+        expect(reloads).toBe(1);
+        expect(documents.get("config")).toBe(saved);
+        expect(getDocumentDraft("config")).toEqual({ text: "committed on blur" });
+    } finally {
+        Object.defineProperty(globalThis, "window", { configurable: true, writable: true, value: originalWindow });
+    }
 });

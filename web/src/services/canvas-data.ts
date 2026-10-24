@@ -128,6 +128,35 @@ export function getDocumentDraft(domain: string) {
 export function getDocumentBaseline(domain: string) {
     return drafts.get(domain)?.document?.value;
 }
+export type DocumentRecoveryBackup = { epoch: number; changes: Record<string, number>; documents: Record<string, unknown> };
+
+// Capture all unsaved domains without advancing baselines or clearing failed drafts.
+export async function captureDocumentRecoveryBackup(): Promise<DocumentRecoveryBackup> {
+    const epoch = sessionEpoch();
+    assertSession(epoch);
+    while (queues.size) {
+        await Promise.all([...queues.values()]);
+        assertSession(epoch);
+    }
+    const documents: Record<string, unknown> = {};
+    for (const [domain, draft] of drafts) {
+        if (!draft.dirty && !draft.pending.length && !draft.issue) continue;
+        // An updater whose original document could not load cannot be backed up as JSON.
+        if (draft.pending.length || draft.value === undefined) throw new Error(i18n.t("saveRecovery.backupNotReady", { defaultValue: "部分草稿尚未读取完整，请先重试保存，再导出全部草稿。" }));
+        documents[domain] = JSON.parse(JSON.stringify(draft.value));
+    }
+    if (!Object.keys(documents).length) throw new Error(i18n.t("saveRecovery.noDraft"));
+    return { epoch, changes: Object.fromEntries([...drafts].map(([domain, draft]) => [domain, draft.changes])), documents };
+}
+
+// Must run immediately before reload: edits and late generation responses invalidate the download.
+export function assertDocumentRecoveryBackupCurrent(backup: DocumentRecoveryBackup) {
+    assertSession(backup.epoch);
+    const changed = [...drafts].some(([domain, draft]) => draft.changes !== (backup.changes[domain] || 0)
+        || ((draft.dirty || draft.pending.length || draft.issue) && !Object.hasOwn(backup.documents, domain)))
+        || Object.entries(backup.documents).some(([domain, value]) => !equalDocument(value, getDocumentDraft(domain)));
+    if (changed) throw new Error(i18n.t("saveRecovery.backupChanged", { defaultValue: "导出后又有修改或生成结果到达，请重新导出全部草稿后再重新加载。" }));
+}
 // Explicitly reopen a saved document for editing. Read-only task lists must not
 // call this: adopting a newer revision also requires replacing the editor state.
 export function reloadSavedDocument(domain: string, validate: (value: unknown) => void, apply: (value: unknown) => void, signal?: AbortSignal) {
