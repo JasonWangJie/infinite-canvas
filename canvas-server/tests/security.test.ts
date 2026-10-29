@@ -111,6 +111,91 @@ function headers(fixture: ReturnType<typeof setup>, session: { cookie: string; c
 }
 
 describe("Canvas authorization and owner isolation", () => {
+    test("shows a safe recovery page for a browser exchange failure without replaying the callback", async () => {
+        const f = setup();
+        f.intercept((path) => path.endsWith("/exchange") ? Response.json({ message: "private upstream response" }, { status: 401 }) : undefined);
+        const start = await f.app.request(`${f.config.origin}/auth/start`);
+        const target = new URL(start.headers.get("location")!);
+        const state = target.searchParams.get("state")!;
+        const cookie = cookieValue(start, TRANSACTION_COOKIE);
+        const callback = `${f.config.origin}/auth/callback?${new URLSearchParams({ code: "private-callback-code", state, return_to: "https://evil.example" })}`;
+        const response = await f.app.request(callback, { headers: { Cookie: cookie, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" } });
+        expect(response.status).toBe(401);
+        expect(response.headers.get("content-type")).toContain("text/html");
+        const page = await response.text();
+        expect(page).toContain("未能完成画布授权");
+        expect(page).toContain("AUTH_EXCHANGE_FAILED");
+        expect(page).toContain('href="/auth/start"');
+        expect(page).toContain('href="https://gateway.example"');
+        expect(page).toContain("重新授权");
+        expect(page).toContain("联系管理员");
+        expect(page).toContain('name="viewport"');
+        expect(page).toContain("prefers-color-scheme: dark");
+        expect(page).not.toContain("<script");
+        expect(response.headers.get("cache-control")).toContain("no-store");
+        expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+        const nonce = /<style nonce="([A-Za-z0-9_-]+)">/.exec(page)?.[1];
+        expect(nonce).toBeDefined();
+        expect(response.headers.get("content-security-policy")).toContain(`style-src 'nonce-${nonce}'`);
+        expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
+        expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+        const exchange = f.calls.find((call) => call.path.endsWith("exchange"))!;
+        for (const secret of ["private-callback-code", "private upstream response", state, cookie.split("=")[1], String(exchange.json?.code_verifier), f.config.clientSecret, "evil.example"]) {
+            expect(page).not.toContain(secret);
+            expect(JSON.stringify(f.auditEvents)).not.toContain(secret);
+        }
+        expect(response.headers.getSetCookie().some((value) => value.startsWith(`${SESSION_COOKIE}=`))).toBe(false);
+        expect(f.storage.db.query("SELECT * FROM sessions").all()).toHaveLength(0);
+        const replay = await f.app.request(callback, { headers: { Cookie: cookie, Accept: "text/html" } });
+        expect(replay.status).toBe(400);
+        expect(await replay.text()).toContain("AUTH_TRANSACTION_INVALID");
+        expect(f.calls.filter((call) => call.path.endsWith("exchange"))).toHaveLength(1);
+        const retry = await f.app.request(`${f.config.origin}/auth/start`);
+        expect(retry.status).toBe(303);
+        expect(new URL(retry.headers.get("location")!).searchParams.get("state")).not.toBe(state);
+    });
+
+    test("offers fresh authorization for expired browser callbacks without contacting the gateway", async () => {
+        const f = setup();
+        const start = await f.app.request(`${f.config.origin}/auth/start`);
+        const target = new URL(start.headers.get("location")!);
+        f.time(301);
+        const response = await f.app.request(`${f.config.origin}/auth/callback?code=expired-code&state=${target.searchParams.get("state")}`, { headers: { Cookie: cookieValue(start, TRANSACTION_COOKIE), "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" } });
+        expect(response.status).toBe(400);
+        expect(response.headers.get("content-type")).toContain("text/html");
+        const page = await response.text();
+        expect(page).toContain("授权链接已失效");
+        expect(page).toContain('href="/auth/start"');
+        expect(f.calls.filter((call) => call.path.endsWith("exchange"))).toHaveLength(0);
+    });
+
+    test("keeps JSON errors for API requests and non-HTML authorization clients", async () => {
+        const f = setup();
+        for (const accept of [undefined, "application/json", "text/html;q=0,application/json", "*/*"]) {
+            const response = await f.app.request(`${f.config.origin}/auth/callback`, { headers: accept ? { Accept: accept, "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" } : {} });
+            expect(response.status).toBe(400);
+            expect(response.headers.get("content-type")).toContain("application/json");
+            expect((await response.json()).error.code).toBe("AUTH_TRANSACTION_INVALID");
+        }
+        const api = await f.app.request(`${f.config.origin}/api/session`, { headers: { Accept: "text/html", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" } });
+        expect(api.status).toBe(401);
+        expect(api.headers.get("content-type")).toContain("application/json");
+        expect((await api.json()).error.code).toBe("AUTH_REQUIRED");
+    });
+
+    test("shows a generic browser recovery page when starting authorization cannot access storage", async () => {
+        const f = setup();
+        f.storage.db.query("DROP TABLE login_transactions").run();
+        const response = await f.app.request(`${f.config.origin}/auth/start`, { headers: { Accept: "text/html" } });
+        expect(response.status).toBe(500);
+        expect(response.headers.get("content-type")).toContain("text/html");
+        const page = await response.text();
+        expect(page).toContain("INTERNAL_ERROR");
+        expect(page).toContain('href="/auth/start"');
+        expect(page).not.toContain("login_transactions");
+        expect(page).not.toContain(f.directory);
+    });
+
     test("binds a one-use callback to state and S256, stores only encrypted credentials and secure cookies", async () => {
         const f = setup();
         const start = await f.app.request(`${f.config.origin}/auth/start?return_to=https://evil.example`);

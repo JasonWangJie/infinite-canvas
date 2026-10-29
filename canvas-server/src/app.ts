@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
+import { accepts } from "hono/accepts";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { authorizationErrorPage } from "./authorization-error-page.ts";
 import { LOGIN_TRANSACTION_SECONDS, SESSION_IDLE_SECONDS, SESSION_SECONDS, type ServerConfig } from "./config.ts";
 import { Gateway, GatewayError, publicMediaResponse, publicResourceResponse, type Fetcher, type Grant, type GrantState } from "./gateway.ts";
 import { CredentialVault, digest, equalSecret, randomSecret, SESSION_COOKIE, TRANSACTION_COOKIE } from "./security.ts";
 import { CanvasStorage, type LoginRow, type SessionRow } from "./storage.ts";
 
 type TimingStage = "authorization" | "model_validation" | "upstream_headers";
-type Env = { Variables: { session: SessionRow; apiKey: string; requestId: string; timings: Partial<Record<TimingStage, number>> } };
+type Env = { Variables: { session: SessionRow; apiKey: string; requestId: string; timings: Partial<Record<TimingStage, number>>; authorizationErrorPolicy?: string } };
 export type SecurityAuditEvent = { timestamp: string; component: string; app: string; action: string; result: "success" | "failure"; code?: string; user_id?: number; subject_ref?: string; grant_ref?: string };
 const cookieOptions = { secure: true, httpOnly: true, sameSite: "Lax" as const, path: "/" };
 const safeId = /^[A-Za-z0-9_-]+$/;
@@ -104,7 +106,7 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         await next();
         // Raw streaming/file Response objects replace prepared Hono headers.
         // Apply the security policy to the final response as well.
-        for (const [name, value] of Object.entries(securityHeaders)) c.header(name, value);
+        for (const [name, value] of Object.entries(securityHeaders)) c.header(name, name === "Content-Security-Policy" ? c.get("authorizationErrorPolicy") || value : value);
         if (c.get("requestId")) {
             c.header("X-Request-Id", c.get("requestId"));
             const timing = Object.entries(c.get("timings")).map(([stage, duration]) => `${stage};dur=${duration.toFixed(2)}`).join(", ");
@@ -113,16 +115,29 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
     });
 
     app.onError((error, c) => {
+        let code = "INTERNAL_ERROR", message = "画布服务暂不可用", status = 500;
         if (error instanceof GatewayError) {
             audit(c.req.path.startsWith("/auth/") ? "sso.login" : "authorization", "failure", c.get("session"), error.code);
-            return c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
+            code = error.code; message = error.message; status = error.status;
+        } else if (error instanceof SyntaxError) {
+            code = "INVALID_JSON"; message = "请求格式无效"; status = 400;
+        } else {
+            // Avoid logging request bodies, callback query strings, credentials or
+            // exception messages that might contain an outbound URL or token.
+            audit(c.req.path.startsWith("/auth/") ? "sso.login" : "request", "failure", c.get("session"), code);
+            console.error("Canvas request failed", { method: c.req.method, route: c.req.routePath });
         }
-        if (error instanceof SyntaxError) return c.json({ error: { code: "INVALID_JSON", message: "请求格式无效" } }, 400);
-        // Avoid logging request bodies, callback query strings, credentials or
-        // exception messages that might contain an outbound URL or token.
-        audit(c.req.path.startsWith("/auth/") ? "sso.login" : "request", "failure", c.get("session"), "INTERNAL_ERROR");
-        console.error("Canvas request failed", { method: c.req.method, route: c.req.routePath });
-        return c.json({ error: { code: "INTERNAL_ERROR", message: "画布服务暂不可用" } }, 500);
+        const authorizationRoute = c.req.path === "/auth/start" || c.req.path === "/auth/callback";
+        const documentNavigation = c.req.header("Sec-Fetch-Mode") === "navigate" && c.req.header("Sec-Fetch-Dest") === "document";
+        const responseType = accepts(c, { header: "Accept", supports: ["application/json", "text/html"], default: documentNavigation && !c.req.header("Accept") ? "text/html" : "application/json" });
+        if (authorizationRoute && c.req.method === "GET" && responseType === "text/html") {
+            const nonce = randomSecret();
+            const policy = `default-src 'none'; style-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox allow-top-navigation-by-user-activation`;
+            c.set("authorizationErrorPolicy", policy);
+            c.header("Content-Security-Policy", policy);
+            return c.html(authorizationErrorPage(code, config.gatewayPublicUrl, nonce), status as 400);
+        }
+        return c.json({ error: { code, message } }, status as 400);
     });
 
     app.get("/health", (c) => c.json({ ok: true }));
