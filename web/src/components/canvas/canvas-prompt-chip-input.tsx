@@ -18,6 +18,8 @@ type Props = {
     className?: string;
     style?: CSSProperties;
     placeholder?: string;
+    ariaLabel?: string;
+    submitWithModifier?: boolean;
 };
 
 type MentionState = {
@@ -31,7 +33,7 @@ type Token =
 
 // Prompt-panel contentEditable input: @ references embed thumbnail chips instead of plain label text.
 // Serialization converts chips back to reference labels so the generated value matches the former textarea semantics.
-export function CanvasPromptChipInput({ value, references, onChange, onSubmit, className, style, placeholder }: Props) {
+export function CanvasPromptChipInput({ value, references, onChange, onSubmit, className, style, placeholder, ariaLabel, submitWithModifier = false }: Props) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const editorRef = useRef<HTMLDivElement>(null);
     const composingRef = useRef(false);
@@ -139,6 +141,7 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
                 suppressContentEditableWarning
                 role="textbox"
                 aria-multiline="true"
+                aria-label={ariaLabel || placeholder || i18n.t("canvas.promptPanel.editorTitle")}
                 className={`${className || ""} overflow-y-auto whitespace-pre-wrap break-words outline-none`}
                 style={{ ...style, cursor: "text" }}
                 onInput={() => {
@@ -181,7 +184,8 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
                         requestAnimationFrame(syncFromEditor);
                         return;
                     }
-                    if (isPlainEnterKey(event) && onSubmit) {
+                    const submitKey = submitWithModifier ? event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey : isPlainEnterKey(event);
+                    if (submitKey && onSubmit) {
                         event.preventDefault();
                         onSubmit();
                         return;

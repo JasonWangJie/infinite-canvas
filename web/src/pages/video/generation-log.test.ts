@@ -13,6 +13,7 @@ import type { CanvasNodeData } from "@/types/canvas";
 import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
 import * as imageStorage from "@/services/image-storage";
 import { readImageTaskRecords } from "@/services/image-task-records";
+import * as imageTaskRecords from "@/services/image-task-records";
 
 const originalFetch = globalThis.fetch;
 const originalAdapter = axios.defaults.adapter;
@@ -246,6 +247,7 @@ async function canvasVideoFixture(projects: CanvasProject[]) {
     const React = await import("react");
     const { createRoot } = await import("react-dom/client");
     const { createMemoryRouter, RouterProvider } = await import("react-router-dom");
+    const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
     const globals = {
         __APP_VERSION__: "test",
         __APP_RELEASES__: [],
@@ -304,11 +306,13 @@ async function canvasVideoFixture(projects: CanvasProject[]) {
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
-    const router = createMemoryRouter([{ path: "/canvas/:id", element: React.createElement(App, {}, React.createElement(CanvasPage)) }], { initialEntries: ["/canvas/a"] });
+    const queryClient = new QueryClient();
+    const router = createMemoryRouter([{ path: "/canvas/:id", element: React.createElement(QueryClientProvider, { client: queryClient }, React.createElement(App, {}, React.createElement(CanvasPage))) }, { path: "/image", element: React.createElement("div", {}, "Original image task") }], { initialEntries: ["/canvas/a"] });
     const close = async () => {
         await React.act(async () => {
             root.unmount();
         });
+        queryClient.clear();
         container.remove();
         mock.module("@/lib/canvas/plugin-loader", () => pluginLoader);
         browser.matchMedia = previousMatchMedia;
@@ -331,9 +335,13 @@ function videoProjects(metadata: CanvasNodeData["metadata"]): CanvasProject[] {
 }
 
 async function retryCanvasVideo(fixture: Awaited<ReturnType<typeof canvasVideoFixture>>) {
-    const button = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((item) => [i18n.t("canvas.node.retry"), i18n.t("managed.resumeImage")].includes(item.textContent || ""));
+    const button = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((item) => ["canvas.node.retry", "managed.resumeImage", "managed.recoverImage", "managed.regenerateImageTask", "managed.verifyImageTask"].map((key) => i18n.t(key)).includes(item.textContent || ""));
     expect(Boolean(button)).toBe(true);
     await fixture.act(async () => button!.click());
+}
+
+function isConfigGenerateButton(button: HTMLButtonElement) {
+    return ["image", "video"].some((mode) => button.getAttribute("aria-label") === i18n.t("canvas.promptPanel.generateMode", { mode: i18n.t(`canvas.nodeTypes.${mode}`) }));
 }
 
 async function undoCanvasVideo(fixture: Awaited<ReturnType<typeof canvasVideoFixture>>) {
@@ -438,7 +446,7 @@ test("a config node saves its newly created video child and connection before su
     };
     const fixture = await canvasVideoFixture(projects);
     try {
-        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((button) => button.textContent === i18n.t("canvas.configNode.generate"));
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find(isConfigGenerateButton);
         expect(Boolean(generate)).toBe(true);
         await fixture.act(async () => generate!.click());
         expect(requests).toEqual([
@@ -587,14 +595,405 @@ test("canvas image blocks POST if its intent cannot be linked to the saved canva
     } finally { await fixture.close(); }
 });
 
-test("canvas image confirmed rejection clears the intent and remains retryable", async () => {
+test("canvas image keeps a received result recoverable when its final canvas save fails, then saves it without another POST", async () => {
+    const stored = { url: "blob:canvas-save-image", storageKey: "image:canvas-save", width: 320, height: 160, bytes: 5, mimeType: "image/png" };
+    const upload = spyOn(imageStorage, "uploadImage").mockResolvedValue(stored);
+    const read = spyOn(imageStorage, "readStoredImage").mockResolvedValue(stored);
+    let failCanvasSave = false;
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => String(input) === "/api/data/canvas" && init?.method === "PUT" && failCanvasSave
+        ? Response.json({ error: { message: "canvas storage unavailable" } }, { status: 503 })
+        : transport(input, init)) as typeof fetch;
+    poll = async (request) => { failCanvasSave = true; return response(request, { data: [{ b64_json: "aW1hZ2U=" }] }); };
+    const fixture = await canvasVideoFixture(imageProjects());
+    try {
+        await retryCanvasVideo(fixture);
+        const pending = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+        expect(pending.metadata).toMatchObject({ status: "error", content: stored.url });
+        expect(typeof pending.metadata?.imageTaskRecordId).toBe("string");
+        const retained = await readImageTaskRecords();
+        expect(Object.keys(retained)).toContain(pending.metadata!.imageTaskRecordId!);
+        expect(retained[pending.metadata!.imageTaskRecordId!].status).toBe("succeeded");
+        failCanvasSave = false;
+        await retryCanvasVideo(fixture);
+        const recovered = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+        expect(recovered.metadata).toMatchObject({ status: "success", content: stored.url });
+        expect(recovered.metadata?.imageTaskRecordId).toBeUndefined();
+        expect(requests).toEqual([{ method: "post", url: "/api/ai/v1/images/generations" }]);
+        expect(upload).toHaveBeenCalledTimes(1);
+        expect((documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects[0].nodes[0].metadata?.imageTaskRecordId).toBeUndefined();
+    } finally { await fixture.close(); upload.mockRestore(); read.mockRestore(); }
+});
+
+test.each([false, true])("canvas image checkbox async=%s selects the protocol and restores its saved task without another POST", async (asyncMode) => {
+    const projects = imageProjects({ status: "idle", prompt: "draw a tree", generationMode: "image", count: 1 });
+    projects[0].nodes[0].type = "config";
+    projects[0].nodes[0].position.x = -240;
+    const stored = { url: "blob:checkbox-image", storageKey: "image:checkbox", width: 320, height: 160, bytes: 5, mimeType: "image/png" };
+    const upload = spyOn(imageStorage, "uploadImage").mockResolvedValue(stored);
+    const read = spyOn(imageStorage, "readStoredImage").mockResolvedValue(stored);
+    const asyncRequests: string[] = [];
+    const transport = globalThis.fetch;
+    let ready = false;
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        if (path.endsWith("/images/generations_async")) {
+            asyncRequests.push(`${init?.method || "GET"} ${path}`);
+            const saved = (documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects.find((project) => project.id === "a")!;
+            const child = saved.nodes.find((node) => node.type === "image")!;
+            expect(child.metadata?.imageAsync).toBe(true);
+            const recordId = child.metadata?.images?.[0].imageTaskRecordId;
+            expect(Boolean(recordId)).toBe(true);
+            expect((await readImageTaskRecords())[recordId!]).toMatchObject({ status: "submitting", task_id: null });
+            return Response.json({ task_id: "asyncimg_checkbox" }, { status: 202 });
+        }
+        if (path.endsWith("/images/tasks_async/asyncimg_checkbox")) {
+            asyncRequests.push(`${init?.method || "GET"} ${path}`);
+            return Response.json(ready ? { status: "succeeded", data: [{ b64_json: "aW1hZ2U=" }] } : { status: "running" });
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    poll = async (request) => response(request, { data: [{ b64_json: "aW1hZ2U=" }] });
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const checkbox = fixture.container.querySelector<HTMLInputElement>("[data-node-id='shared-node'] input[type='checkbox']")!;
+        expect(Boolean(checkbox)).toBe(true);
+        expect(checkbox.checked).toBe(false);
+        if (asyncMode) await fixture.act(async () => checkbox.click());
+        expect(checkbox.checked).toBe(asyncMode);
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find(isConfigGenerateButton)!;
+        expect(generate.disabled).toBe(false);
+        await fixture.act(async () => generate.click());
+        const child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.type === "image")!;
+        if (!asyncMode) {
+            expect(requests).toEqual([{ method: "post", url: "/api/ai/v1/images/generations" }]);
+            expect(asyncRequests).toEqual([]);
+            expect(child.metadata?.content).toBe(stored.url);
+        } else {
+            expect(requests).toEqual([]);
+            expect(asyncRequests).toEqual(["POST /api/ai/v1/images/generations_async"]);
+            const recordId = child.metadata?.images?.[0].imageTaskRecordId;
+            expect((await readImageTaskRecords())[recordId!].task_id).toBe("asyncimg_checkbox");
+            await fixture.act(async () => { await fixture.router.navigate("/canvas/b"); });
+            await fixture.act(async () => { await fixture.router.navigate("/canvas/a"); });
+            ready = true;
+            const query = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.resumeImage"))!;
+            expect(Boolean(query)).toBe(true);
+            await fixture.act(async () => query.click());
+            const restored = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.id === child.id)!;
+            expect(restored.metadata?.content).toBe(stored.url);
+            expect(restored.metadata?.images?.[0].imageTaskRecordId).toBeUndefined();
+            expect(asyncRequests).toEqual(["POST /api/ai/v1/images/generations_async", "GET /api/ai/v1/images/tasks_async/asyncimg_checkbox", "GET /api/ai/v1/images/tasks_async/asyncimg_checkbox"]);
+        }
+        expect(upload).toHaveBeenCalledTimes(1);
+    } finally { await fixture.close(); upload.mockRestore(); read.mockRestore(); }
+});
+
+test("canvas image confirmed rejection keeps its history and permits an explicit new task", async () => {
     poll = async (request) => { throw new axios.AxiosError("rejected", "ERR_BAD_REQUEST", request, undefined, { ...response(request, { error: { message: "rejected" } }), status: 400 }); };
     const fixture = await canvasVideoFixture(imageProjects());
     try {
         await retryCanvasVideo(fixture);
-        expect(fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata?.imageTaskRecordId).toBeUndefined();
+        const previous = fixture.useCanvasStore.getState().openProject("a")?.nodes[0].metadata?.imageTaskRecordId;
+        expect(typeof previous).toBe("string");
+        expect(fixture.container.textContent).toContain(i18n.t("managed.regenerateImageTask"));
         await retryCanvasVideo(fixture);
         expect(requests).toHaveLength(2);
+        expect(Object.keys(await readImageTaskRecords())).toHaveLength(2);
+        expect((await readImageTaskRecords())[previous!].status).toBe("failed");
+    } finally { await fixture.close(); }
+});
+
+test("a stale query action cannot restart a failed async image until the user explicitly chooses a new task", async () => {
+    const oldId = "failed-original";
+    const source = { kind: "canvas", canvasId: "a", nodeId: "shared-node" };
+    const old = { id: oldId, task_id: "asyncimg_original", status: "pending", created_at: 123, value: { model: "image-model", source } };
+    documents["image-tasks"] = { revision: 1, value: { [oldId]: old } };
+    const calls: string[] = [];
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        if (path.endsWith("/images/tasks_async/asyncimg_original")) { calls.push(`GET ${path}`); return Response.json({ status: "running" }); }
+        if (path.endsWith("/images/generations_async")) {
+            calls.push(`POST ${path}`);
+            const records = await readImageTaskRecords();
+            const next = Object.values(records).find((record) => record.id !== oldId)!;
+            expect(next.value.source).toEqual(source);
+            return Response.json({ task_id: "asyncimg_new" }, { status: 202 });
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    const fixture = await canvasVideoFixture(imageProjects({ status: "error", prompt: "draw a tree", imageAsync: true, imageTaskRecordId: oldId, imageTaskState: "pending" }));
+    try {
+        expect(fixture.container.querySelector("[data-image-task-state='pending']")).not.toBeNull();
+        await fixture.act(async () => writeDocument("image-tasks", { [oldId]: { ...old, status: "failed", value: { ...old.value, result: { status: "failed", error_message: "provider rejected" } } } }));
+        await retryCanvasVideo(fixture);
+        expect(calls.filter((call) => call.startsWith("POST"))).toEqual([]);
+        expect(fixture.container.textContent).toContain(i18n.t("managed.regenerateImageTask"));
+        expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata?.imageTaskRecordId).toBe(oldId);
+        await retryCanvasVideo(fixture);
+        const records = await readImageTaskRecords();
+        expect(calls.filter((call) => call.startsWith("POST"))).toEqual(["POST /api/ai/v1/images/generations_async"]);
+        expect(Object.keys(records)).toHaveLength(2);
+        expect(records[oldId]).toEqual({ ...old, status: "failed", value: { ...old.value, result: { status: "failed", error_message: "provider rejected" } } });
+        const current = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+        expect(current.metadata?.imageTaskRecordId).not.toBe(oldId);
+        expect(current.metadata?.imageTaskState).toBe("pending");
+        expect(fixture.container.querySelector("[data-image-task-state='pending']")).not.toBeNull();
+        expect(requests).toEqual([]);
+    } finally { await fixture.close(); }
+});
+
+test("a batch aggregate query selects its pending slot even when the first slot failed and never submits a new image", async () => {
+    const images = [
+        { id: "failed", status: "error" as const, imageTaskRecordId: "failed", imageTaskState: "failed" as const },
+        { id: "pending", status: "idle" as const, imageTaskRecordId: "pending", imageTaskState: "pending" as const },
+    ].map((image) => ({ ...image, content: "", naturalWidth: 0, naturalHeight: 0, bytes: 0, mimeType: "image/png" }));
+    documents["image-tasks"] = { revision: 1, value: {
+        failed: { id: "failed", task_id: "asyncimg_failed", status: "failed", value: {} },
+        pending: { id: "pending", task_id: "asyncimg_pending", status: "pending", value: {} },
+    } };
+    const calls: string[] = [];
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        if (path.includes("/api/ai/")) {
+            calls.push(`${init?.method || "GET"} ${path}`);
+            if (path.endsWith("/images/tasks_async/asyncimg_pending")) return Response.json({ status: "running" });
+            throw new Error("The aggregate query must never select the failed slot or create a task");
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    const fixture = await canvasVideoFixture(imageProjects({ status: "error", prompt: "batch", imageAsync: true, images }));
+    try {
+        const initialQueries = calls.length;
+        const card = fixture.container.querySelector<HTMLElement>("[data-node-id='shared-node'] > .relative")!;
+        await fixture.act(async () => {
+            card.dispatchEvent(new browser.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+            window.dispatchEvent(new browser.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+        });
+        const query = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-panel='shared-node'] button")].find((button) => [i18n.t("managed.resumeImage"), i18n.t("managed.queryAllImages")].includes(button.getAttribute("aria-label") || ""))!;
+        expect(Boolean(query)).toBe(true);
+        await fixture.act(async () => query.click());
+        expect(calls.slice(initialQueries)).toEqual(["GET /api/ai/v1/images/tasks_async/asyncimg_pending"]);
+        expect(Object.keys(await readImageTaskRecords())).toEqual(["failed", "pending"]);
+        expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata?.images?.map((image) => image.imageTaskRecordId)).toEqual(["failed", "pending"]);
+        expect(requests).toEqual([]);
+    } finally { await fixture.close(); }
+});
+
+test("an explicit new-task action with a slow local read cannot replace a newer active intent", async () => {
+    const original = { id: "original-failed", task_id: "asyncimg_failed", status: "failed", value: {} };
+    const replacement = { id: "replacement", task_id: "asyncimg_replacement", status: "pending", value: {} };
+    documents["image-tasks"] = { revision: 1, value: { [original.id]: original, [replacement.id]: replacement } };
+    const fixture = await canvasVideoFixture(imageProjects({ status: "error", prompt: "tree", imageAsync: true, imageTaskRecordId: original.id, imageTaskState: "failed" }));
+    const gate = Promise.withResolvers<void>(), started = Promise.withResolvers<void>();
+    const realRead = imageTaskRecords.readImageTaskRecords;
+    let blockRead = true;
+    const read = spyOn(imageTaskRecords, "readImageTaskRecords").mockImplementation(async () => {
+        const records = await realRead();
+        if (blockRead) { blockRead = false; started.resolve(); await gate.promise; }
+        return records;
+    });
+    try {
+        await retryCanvasVideo(fixture);
+        await started.promise;
+        const { useAgentStore } = await import("@/stores/use-agent-store");
+        await fixture.act(async () => { useAgentStore.getState().canvasContext!.applyOps([{ type: "update_node", id: "shared-node", metadata: { imageTaskRecordId: replacement.id, imageTaskState: "pending" } }]); });
+        await fixture.act(async () => gate.resolve());
+        expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata?.imageTaskRecordId).toBe(replacement.id);
+        expect(Object.keys(await realRead())).toEqual([original.id, replacement.id]);
+        expect(requests).toEqual([]);
+        expect(fileRequests.filter((request) => request.includes("/api/ai/"))).toEqual([]);
+    } finally { gate.resolve(); read.mockRestore(); await fixture.close(); }
+});
+
+test.each(["query", "save"])("canvas batch %s-all processes only original intents and preserves every result history", async (action) => {
+    const ids = ["first", "second"];
+    const images = ids.map((id) => ({ id, status: "error" as const, content: "", naturalWidth: 0, naturalHeight: 0, bytes: 0, mimeType: "image/png", imageTaskRecordId: id, imageTaskState: action === "query" ? "pending" as const : "storage_failed" as const }));
+    const records = Object.fromEntries(ids.map((id, index) => [id, { id, task_id: action === "query" ? `asyncimg_${id}` : null, status: action === "query" ? "pending" : "succeeded", created_at: 123 + index, value: { model: "image-model", source: { kind: "canvas", canvasId: "a", nodeId: "shared-node", slotId: id }, ...(action === "save" ? { result: { data: [{ b64_json: id === "first" ? "Zmlyc3Q=" : "c2Vjb25k" }] } } : {}) } }]));
+    documents["image-tasks"] = { revision: 1, value: records };
+    const stored = (key: string) => ({ url: `blob:${key}`, storageKey: key, width: 320, height: 160, bytes: 5, mimeType: "image/png" });
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async (input) => stored(String(input).includes("Zmlyc3Q=") ? "image:first" : "image:second"));
+    const read = spyOn(imageStorage, "readStoredImage").mockImplementation(async (key) => stored(key));
+    const calls: string[] = [];
+    const transport = globalThis.fetch;
+    let phase = 0;
+    let canvasSaveFails = false;
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        if (canvasSaveFails && path === "/api/data/canvas" && init?.method === "PUT") return Response.json({ error: { message: "canvas save unavailable" } }, { status: 503 });
+        if (path.includes("/images/tasks_async/")) {
+            calls.push(`${init?.method || "GET"} ${path}`);
+            if (!phase) return Response.json({ status: "running" });
+            if (phase === 1 && path.endsWith("asyncimg_second")) return Response.json({ error: { message: "temporary polling failure" } }, { status: 503 });
+            return Response.json({ status: "succeeded", data: [{ b64_json: path.endsWith("asyncimg_first") ? "Zmlyc3Q=" : "c2Vjb25k" }] });
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    const fixture = await canvasVideoFixture(imageProjects({ status: "error", prompt: "batch", images }));
+    const allLabel = i18n.t(action === "query" ? "managed.queryAllImages" : "managed.recoverAllImages");
+    const allButton = () => [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((button) => button.textContent === allLabel)!;
+    try {
+        phase = 1;
+        canvasSaveFails = action === "save";
+        expect(Boolean(allButton())).toBe(true);
+        await fixture.act(async () => allButton().click());
+        if (action === "query") {
+            expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata?.images?.[0].status).toBe("success");
+            expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata?.images?.[1].imageTaskState).toBe("pending");
+            phase = 2;
+            await fixture.act(async () => allButton().click());
+            expect(calls.filter((call) => call.endsWith("asyncimg_first"))).toHaveLength(2);
+        } else {
+            expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata?.images?.map((image) => image.imageTaskRecordId)).toEqual(ids);
+            canvasSaveFails = false;
+            await fixture.act(async () => allButton().click());
+        }
+        const node = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+        expect(node.metadata?.images?.map((image) => image.status)).toEqual(["success", "success"]);
+        expect(node.metadata?.images?.map((image) => image.imageTaskRecordId)).toEqual([undefined, undefined]);
+        expect(upload).toHaveBeenCalledTimes(2);
+        const retained = await readImageTaskRecords();
+        expect(Object.values(retained).map((record) => record.value.source?.slotId)).toEqual(ids);
+        expect(Object.values(retained).map((record) => record.created_at)).toEqual([123, 124]);
+        expect(calls.every((call) => call.startsWith("GET"))).toBe(true);
+        expect(requests).toEqual([]);
+    } finally { await fixture.close(); upload.mockRestore(); read.mockRestore(); }
+});
+
+test("a newly generated async batch without polling hints can query all repeatedly and restore results without another POST", async () => {
+    const projects = imageProjects({ status: "idle", prompt: "draw trees", generationMode: "image", imageAsync: true, count: 3 });
+    projects[0].nodes[0].type = "config";
+    projects[0].nodes[0].position.x = -240;
+    const stored = { url: "blob:generated-batch", storageKey: "image:generated-batch", width: 320, height: 160, bytes: 5, mimeType: "image/png" };
+    const upload = spyOn(imageStorage, "uploadImage").mockResolvedValue(stored);
+    const read = spyOn(imageStorage, "readStoredImage").mockResolvedValue(stored);
+    const transport = globalThis.fetch;
+    const calls: string[] = [];
+    const queryGate = Promise.withResolvers<void>();
+    let gated = true, ready = false;
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        if (path.endsWith("/images/generations_async")) {
+            calls.push(`POST ${path}`);
+            const intentId = new Headers(init?.headers).get("Idempotency-Key")!;
+            const record = (await readImageTaskRecords())[intentId];
+            expect(record.value.source?.canvasId).toBe("a");
+            expect(typeof record.value.source?.slotId).toBe("string");
+            const canvas = (documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects.find((project) => project.id === "a")!;
+            expect(canvas.nodes.find((node) => node.id === record.value.source?.nodeId)?.metadata?.images?.find((image) => image.id === record.value.source?.slotId)?.imageTaskRecordId).toBe(intentId);
+            return Response.json({ task_id: `asyncimg_${intentId}` }, { status: 202 });
+        }
+        if (path.includes("/images/tasks_async/")) {
+            calls.push(`GET ${path}`);
+            if (gated) await queryGate.promise;
+            return Response.json(ready ? { status: "succeeded", data: [{ b64_json: "aW1hZ2U=" }] } : { status: "running" });
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find(isConfigGenerateButton)!;
+        await fixture.act(async () => generate.click());
+        const child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.type === "image")!;
+        const queryAll = () => [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.queryAllImages"))!;
+        expect(calls.filter((call) => call.startsWith("POST"))).toHaveLength(3);
+        expect(calls.filter((call) => call.startsWith("GET"))).toHaveLength(0);
+        await fixture.act(async () => { queryAll().click(); queryAll().click(); });
+        expect(queryAll().disabled).toBe(true);
+        expect(calls.filter((call) => call.startsWith("GET"))).toHaveLength(1);
+        gated = false;
+        await fixture.act(async () => queryGate.resolve());
+        expect(calls.filter((call) => call.startsWith("GET"))).toHaveLength(3);
+        await fixture.act(async () => queryAll().click());
+        expect(calls.filter((call) => call.startsWith("GET"))).toHaveLength(6);
+        ready = true;
+        const card = fixture.container.querySelector<HTMLElement>(`[data-node-id='${child.id}'] > .relative`)!;
+        await fixture.act(async () => {
+            card.dispatchEvent(new browser.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+            window.dispatchEvent(new browser.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+        });
+        const panelAction = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-panel='${child.id}'] button`)].find((button) => [i18n.t("managed.resumeImage"), i18n.t("managed.queryAllImages")].includes(button.getAttribute("aria-label") || ""))!;
+        expect(Boolean(panelAction)).toBe(true);
+        await fixture.act(async () => panelAction.click());
+        expect(calls.filter((call) => call.startsWith("GET"))).toHaveLength(9);
+        expect(calls.filter((call) => call.startsWith("POST"))).toHaveLength(3);
+        const completed = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.id === child.id)!;
+        expect(completed.metadata?.images?.map((image) => image.status)).toEqual(["success", "success", "success"]);
+        expect(completed.metadata?.images?.map((image) => image.imageTaskRecordId)).toEqual([undefined, undefined, undefined]);
+        expect(upload).toHaveBeenCalledTimes(3);
+        expect(requests).toEqual([]);
+    } finally { queryGate.resolve(); await fixture.close(); upload.mockRestore(); read.mockRestore(); }
+});
+
+test.each([false, true])("canvas image protocol toggles are local and rapid generation clicks pay only once with async=%s", async (asyncMode) => {
+    const projects = imageProjects({ status: "idle", prompt: "draw a tree", generationMode: "image", count: 1 });
+    projects[0].nodes[0].type = "config";
+    projects[0].nodes[0].position.x = -240;
+    const gate = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+        const path = String(input);
+        if (path.endsWith("/images/generations_async")) {
+            calls.push(`${init?.method || "GET"} ${path}`);
+            await gate.promise;
+            return Response.json({ task_id: "asyncimg_rapid" }, { status: 202 });
+        }
+        return transport(input, init);
+    }) as typeof fetch;
+    poll = async (request) => { await gate.promise; throw new axios.AxiosError("response lost", "ERR_NETWORK", request); };
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const checkbox = fixture.container.querySelector<HTMLInputElement>("[data-node-id='shared-node'] input[type='checkbox']")!;
+        expect(checkbox.checked).toBe(false);
+        await fixture.act(async () => checkbox.click());
+        expect(checkbox.checked).toBe(true);
+        await fixture.act(async () => checkbox.click());
+        expect(checkbox.checked).toBe(false);
+        if (asyncMode) await fixture.act(async () => checkbox.click());
+        expect(requests).toEqual([]);
+        expect(calls).toEqual([]);
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find(isConfigGenerateButton)!;
+        await fixture.act(async () => { generate.click(); generate.click(); });
+        expect(checkbox.disabled).toBe(true);
+        expect(fixture.container.textContent).not.toContain(i18n.t("managed.imageTaskPending"));
+        expect(fixture.container.textContent).not.toContain(i18n.t("managed.queryAllImages"));
+        await fixture.act(async () => checkbox.click());
+        expect(checkbox.checked).toBe(asyncMode);
+        expect(requests).toHaveLength(asyncMode ? 0 : 1);
+        expect(calls).toHaveLength(asyncMode ? 1 : 0);
+        await fixture.act(async () => gate.resolve());
+        expect(requests).toHaveLength(asyncMode ? 0 : 1);
+        expect(calls).toHaveLength(asyncMode ? 1 : 0);
+        expect(fixture.useCanvasStore.getState().openProject("a")!.nodes.filter((node) => node.type === "image")).toHaveLength(1);
+    } finally { gate.resolve(); await fixture.close(); }
+});
+
+test.each([false, true])("a text reference enables an image node with an empty prompt, including grouped=%s", async (grouped) => {
+    const projects = imageProjects({ status: "idle", prompt: "" });
+    const text: CanvasNodeData = { id: "reference-text", type: "text", title: "reference", position: { x: -160, y: 0 }, width: 100, height: 100, metadata: { content: "a tree beside a river", ...(grouped ? { groupId: "reference-group" } : {}) } };
+    projects[0].nodes.push(text);
+    if (grouped) projects[0].nodes.push({ id: "reference-group", type: "group", title: "references", position: { x: -180, y: -20 }, width: 160, height: 160, metadata: {} });
+    projects[0].connections.push({ id: "reference-connection", fromNodeId: grouped ? "reference-group" : text.id, toNodeId: "shared-node" });
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const card = fixture.container.querySelector<HTMLElement>("[data-node-id='shared-node'] > .relative")!;
+        await fixture.act(async () => {
+            card.dispatchEvent(new browser.MouseEvent("mousedown", { bubbles: true, button: 0 }));
+            window.dispatchEvent(new browser.MouseEvent("mouseup", { bubbles: true, button: 0 }));
+        });
+        const panel = fixture.container.querySelector<HTMLElement>("[data-node-panel='shared-node']")!;
+        expect(Boolean(panel)).toBe(true);
+        expect(panel.querySelector<HTMLElement>("[role='textbox']")?.textContent).toBe("");
+        expect(panel.querySelectorAll(`button[aria-label='${i18n.t("canvas.references.disconnect")}']`)).toHaveLength(1);
+        expect(Boolean(panel.querySelector("svg.lucide-file-text"))).toBe(true);
+        const { buildNodeGenerationContext } = await import("@/components/canvas/canvas-node-generation");
+        expect(buildNodeGenerationContext("shared-node", projects[0].nodes, projects[0].connections, "").prompt).toContain(text.metadata!.content!);
+        const generate = panel.querySelector<HTMLButtonElement>(`button[aria-label='${i18n.t("canvas.promptPanel.generateMode", { mode: i18n.t("canvas.nodeTypes.image") })}']`)!;
+        expect(generate.disabled).toBe(false);
+        expect(requests).toEqual([]);
     } finally { await fixture.close(); }
 });
 
@@ -660,14 +1059,15 @@ test("canvas batch images persist a separate intent per slot and querying an unk
     };
     const fixture = await canvasVideoFixture(projects);
     try {
-        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find((button) => button.textContent === i18n.t("canvas.configNode.generate"));
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find(isConfigGenerateButton);
         expect(Boolean(generate)).toBe(true);
         await fixture.act(async () => generate!.click());
         const child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.type === "image")!;
-        expect(child.metadata!.images!.map((image) => image.status)).toEqual(["error", "error"]);
+        expect(child.metadata!.images!.map((image) => image.status)).toEqual(["idle", "idle"]);
+        expect(child.metadata!.images!.map((image) => image.imageTaskState)).toEqual(["unknown", "unknown"]);
         expect(new Set(child.metadata!.images!.map((image) => image.imageTaskRecordId)).size).toBe(2);
         expect(requests).toHaveLength(2);
-        const query = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.resumeImage"));
+        const query = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.verifyImageTask"));
         expect(Boolean(query)).toBe(true);
         await fixture.act(async () => query!.click());
         expect(requests).toHaveLength(2);
@@ -689,8 +1089,17 @@ test.each(["execution_unknown", "succeeded"])("batch %s recovery retains the suc
         const expand = fixture.container.querySelector<HTMLButtonElement>(`button[aria-label='${i18n.t("canvas.node.batchCollapsed")}']`)!;
         expect(Boolean(expand)).toBe(true);
         await fixture.act(async () => expand.click());
-        const queries = () => [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].filter((button) => button.textContent === i18n.t("managed.resumeImage"));
+        const queries = () => [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].filter((button) => button.textContent === i18n.t(status === "succeeded" ? "managed.recoverImage" : "managed.verifyImageTask"));
         expect(queries()).toHaveLength(2);
+        if (status === "execution_unknown") {
+            await fixture.act(async () => queries()[0].click());
+            expect(fixture.router.state.location.pathname).toBe("/image");
+            const unchanged = fixture.useCanvasStore.getState().openProject("a")!.nodes[0];
+            expect(unchanged.metadata?.content).toBe(primary.content);
+            expect(unchanged.metadata?.images?.slice(1).map((image) => image.imageTaskRecordId)).toEqual(["slot-1", "slot-2"]);
+            expect(requests).toEqual([]);
+            return;
+        }
         await fixture.act(async () => { for (const query of queries()) query.click(); });
         if (status === "succeeded") expect(upload).toHaveBeenCalledTimes(1);
         else expect(upload).not.toHaveBeenCalled();

@@ -158,6 +158,17 @@ export type FocusFrame = {
     bottomInset?: number;
 };
 
+export function measureFocusFrame(container: HTMLDivElement | null, nodeId: string): FocusFrame {
+    if (!container) return {};
+    const panelRect = container.querySelector<HTMLElement>(`[data-node-id="${nodeId}"] [data-node-panel]`)?.getBoundingClientRect();
+    const toolbarRect = container.ownerDocument.querySelector<HTMLElement>(`[data-node-toolbar="${nodeId}"]`)?.getBoundingClientRect();
+    const dockRect = container.ownerDocument.querySelector<HTMLElement>("[data-canvas-bottom-toolbar]")?.getBoundingClientRect();
+    // Both overlays clamp to the viewport, so their distance from the node changes while focusing.
+    const below = panelRect?.height ?? 0; // Includes the panel wrapper's padding above its content.
+    const above = toolbarRect ? toolbarRect.height + 14 : 0;
+    return { above, below, bottomInset: dockRect && below > 0 ? Math.max(0, container.getBoundingClientRect().bottom - dockRect.top) : 0 };
+}
+
 // Viewport that centers the node (plus any open overlay above/below) in the usable canvas area, zoomed so the
 // whole thing fits (the node itself is kept within 60% of the viewport). When an overlay is open below the node,
 // the remaining space is split 3:1 so the panel sits closer to the bottom dock (half the usual bottom gap).

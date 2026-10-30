@@ -29,6 +29,7 @@ export type TaskCenterItem = {
     canResume: boolean;
     resumeAction?: "query" | "save";
     relatedTasks?: TaskCenterItem[];
+    hasCompletedOutput?: boolean;
     sessionEpoch: number;
     imageTask?: ImageTaskRecord;
     videoLog?: GenerationLog;
@@ -119,6 +120,8 @@ function imageTaskItem(record: ImageTaskRecord, epoch: number): TaskCenterItem {
         model: record.value.model || "",
         createdAt: (record.created_at || 0) * 1000,
         taskId: record.task_id || undefined,
+        projectId: record.value.source?.canvasId,
+        nodeId: record.value.source?.nodeId,
         href: `/image?task=${encodeURIComponent(record.id)}`,
         summary: batch ? [i18n.t("managed.imageBatchSummary", batch), incomplete ? i18n.t("managed.imageBatchIncompleteNotice") : "", ready && partial ? i18n.t("managed.imageBatchPartialNotice", batch) : ""].filter(Boolean).join(" ") : undefined,
         error: record.value.result?.error_message,
@@ -177,6 +180,7 @@ function canvasItems(value: unknown, epoch: number): TaskCenterItem[] {
             source: "canvas",
             kind: node.type as TaskCenterItem["kind"],
             status,
+            hasCompletedOutput: outputs.some((output) => output.status === "success"),
             title: `${project.title} · ${node.title}`,
             prompt: metadata.prompt || "",
             model: metadata.model || "",
@@ -225,20 +229,50 @@ export async function loadTaskCenter(): Promise<TaskCenterSnapshot> {
         if (result.status === "fulfilled") snapshot.items.push(...result.value);
         else snapshot.errors[sources[index]] = result.reason instanceof Error ? result.reason.message : String(result.reason);
     });
-    // Only saved record IDs establish a relationship; similar prompts and timestamps do not.
+    // Only explicit IDs and saved source links establish a relationship.
     const imageTasks = new Map(snapshot.items.filter((item) => item.source === "image-tasks").map((item) => [item.recordId, item]));
+    const canvasRequests = new Map<string, TaskCenterItem[]>();
+    for (const task of imageTasks.values()) {
+        if (!task.projectId || !task.nodeId) continue;
+        const key = `canvas:${task.projectId}:${task.nodeId}`;
+        canvasRequests.set(key, [...(canvasRequests.get(key) || []), task]);
+    }
     const attached = new Set<string>();
     for (const item of snapshot.items) {
         if (item.source === "image-tasks") continue;
-        const related = (item.imageTaskRecordIds || []).flatMap((id) => { const task = imageTasks.get(id); return task ? [task] : []; });
+        const currentIds = item.imageTaskRecordIds || [];
+        const current = currentIds.flatMap((id) => { const task = imageTasks.get(id); return task ? [task] : []; });
+        const related = [...new Map([...current, ...(canvasRequests.get(item.id) || [])].map((task) => [task.recordId, task])).values()];
         if (!related.length) continue;
         item.relatedTasks = related;
         related.forEach((task) => attached.add(task.recordId));
+        if (item.source === "canvas") {
+            item.createdAt = Math.max(...related.map((task) => task.createdAt));
+            for (const task of related) {
+                task.projectId = item.projectId;
+                task.nodeId = item.nodeId;
+                task.href = item.href;
+            }
+            if (currentIds.length) {
+                item.status = current.length !== currentIds.length || current.some((task) => task.status === "attention") ? "attention"
+                    : current.some((task) => task.status === "active") ? "active"
+                    : current.every((task) => task.status === "failed") && !item.hasCompletedOutput ? "failed" : "attention";
+                if (item.status === "active") { item.error = undefined; item.summary = i18n.t("managed.imageTaskPending"); }
+                else if (item.status === "attention" && current.every((task) => task.status === "completed")) item.summary = i18n.t("managed.imageTaskStorageFailed");
+            }
+            continue;
+        }
         if (related.some((task) => task.status === "attention") || (item.status === "completed" && related.some((task) => task.status !== "completed")) || (item.status === "failed" && related.some((task) => task.status !== "failed"))) item.status = "attention";
     }
     snapshot.items = snapshot.items.filter((item) => item.source !== "image-tasks" || !attached.has(item.recordId));
     snapshot.items.sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
     return snapshot;
+}
+
+export async function readCanvasTaskDiagnostics(projectId: string, nodeId: string) {
+    const item = (await loadTaskCenter()).items.find((task) => task.source === "canvas" && task.projectId === projectId && task.nodeId === nodeId);
+    if (!item) throw new Error(i18n.t("taskCenter.recordRemoved"));
+    return taskCenterDiagnostics(item);
 }
 
 export async function resumeTaskCenterItem(item: TaskCenterItem): Promise<TaskCenterItem> {

@@ -17,7 +17,7 @@ import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
-import { modelOptionLabel, modelMatchesCapability, supportsAsyncImageGeneration, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { modelOptionLabel, modelMatchesCapability, supportsAsyncImageGeneration, supportsImageGeneration, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
@@ -149,8 +149,9 @@ export default function ImagePage() {
     const model = effectiveConfig.imageModel || effectiveConfig.model;
     const modelReady = isAiConfigReady(effectiveConfig, model) && modelMatchesCapability(effectiveConfig, model, "image");
     const asyncSupported = supportsAsyncImageGeneration(effectiveConfig, model);
+    const executionReady = supportsImageGeneration(effectiveConfig, model, asyncMode ? "async" : "sync");
     const { importing: importingReferences, importReferences, cancelImport } = useReferenceImageImport((images) => setReferences((value) => [...value, ...images]), `${location.key}:${interactionVersion.current}`);
-    const canGenerate = Boolean(prompt.trim()) && modelReady && !importingReferences;
+    const canGenerate = Boolean(prompt.trim()) && modelReady && executionReady && !importingReferences;
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
 
     useEffect(() => { if (!asyncSupported) setAsyncMode(false); }, [asyncSupported]);
@@ -203,6 +204,12 @@ export default function ImagePage() {
             message.warning(t("workbench.modelUnavailable"));
             openConfigDialog(true);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.configIncomplete") });
+            return;
+        }
+
+        if (!supportsImageGeneration(effectiveConfig, model, asyncMode && !agentTaskId ? "async" : "sync")) {
+            message.warning(t("managed.imageExecutionUnsupported"));
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("managed.imageExecutionUnsupported") });
             return;
         }
 
@@ -590,7 +597,7 @@ export default function ImagePage() {
                                         </Button>
                                     </div>
                                 </div>
-                                <Input.TextArea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={7} placeholder={t("imageWorkbench.promptPlaceholder")} />
+                                <Input.TextArea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={7} aria-label={t("imageWorkbench.promptPlaceholder")} placeholder={t("imageWorkbench.promptPlaceholder")} />
                             </div>
 
                             <div className="min-w-0">
@@ -674,6 +681,7 @@ export default function ImagePage() {
                             </Checkbox>
                             {asyncMode ? <p className="my-2 text-xs text-muted-foreground">{t("managed.asyncImageHint")}</p> : null}
                             {!asyncSupported && modelReady ? <p className="my-2 text-xs text-muted-foreground">{t("managed.asyncImageUnsupported")}</p> : null}
+                            {modelReady && !executionReady ? <p role="status" className="my-2 text-xs text-muted-foreground">{t("managed.imageExecutionUnsupported")}</p> : null}
                             <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
                                 {t("workbench.generate")}
                             </Button>

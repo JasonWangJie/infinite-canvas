@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { App, Modal, Segmented, Tooltip } from "antd";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { App, Modal, Segmented, Tooltip, theme as antTheme } from "antd";
 import { Download, Ellipsis, FolderPlus, Image as ImageIcon, Info, MessageSquare, Minus, Music2, Plus, RefreshCw, Settings2, Trash2, Ungroup, Upload, Video } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
+import { getCanvasImageTaskState, imageTaskActionKey } from "@/lib/canvas/canvas-generation-helpers";
 import { formatBytes, getDataUrlByteSize } from "@/lib/image-utils";
 import { useCopyText } from "@/hooks/use-copy-text";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -86,6 +87,33 @@ export function CanvasNodeHoverToolbar({
     const { message } = App.useApp();
     const { t } = useTranslation();
     const copyText = useCopyText();
+    const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const toolbarRef = useRef<HTMLDivElement>(null);
+
+    useLayoutEffect(() => {
+        const toolbar = toolbarRef.current;
+        const section = toolbar?.closest("section");
+        if (!toolbar || !node || !section) return;
+        const panel = section.querySelector<HTMLElement>(`[data-node-panel="${node.id}"]`);
+        const place = () => {
+            const bounds = section.getBoundingClientRect();
+            if (!bounds.width || !bounds.height) return;
+            const rect = toolbar.getBoundingClientRect();
+            const left = viewport.x + (node.position.x + node.width / 2) * viewport.k;
+            toolbar.style.left = `${Math.max(rect.width / 2 + 8, Math.min(left, bounds.width - rect.width / 2 - 8))}px`;
+            let bottom = viewport.y + node.position.y * viewport.k - 14;
+            if (panel) bottom = Math.min(bottom, panel.getBoundingClientRect().top - bounds.top - 8);
+            const topBar = section.querySelector<HTMLElement>("[data-canvas-top-bar]")?.getBoundingClientRect();
+            toolbar.style.top = `${Math.max((topBar?.bottom || bounds.top) - bounds.top + rect.height + 8, bottom)}px`;
+        };
+        place();
+        const resize = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(place);
+        resize?.observe(section);
+        resize?.observe(toolbar);
+        const movement = new MutationObserver(place);
+        if (panel) { resize?.observe(panel); movement.observe(panel, { attributes: true, attributeFilter: ["style"] }); }
+        return () => { resize?.disconnect(); movement.disconnect(); };
+    });
 
     useEffect(() => {
         try {
@@ -118,6 +146,7 @@ export function CanvasNodeHoverToolbar({
     const isText = node.type === CanvasNodeType.Text;
     const isConfig = node.type === CanvasNodeType.Config;
     const canRetry = node.metadata?.status === "error" && !(isVideo && Boolean(node.metadata?.videoTaskId) && !hasVideo);
+    const imageTaskState = isImage ? getCanvasImageTaskState(node) : undefined;
     const canQueryVideoTask = isVideo && Boolean(node.metadata?.videoTaskId) && !hasVideo && node.metadata?.status !== "loading";
     const quickImageToolIdSet = new Set(quickImageToolIds);
     const copyImagePrompt = (target: CanvasNodeData) => {
@@ -144,7 +173,7 @@ export function CanvasNodeHoverToolbar({
     ];
     const nodeToolbarTools: ToolbarTool[] = [
         ...(canQueryVideoTask ? [{ id: "queryVideoTask", title: t("canvas.nodeToolbar.queryVideoTaskTitle"), label: t("canvas.nodeToolbar.queryVideoTask"), icon: <RefreshCw className="size-4" />, onClick: () => onRetry(node) }] : []),
-        ...(canRetry ? [{ id: "retry", title: t("canvas.nodeToolbar.retryTitle"), label: t(node.metadata?.imageTaskRecordId || node.metadata?.images?.some((image) => image.imageTaskRecordId) ? "managed.resumeImage" : "canvas.node.retry"), icon: <RefreshCw className="size-4" />, onClick: () => onRetry(node) }] : []),
+        ...(canRetry ? [{ id: "retry", title: t(imageTaskState ? imageTaskActionKey(imageTaskState) : "canvas.nodeToolbar.retryTitle"), label: t(imageTaskState ? imageTaskActionKey(imageTaskState) : "canvas.node.retry"), icon: <RefreshCw className="size-4" />, onClick: () => onRetry(node) }] : []),
         ...(hasImage || hasVideo || isText ? [{ id: "saveAsset", title: t("common.addToAssets"), label: t("canvas.nodeToolbar.saveAsset"), icon: <FolderPlus className="size-4" />, onClick: () => onSaveAsset(node) }] : []),
         ...(hasImage || hasVideo || hasAudio ? [{ id: "download", title: t(hasAudio ? "canvas.nodeToolbar.downloadAudio" : hasVideo ? "canvas.nodeToolbar.downloadVideo" : "canvas.nodeToolbar.downloadImage"), label: t("common.download"), icon: <Download className="size-4" />, onClick: () => onDownload(node) }] : []),
         ...(isVideo ? [{ id: "edit", title: t("common.edit"), label: t("common.edit"), icon: <MessageSquare className="size-4" />, onClick: () => onToggleDialog(node) }] : []),
@@ -185,9 +214,10 @@ export function CanvasNodeHoverToolbar({
     return (
         <>
             <div
-                className="absolute z-[70] flex h-12 -translate-x-1/2 -translate-y-full items-center overflow-visible rounded-[18px] border border-black/10 bg-white text-[15px] text-[#242529] shadow-[0_8px_28px_rgba(15,23,42,.12)]"
+                ref={toolbarRef}
+                className="thin-scrollbar absolute z-[70] flex h-12 max-w-[calc(100%-16px)] -translate-x-1/2 -translate-y-full items-center overflow-x-auto rounded-[18px] border text-[15px] shadow-xl"
                 data-node-toolbar={node.id}
-                style={{ left, top }}
+                style={{ left, top, background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }}
                 onMouseEnter={() => onKeep(node.id)}
                 onMouseLeave={() => {
                     if (!imageToolSettingsOpen) onLeave();
@@ -290,10 +320,12 @@ export function CanvasNodeInfoModal({ node, open, onClose }: { node: CanvasNodeD
 
 function ToolbarAction({ title, label, icon, onClick, showLabel, active = false, danger = false }: ToolbarTool & { showLabel: boolean }) {
     const hasText = showLabel && Boolean(label);
+    const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const { token } = antTheme.useToken();
     return (
-        <Tooltip title={title} placement="top" mouseEnterDelay={0.2} color="#ffffff" styles={{ root: { color: "#242529", boxShadow: "0 8px 24px rgba(15,23,42,.16)", fontSize: 13, fontWeight: 500 } }}>
-            <button type="button" className={`group relative flex h-12 items-center whitespace-nowrap px-1.5 ${danger ? "text-[#ef4444]" : ""}`} onClick={onClick} aria-label={title}>
-                <span className={`flex h-9 items-center ${hasText ? "gap-2 px-2.5" : "justify-center px-2"} rounded-lg transition group-hover:bg-[#f0f0f1] ${active ? "bg-[#eeeeef]" : ""}`}>
+        <Tooltip title={title} placement="top" mouseEnterDelay={0.2}>
+            <button type="button" className="group relative flex h-12 shrink-0 items-center whitespace-nowrap px-1.5" style={{ color: danger ? token.colorError : undefined }} onClick={onClick} aria-label={title}>
+                <span className={`flex h-9 items-center ${hasText ? "gap-2 px-2.5" : "justify-center px-2"} rounded-lg transition group-hover:bg-black/5 dark:group-hover:bg-white/10`} style={{ background: active ? theme.toolbar.activeBg : undefined }}>
                     {icon}
                     {hasText ? <span>{label}</span> : null}
                 </span>

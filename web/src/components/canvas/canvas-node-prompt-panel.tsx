@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import { ArrowUp, LoaderCircle, Maximize2, Square } from "lucide-react";
-import { Button, Modal, Tooltip } from "antd";
+import { Button, Checkbox, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
-import { defaultConfig, resolveModelForCapability, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { defaultConfig, modelMatchesCapability, modelOptionLabel, resolveModelForCapability, supportsAsyncImageGeneration, supportsImageGeneration, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
@@ -14,7 +14,8 @@ import { CanvasPromptChipInput } from "./canvas-prompt-chip-input";
 import { CanvasVideoSettingsPopover } from "./canvas-video-settings-popover";
 import { CanvasTextSettingsPopover } from "./canvas-text-settings-popover";
 import { CanvasNodeType, type CanvasGenerationMode, type CanvasNodeData } from "@/types/canvas";
-import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { buildCanvasResourceReferences, getGroupResourceNodes, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { getCanvasImageTaskState, imageTaskActionKey, imageTaskMessageKey } from "@/lib/canvas/canvas-generation-helpers";
 import { CanvasNodeReferenceBar } from "./canvas-node-reference-bar";
 
 export type CanvasNodeGenerationMode = CanvasGenerationMode;
@@ -42,11 +43,23 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const mode = modeOverride ?? defaultMode(node.type);
     const config = buildNodeConfig(globalConfig, node, mode);
+    const modelReady = modelMatchesCapability(globalConfig, config.model, mode);
+    const asyncSupported = supportsAsyncImageGeneration(globalConfig, config.model);
+    const executionSupported = mode !== "image" || supportsImageGeneration(globalConfig, config.model, config.imageAsync ? "async" : "sync");
+    const taskState = mode === "image" ? getCanvasImageTaskState(node) : undefined;
+    const batchRecoveryAction = (node.metadata?.images?.length || 0) > 1 ? taskState === "pending" ? "managed.queryAllImages" : taskState === "storage_failed" ? "managed.recoverAllImages" : undefined : undefined;
+    const resumesTask = Boolean(taskState && taskState !== "failed");
+    const modeLabel = t(`canvas.nodeTypes.${mode}`);
     const hasTextContent = node.type === CanvasNodeType.Text && Boolean(node.metadata?.content?.trim());
     const hasImageContent = node.type === CanvasNodeType.Image && Boolean(node.metadata?.content);
     const isEditingExistingContent = hasTextContent || hasImageContent;
     const [prompt, setPrompt] = useState(node.metadata?.composerContent ?? node.metadata?.prompt ?? "");
     const [expanded, setExpanded] = useState(false);
+    const referenceNodes = connectedNodes.flatMap((item) => item.type === CanvasNodeType.Group ? getGroupResourceNodes(item.id, nodes) : [item]);
+    const hasReferenceText = mode === "image" && buildCanvasResourceReferences(referenceNodes).some((item) => item.kind === "text" && Boolean(item.text?.trim()));
+    const canGenerate = resumesTask || modelReady && executionSupported && Boolean(prompt.trim() || hasReferenceText);
+    const actionLabel = t(isRunning ? "canvas.promptPanel.stop" : batchRecoveryAction || (taskState ? imageTaskActionKey(taskState) : "canvas.promptPanel.generateMode"), { mode: modeLabel });
+    const statusMessage = isRunning ? t("canvas.node.generating") : taskState ? t(imageTaskMessageKey(taskState)) : !modelReady ? t("canvas.promptPanel.unavailableModel") : !executionSupported ? t("managed.imageExecutionUnsupported") : "";
 
     // Restore prompts only when switching nodes; preserve the current input after generation on the same node.
     useEffect(() => {
@@ -62,7 +75,7 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
 
     const submit = () => {
         const text = prompt.trim();
-        if (!text || isRunning) return;
+        if (!canGenerate || isRunning) return;
         onGenerate(node.id, mode, text);
     };
 
@@ -79,19 +92,30 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
             onPointerDown={(event) => event.stopPropagation()}
             onWheel={(event) => event.stopPropagation()}
         >
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="font-medium">{t("canvas.promptPanel.operation", { mode: modeLabel })}</span>
+                {mode === "image" ? (
+                    <Tooltip title={t(asyncSupported ? "managed.canvasAsyncHint" : "managed.asyncImageModelRequired")}>
+                        <Checkbox checked={config.imageAsync} disabled={isRunning || (!asyncSupported && !config.imageAsync)} onChange={(event) => onConfigChange(node.id, { imageAsync: event.target.checked })}>{t("managed.asyncImage")}</Checkbox>
+                    </Tooltip>
+                ) : null}
+            </div>
+            {mode === "text" ? <p className="mb-2 text-xs opacity-60">{t("canvas.promptPanel.textModeHint")}</p> : null}
+            <p className="mb-2 text-xs opacity-70" role="status" aria-live="polite" aria-atomic="true">{statusMessage}</p>
             <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={onStartReferenceSelection} />
             <CanvasPromptChipInput
                 value={prompt}
                 references={mentionReferences}
                 onChange={updatePrompt}
                 onSubmit={submit}
+                ariaLabel={t("canvas.promptPanel.promptLabel", { mode: modeLabel })}
                 className="thin-scrollbar h-40 w-full cursor-text resize-none rounded-xl px-3 py-2 text-sm leading-5 outline-none"
                 style={{ background: "transparent", color: theme.node.text }}
                 placeholder={t(`canvas.promptPanel.${mode === "image" && hasImageContent ? "editImage" : mode === "text" && hasTextContent ? "editText" : mode}`)}
             />
 
-            <div className="mt-2 flex min-w-0 items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
+            <div className="mt-2 flex min-w-0 flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <Tooltip title={t("canvas.promptPanel.expandEditor")}>
                         <Button type="text" className="!h-8 !w-8 !min-w-8 shrink-0 !rounded-full !bg-transparent !p-0" style={{ color: theme.node.text }} icon={<Maximize2 className="size-3.5" />} onClick={openExpandedEditor} aria-label={t("canvas.promptPanel.expandEditor")} />
                     </Tooltip>
@@ -129,9 +153,9 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
                     type="primary"
                     className="!h-10 !min-w-16 shrink-0 !rounded-full !px-3"
                     danger={isRunning}
-                    disabled={!isRunning && !prompt.trim()}
+                    disabled={!isRunning && !canGenerate}
                     onClick={() => (isRunning ? onStop(node.id) : submit())}
-                    aria-label={t(isRunning ? "canvas.promptPanel.stopGeneration" : "canvas.promptPanel.generate")}
+                    aria-label={actionLabel}
                 >
                     <span className="flex items-center gap-1.5">
                         {isRunning ? (
@@ -141,19 +165,33 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
                                 <span className="text-xs font-medium">{t("canvas.promptPanel.stop")}</span>
                             </>
                         ) : (
-                            <ArrowUp className="size-4" />
+                            <><ArrowUp className="size-4" /><span className="text-xs font-medium">{actionLabel}</span></>
                         )}
                     </span>
                 </Button>
             </div>
-            <Modal title={t("canvas.promptPanel.editorTitle")} open={expanded} centered width={760} footer={null} onCancel={() => setExpanded(false)} destroyOnHidden>
+            <p className="mt-2 text-[11px] opacity-50">{t("canvas.promptPanel.keyboardHint")}</p>
+            <Modal
+                title={t("canvas.promptPanel.expandedTitle", { mode: modeLabel })}
+                open={expanded}
+                centered
+                width={760}
+                footer={<div className="flex flex-wrap items-center justify-between gap-3 text-left"><span className="min-w-0 text-xs opacity-65">{t("canvas.promptPanel.expandedKeyboardHint")}</span><Button type="primary" danger={isRunning} disabled={!isRunning && !canGenerate} onClick={() => isRunning ? onStop(node.id) : submit()}>{actionLabel}</Button></div>}
+                onCancel={() => setExpanded(false)}
+                destroyOnHidden
+            >
                 <div data-canvas-no-zoom className="pt-2" onWheelCapture={(event) => event.stopPropagation()}>
+                    <p className="mb-3 break-words text-xs opacity-70">{t("canvas.promptPanel.modelLabel", { model: modelOptionLabel(config, config.model) })}</p>
+                    <p className="mb-2 text-xs opacity-70" role="status" aria-live="polite">{statusMessage}</p>
                     <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={(nodeId) => { setExpanded(false); onStartReferenceSelection?.(nodeId); }} />
                     <CanvasPromptChipInput
                         value={prompt}
                         references={mentionReferences}
                         onChange={updatePrompt}
-                        className="thin-scrollbar h-[52dvh] min-h-80 w-full cursor-text overflow-y-auto rounded-xl border p-4 text-[15px] leading-6 outline-none"
+                        onSubmit={() => isRunning ? onStop(node.id) : submit()}
+                        submitWithModifier
+                        ariaLabel={t("canvas.promptPanel.promptLabel", { mode: modeLabel })}
+                        className="thin-scrollbar h-[45dvh] min-h-40 w-full cursor-text overflow-y-auto rounded-xl border p-4 text-[15px] leading-6 outline-none"
                         style={{ background: "transparent", borderColor: theme.toolbar.border, color: theme.node.text }}
                         placeholder={t(`canvas.promptPanel.${mode === "image" && hasImageContent ? "editImage" : mode === "text" && hasTextContent ? "editText" : mode}`)}
                     />
@@ -171,6 +209,7 @@ function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode: Can
     return {
         ...globalConfig,
         model: resolveModelForCapability(globalConfig, node.metadata?.model, mode),
+        imageAsync: node.metadata?.imageAsync === true,
         reasoningEffort: node.metadata?.reasoningEffort || globalConfig.reasoningEffort || defaultConfig.reasoningEffort,
         quality: node.metadata?.quality || globalConfig.quality || defaultConfig.quality,
         size: node.metadata?.size || globalConfig.size || defaultConfig.size,

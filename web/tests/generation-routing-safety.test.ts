@@ -5,9 +5,9 @@ import { mockBrowserDocuments } from "./local-document-fixture";
 import { endCanvasSession, readCanvasSession } from "@/services/api/canvas-client";
 import { ImageGenerationUncertainError, requestAsyncImageGeneration, requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
 import { createVideoGenerationTask, pollVideoGenerationTask } from "@/services/api/video";
-import { readImageTaskRecords } from "@/services/image-task-records";
+import { readImageTaskRecords, updateImageTaskRecord } from "@/services/image-task-records";
 import { startGenerationRequest } from "@/services/generation-diagnostics";
-import { defaultConfig, resolveModelForCapability, supportsAsyncImageGeneration, useConfigStore, type AiConfig } from "@/stores/use-config-store";
+import { defaultConfig, modelMatchesCapability, refreshGatewayModels, resolveModelForCapability, selectableModelsByCapability, supportsAsyncImageGeneration, supportsImageGeneration, useConfigStore, type AiConfig } from "@/stores/use-config-store";
 
 const originalFetch = globalThis.fetch;
 const originalAdapter = axios.defaults.adapter;
@@ -203,4 +203,87 @@ test("removing a model still permits original video queries but prevents new sub
     expect(await pollVideoGenerationTask(config, { id: "original-task", provider: "openai", model: config.model })).toEqual({ status: "pending" });
     await expect(createVideoGenerationTask(config, "new video")).rejects.toThrow("当前用户无权调用所选模型");
     expect(requests).toEqual(["GET /api/ai/v1/videos/original-task"]);
+});
+
+test.each(["gpt-image-2", "dall-e-3", "seedream-5-pro", "qwen-image", "flux.1-pro"])("dedicated image model %s cannot use text endpoints, including stale selections", async (name) => {
+    const config = configure(["image-generation", "openai", "openai-response", "gemini"], name);
+    globalThis.fetch = (async (url) => { requests.push(String(url)); throw new Error("Unexpected text request"); }) as typeof fetch;
+    expect(modelMatchesCapability(config, config.model, "image")).toBe(true);
+    expect(modelMatchesCapability(config, config.model, "text")).toBe(false);
+    expect(selectableModelsByCapability(config, "text")).toEqual([]);
+    await expect(requestImageQuestion(config, [{ role: "user", content: "draw" }], () => {})).rejects.toThrow("当前模型不支持此操作");
+    expect(requests).toEqual([]);
+});
+
+test("model refresh replaces an image-only text default while preserving genuine Gemini multi-capability", async () => {
+    configure(["image-generation", "openai-response"], "gpt-image-2");
+    globalThis.fetch = (async () => Response.json({ data: [
+        { id: "gpt-image-2", supported_endpoint_types: ["image-generation", "openai", "openai-response"] },
+        { id: "gemini-image", supported_endpoint_types: ["gemini", "image-generation"] },
+    ] })) as typeof fetch;
+    await refreshGatewayModels();
+    const { config } = useConfigStore.getState();
+    expect(config.imageModel).toBe("gateway::gpt-image-2");
+    expect(config.textModel).toBe("gateway::gemini-image");
+    expect(selectableModelsByCapability(config, "text")).toEqual(["gateway::gemini-image"]);
+    expect(modelMatchesCapability(config, config.textModel, "image")).toBe(true);
+});
+
+test.each(["sync", "async"] as const)("explicitly unavailable %s execution is stopped before a paid POST", async (operation) => {
+    configure(["image-generation"], "gpt-image-2");
+    globalThis.fetch = (async () => Response.json({ data: [{ id: "gpt-image-2", supported_endpoint_types: ["image-generation"], image_execution: { sync: operation !== "sync", async: operation !== "async" } }] })) as typeof fetch;
+    await refreshGatewayModels();
+    const { config } = useConfigStore.getState();
+    expect(supportsImageGeneration(config, config.imageModel, "sync")).toBe(operation !== "sync");
+    expect(supportsAsyncImageGeneration(config, config.imageModel)).toBe(operation !== "async");
+    globalThis.fetch = (async (url) => { requests.push(String(url)); throw new Error("Unexpected paid request"); }) as typeof fetch;
+    await expect(operation === "sync" ? requestGeneration(config, "draw") : requestAsyncImageGeneration(config, "draw", [], "disabled-mode")).rejects.toThrow("当前模型不支持所选生成方式");
+    expect(requests).toEqual([]);
+});
+
+test("declared Gemini sync route wins over an async-only standard image endpoint", async () => {
+    configure(["image-generation", "gemini"], "opaque-model");
+    globalThis.fetch = (async () => Response.json({ data: [{ id: "opaque-model", supported_endpoint_types: ["image-generation", "gemini"], image_execution: { sync: true, async: true, sync_endpoint: "gemini" } }] })) as typeof fetch;
+    await refreshGatewayModels();
+    const { config } = useConfigStore.getState();
+    expect(modelMatchesCapability(config, config.imageModel, "image")).toBe(true);
+    axios.defaults.adapter = async (request) => response(request, { candidates: [{ content: { parts: [{ inlineData: { data: "aW1hZ2U=", mimeType: "image/png" } }] } }] });
+    expect(await requestGeneration(config, "draw")).toHaveLength(1);
+    expect(requests).toEqual(["POST /api/ai/v1beta/models/opaque-model:generateContent"]);
+});
+
+test("malformed execution metadata does not replace the last valid model catalog", async () => {
+    const config = configure(["image-generation"]);
+    globalThis.fetch = (async () => Response.json({ data: [{ id: "gpt-image-2", supported_endpoint_types: ["image-generation"], image_execution: { sync: "false", async: true } }] })) as typeof fetch;
+    await expect(refreshGatewayModels()).rejects.toThrow();
+    expect(useConfigStore.getState().config).toBe(config);
+});
+
+test("async canvas submission waits for the linked intent save, then reuses the known task without another POST", async () => {
+    const config = configure(["image-generation"]);
+    let linked = false;
+    globalThis.fetch = (async (url, init) => {
+        expect(linked).toBe(true);
+        expect((await readImageTaskRecords())["linked-intent"].status).toBe("submitting");
+        requests.push(`${init?.method} ${url}`);
+        return Response.json({ task_id: "asyncimg_linked" }, { status: 202 });
+    }) as typeof fetch;
+    const source = { kind: "canvas" as const, canvasId: "canvas", nodeId: "image", slotId: "slot" };
+    const options = { onIntentSaved: async (id: string) => { expect(id).toBe("linked-intent"); await updateImageTaskRecord(id, (record) => ({ ...record, value: { ...record.value, source } })); linked = true; } };
+    expect(await requestAsyncImageGeneration(config, "draw", [], "linked-intent", options)).toBe("asyncimg_linked");
+    expect(await requestAsyncImageGeneration(config, "draw", [], "linked-intent", options)).toBe("asyncimg_linked");
+    expect(requests).toEqual(["POST /api/ai/v1/images/generations_async"]);
+    expect((await readImageTaskRecords())["linked-intent"].value.source).toEqual(source);
+});
+
+test.each(["cancelled", "save-failed"])("async canvas intent %s before POST never reaches the gateway", async (cause) => {
+    const config = configure(["image-generation"]);
+    const controller = new AbortController();
+    globalThis.fetch = (async (url) => { requests.push(String(url)); throw new Error("Unexpected paid request"); }) as typeof fetch;
+    await expect(requestAsyncImageGeneration(config, "draw", [], cause, {
+        signal: controller.signal,
+        onIntentSaved: async () => { if (cause === "cancelled") controller.abort(); else throw new Error("save failed"); },
+    })).rejects.toThrow();
+    expect((await readImageTaskRecords())[cause].status).toBe("failed");
+    expect(requests).toEqual([]);
 });

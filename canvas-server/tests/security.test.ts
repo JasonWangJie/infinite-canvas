@@ -336,6 +336,91 @@ describe("Canvas authorization and owner isolation", () => {
         expect(f.calls.find((call) => call.path.includes("streamGenerateContent"))?.url).toBe("http://new-api.internal/v1beta/models/allowed-gemini:streamGenerateContent?alt=sse");
     });
 
+    test.each(["generations", "edits", "generations_async", "edits_async"])("rejects disabled image execution for %s before forwarding its paid request", async (operation) => {
+        const f = setup();
+        const a = await login(f, 1);
+        const async = operation.endsWith("_async");
+        f.intercept((path) => path === "/v1/models" ? Response.json({ data: [{ id: "allowed-image", supported_endpoint_types: ["image-generation"], image_execution: { sync: async, async: !async } }] }) : undefined);
+        const requestHeaders = headers(f, a);
+        let body: BodyInit = JSON.stringify({ model: "allowed-image", prompt: "image" });
+        if (operation.startsWith("edits")) {
+            delete requestHeaders["Content-Type"];
+            const form = new FormData();
+            form.set("model", "allowed-image");
+            form.set("image", new File(["original-image"], "reference.png", { type: "image/png" }));
+            body = form;
+        }
+        const path = `/v1/images/${operation}`;
+        const response = await f.app.request(`${f.config.origin}/api/ai${path}`, { method: "POST", headers: requestHeaders, body });
+        expect(response.status).toBe(403);
+        expect((await response.json()).error.code).toBe("MODEL_IMAGE_EXECUTION_FORBIDDEN");
+        expect(f.calls.filter((call) => call.path === path)).toHaveLength(0);
+    });
+
+    test.each([null, [], {}, { sync: true }, { sync: true, async: "true" }, { sync: true, async: true, sync_endpoint: "openai" }].map((execution) => ({ execution })))("rejects malformed image execution metadata %j without forwarding", async ({ execution }) => {
+        const f = setup();
+        const a = await login(f, 1);
+        f.intercept((path) => path === "/v1/models" ? Response.json({ data: [{ id: "allowed-image", supported_endpoint_types: ["image-generation"], image_execution: execution }] }) : undefined);
+        const response = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-image" }) });
+        expect(response.status).toBe(502);
+        expect((await response.json()).error.code).toBe("GATEWAY_PROTOCOL_ERROR");
+        expect(f.calls.some((call) => call.path === "/v1/images/generations")).toBe(false);
+    });
+
+    test.each(["generateContent", "streamGenerateContent"])("checks Gemini image execution only when %s explicitly requests IMAGE output", async (method) => {
+        const f = setup();
+        const a = await login(f, 1);
+        f.intercept((path) => path === "/v1/models" ? Response.json({ data: [{ id: "allowed-gemini", supported_endpoint_types: ["gemini"], image_execution: { sync: false, async: true } }] }) : undefined);
+        const path = `/v1beta/models/allowed-gemini:${method}`;
+        for (const modalities of [undefined, ["TEXT"], ["TEXT", "IMAGE"]]) {
+            const count = f.calls.filter((call) => call.path === path).length;
+            const response = await f.app.request(`${f.config.origin}/api/ai${path}`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ contents: [{ parts: [{ text: "a tree" }] }], ...(modalities ? { generationConfig: { responseModalities: modalities } } : {}) }) });
+            const image = modalities?.includes("IMAGE");
+            expect(response.status).toBe(image ? 403 : 200);
+            if (image) expect((await response.json()).error.code).toBe("MODEL_IMAGE_EXECUTION_FORBIDDEN");
+            else await response.text();
+            expect(f.calls.filter((call) => call.path === path)).toHaveLength(count + (image ? 0 : 1));
+        }
+    });
+
+    test("allowed image execution preserves multipart bytes and does not make the preferred sync protocol exclusive", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        f.intercept((path) => path === "/v1/models" ? Response.json({ data: [{ id: "allowed-image", supported_endpoint_types: ["image-generation", "gemini"], image_execution: { sync: true, async: false, sync_endpoint: "gemini" } }] }) : undefined);
+        const form = new FormData();
+        form.set("model", "allowed-image");
+        form.set("prompt", "edit the original");
+        form.set("image", new File([new Uint8Array([0, 13, 10, 255])], "reference.png", { type: "image/png" }));
+        const requestHeaders = headers(f, a);
+        delete requestHeaders["Content-Type"];
+        const request = new Request(`${f.config.origin}/api/ai/v1/images/edits`, { method: "POST", headers: requestHeaders, body: form });
+        const original = await request.clone().arrayBuffer();
+        const response = await f.app.request(request);
+        expect(response.status).toBe(200);
+        await response.text();
+        const forwarded = f.calls.find((call) => call.path === "/v1/images/edits")!;
+        expect(Buffer.from(forwarded.init!.body as ArrayBuffer)).toEqual(Buffer.from(original));
+        expect(new Headers(forwarded.init?.headers).get("Content-Type")).toBe(request.headers.get("Content-Type"));
+    });
+
+    test("image execution changes do not block an existing task query or alter model metadata", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        const accepted = await f.app.request(`${f.config.origin}/api/ai/v1/images/generations_async`, { method: "POST", headers: headers(f, a), body: JSON.stringify({ model: "allowed-image" }) });
+        expect(accepted.status).toBe(202);
+        await accepted.text();
+        const listing = { data: [{ id: "allowed-image", supported_endpoint_types: ["image-generation"], image_execution: { sync: false, async: false } }] };
+        f.intercept((path) => path === "/v1/models" ? Response.json(listing) : undefined);
+        const models = await f.app.request(`${f.config.origin}/api/models`, { headers: { Cookie: a.cookie } });
+        expect(await models.json()).toEqual(listing);
+        const modelQueries = f.calls.filter((call) => call.path === "/v1/models").length;
+        const history = await f.app.request(`${f.config.origin}/api/ai/v1/images/tasks_async/asyncimg_123`, { headers: { Cookie: a.cookie } });
+        expect(history.status).toBe(200);
+        expect((await history.json()).status).toBe("succeeded");
+        expect(f.calls.filter((call) => call.path === "/v1/models")).toHaveLength(modelQueries);
+        expect(f.calls.filter((call) => call.path === "/v1/images/generations_async")).toHaveLength(1);
+    });
+
     test("correlates model stages with a fresh server request ID without exposing request or upstream header content", async () => {
         const f = setup();
         const a = await login(f, 1);

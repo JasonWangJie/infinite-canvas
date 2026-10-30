@@ -13,13 +13,14 @@ export type ImageTaskResult = {
     error_message?: string;
 };
 export type ImageTaskBatch = { total: number; completed: number; failed: number; unknown: number };
+export type ImageTaskSource = { kind: "canvas"; canvasId: string; nodeId: string; slotId?: string };
 export type ImageTaskRecord = {
     id: string;
     task_id: string | null;
     status: string;
     created_at?: number;
     has_result?: boolean;
-    value: { model?: string; endpoint?: string; retryAfter?: number; result?: ImageTaskResult; localImages?: Record<string, string>; batch?: ImageTaskBatch; requests?: GenerationRequestMeasurement[]; lastQuery?: GenerationRequestMeasurement; mediaTimings?: Record<string, ImageStorageTimings> };
+    value: { source?: ImageTaskSource; model?: string; endpoint?: string; retryAfter?: number; result?: ImageTaskResult; localImages?: Record<string, string>; batch?: ImageTaskBatch; requests?: GenerationRequestMeasurement[]; lastQuery?: GenerationRequestMeasurement; mediaTimings?: Record<string, ImageStorageTimings> };
 };
 
 function taskRecords(value: unknown): Record<string, ImageTaskRecord> {
@@ -28,6 +29,8 @@ function taskRecords(value: unknown): Record<string, ImageTaskRecord> {
     for (const [id, record] of Object.entries(value)) {
         if (!record || typeof record !== "object" || Array.isArray(record) || record.id !== id || typeof record.status !== "string"
             || (record.task_id !== null && typeof record.task_id !== "string") || !record.value || typeof record.value !== "object" || Array.isArray(record.value)) throw new Error(i18n.t("taskCenter.invalidSource"));
+        const source = record.value.source;
+        if (source !== undefined && (!source || source.kind !== "canvas" || typeof source.canvasId !== "string" || !source.canvasId || typeof source.nodeId !== "string" || !source.nodeId || (source.slotId !== undefined && typeof source.slotId !== "string"))) throw new Error(i18n.t("taskCenter.invalidSource"));
     }
     return value as Record<string, ImageTaskRecord>;
 }

@@ -7,7 +7,25 @@ import type { NodeGenerationInput } from "@/components/canvas/canvas-node-genera
 import type { CanvasNodeGenerationMode } from "@/components/canvas/canvas-node-prompt-panel";
 import type { CanvasImageAngleParams } from "@/components/canvas/canvas-node-angle-dialog";
 import type { ReferenceImage } from "@/types/image";
-import { CanvasNodeType, type CanvasAssistantSession, type CanvasConnection, type CanvasNodeData, type CanvasNodeMetadata } from "@/types/canvas";
+import { CanvasNodeType, type CanvasAssistantSession, type CanvasConnection, type CanvasImageTaskState, type CanvasNodeData, type CanvasNodeMetadata } from "@/types/canvas";
+
+export function getCanvasImageTaskState(node: Pick<CanvasNodeData, "metadata">): CanvasImageTaskState | undefined {
+    const entries = [node.metadata, ...(node.metadata?.images || [])];
+    const states = entries.flatMap((entry) => entry?.imageTaskRecordId ? [entry.imageTaskState || "unknown"] : []);
+    return (["storage_failed", "pending", "unknown", "failed"] as const).find((state) => states.includes(state));
+}
+
+export function imageTaskActionKey(state: CanvasImageTaskState) {
+    return state === "pending" ? "managed.resumeImage" : state === "storage_failed" ? "managed.recoverImage" : state === "failed" ? "managed.regenerateImageTask" : "managed.verifyImageTask";
+}
+
+export function imageTaskMessageKey(state: CanvasImageTaskState) {
+    return state === "pending" ? "managed.imageTaskPending" : state === "storage_failed" ? "managed.imageTaskStorageFailed" : state === "failed" ? "managed.taskFailed" : "managed.imageTaskUnknown";
+}
+
+export function imageTaskNodeStatus(state: CanvasImageTaskState | undefined) {
+    return state === "pending" || state === "unknown" ? "idle" as const : "error" as const;
+}
 
 export function imageExtension(dataUrl: string) {
     return dataUrl.match(/^data:image[/]([^;]+)/)?.[1] || dataUrl.match(/image[/]([^;]+)/)?.[1] || "png";
@@ -110,6 +128,7 @@ export function buildGenerationConfig(config: AiConfig, node: CanvasNodeData | u
     return {
         ...config,
         model: resolveModelForCapability(config, node?.metadata?.model, mode),
+        imageAsync: mode === "image" && node?.metadata?.imageAsync === true,
         reasoningEffort: node?.metadata?.reasoningEffort || config.reasoningEffort || defaultConfig.reasoningEffort,
         quality: node?.metadata?.quality || config.quality || defaultConfig.quality,
         size: node?.metadata?.size || config.size || defaultConfig.size,
@@ -141,8 +160,8 @@ export function resetInterruptedGeneration(nodes: CanvasNodeData[]) {
                       metadata: {
                           ...node.metadata,
                           status: "error" as const,
-                          errorDetails: i18n.t("canvas.generation.interrupted"),
-                          images: node.metadata.images?.map((image) => (image.status === "loading" ? { ...image, status: "error" as const, errorDetails: i18n.t("canvas.generation.interrupted") } : image)),
+                          errorDetails: i18n.t(node.metadata.imageTaskRecordId ? "managed.imageTaskUnknown" : "canvas.generation.interrupted"),
+                          images: node.metadata.images?.map((image) => (image.status === "loading" ? { ...image, status: "error" as const, errorDetails: i18n.t(image.imageTaskRecordId ? "managed.imageTaskUnknown" : "canvas.generation.interrupted") } : image)),
                           texts: node.metadata.texts?.map((text) => (text.status === "loading" ? { ...text, status: "error" as const, errorDetails: i18n.t("canvas.generation.interrupted") } : text)),
                       },
                   }

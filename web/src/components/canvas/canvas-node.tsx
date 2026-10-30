@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { ChevronRight, Copy, Download, Group, Image as ImageIcon, Music2, Puzzle, RefreshCw, Star, Trash2, Video } from "lucide-react";
 
@@ -14,6 +14,11 @@ import { CanvasNodeType, type CanvasNodeData, type CanvasNodeImage, type CanvasN
 import type { CanvasNodeContext, CanvasPluginHost } from "@/types/canvas-plugin";
 import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { useTranslation } from "react-i18next";
+import { useParams } from "react-router-dom";
+import { App } from "antd";
+import { useCopyText } from "@/hooks/use-copy-text";
+import { getCanvasImageTaskState, imageTaskActionKey, imageTaskMessageKey } from "@/lib/canvas/canvas-generation-helpers";
+import { readCanvasTaskDiagnostics } from "@/services/task-center";
 
 type ResizeCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
 const selectionBlue = "#2f80ff";
@@ -54,6 +59,7 @@ type CanvasNodeProps = {
     onRetryBatchImage?: (node: CanvasNodeData, imageId: string) => void;
     onDeleteBatchImage?: (nodeId: string, imageId: string) => void;
     onRetry?: (node: CanvasNodeData) => void;
+    onRecoverAllImages?: (node: CanvasNodeData, action: "query" | "save") => void;
     onViewImage?: (node: CanvasNodeData, imageId?: string) => void;
     onSelectReference?: (nodeId: string) => void;
     onContextMenu: (event: React.MouseEvent, nodeId: string) => void;
@@ -74,6 +80,7 @@ type NodeContentRendererProps = {
     onStopEditing: () => void;
     mentionReferences: CanvasResourceReference[];
     onRetry?: (node: CanvasNodeData) => void;
+    onRecoverAllImages?: (action: "query" | "save") => void;
     onToggleBatch?: () => void;
     onSetBatchPrimary?: (itemId: string) => void;
     onDuplicateBatchImage?: (imageId: string) => void;
@@ -119,6 +126,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     onRetryBatchImage,
     onDeleteBatchImage,
     onRetry,
+    onRecoverAllImages,
     onViewImage,
     onSelectReference,
     onContextMenu,
@@ -416,6 +424,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                         onContentChange={onContentChange}
                         onStopEditing={() => setIsEditingContent(false)}
                         onRetry={onRetry}
+                        onRecoverAllImages={(action) => onRecoverAllImages?.(data, action)}
                         onToggleBatch={() => onToggleBatch?.(data.id)}
                         onSetBatchPrimary={(itemId) => onSetBatchPrimary?.(data.id, itemId)}
                         onDuplicateBatchImage={(imageId) => onDuplicateBatchImage?.(data, imageId)}
@@ -448,9 +457,9 @@ export const CanvasNode = React.memo(function CanvasNode({
 
             {/* Counter-scale the panel so its on-screen size stays constant while the canvas zooms. */}
             {showPanel && !isGroup && renderPanel ? (
-                <div className="absolute left-1/2 top-full z-[70] w-[600px] pt-4" style={{ transform: `translateX(-50%) scale(${1 / scale})`, transformOrigin: "top center" }} data-node-panel={data.id}>
+                <CanvasNodePanel nodeId={data.id} scale={scale}>
                     {renderPanel(data)}
-                </div>
+                </CanvasNodePanel>
             ) : null}
         </div>
     );
@@ -459,6 +468,7 @@ export const CanvasNode = React.memo(function CanvasNode({
 function NodeContent(props: NodeContentRendererProps) {
     if (props.node.type === CanvasNodeType.Config && props.renderNodeContent) return props.renderNodeContent(props.node);
     if (props.isBatchRoot && props.node.type === CanvasNodeType.Image) return <ImageNodeContent {...props} />;
+    if (props.node.type === CanvasNodeType.Image && props.node.metadata?.status !== "loading" && getCanvasImageTaskState(props.node)) return <ImageTaskContent node={props.node} theme={props.theme} onRetry={props.onRetry} />;
     if (props.node.type === CanvasNodeType.Text && props.node.metadata?.texts?.length && (props.node.metadata.status !== "error" || props.node.metadata.texts.some((text) => text.content))) return <TextContent {...props} />;
     if (props.node.metadata?.status === "loading") return <LoadingContent theme={props.theme} />;
     if (props.node.metadata?.status === "error") return <ErrorContent node={props.node} theme={props.theme} onRetry={props.onRetry} />;
@@ -473,6 +483,46 @@ function NodeContent(props: NodeContentRendererProps) {
         return <PluginContent ctx={props.pluginContext} />;
     }
     return <MissingPluginContent theme={props.theme} type={props.node.type} />;
+}
+
+function CanvasNodePanel({ nodeId, scale, children }: { nodeId: string; scale: number; children: ReactNode }) {
+    const panelRef = useRef<HTMLDivElement>(null);
+    useLayoutEffect(() => {
+        const panel = panelRef.current;
+        const node = panel?.closest<HTMLElement>("[data-node-id]");
+        const section = node?.closest("section");
+        if (!panel || !node || !section) return;
+        const place = () => {
+            const bounds = section.getBoundingClientRect();
+            if (!bounds.width || !bounds.height) return;
+            const topBar = section.querySelector<HTMLElement>("[data-canvas-top-bar]")?.getBoundingClientRect();
+            const toolbar = section.querySelector<HTMLElement>("[data-canvas-bottom-toolbar]")?.getBoundingClientRect();
+            const nodeToolbar = section.querySelector<HTMLElement>(`[data-node-toolbar="${nodeId}"]`)?.getBoundingClientRect();
+            const left = Math.max(0, bounds.left) + 8;
+            const right = Math.min(window.innerWidth, bounds.right) - 8;
+            const top = Math.max(0, topBar?.bottom || bounds.top) + 8 + (nodeToolbar ? nodeToolbar.height + 8 : 0);
+            const bottom = Math.min(window.innerHeight, toolbar?.top || bounds.bottom) - 8;
+            const width = Math.min(600, Math.max(0, right - left));
+            panel.style.width = `${width}px`;
+            panel.style.maxHeight = `${Math.max(0, bottom - top)}px`;
+            const anchor = node.getBoundingClientRect();
+            const rect = panel.getBoundingClientRect();
+            const centered = anchor.left + anchor.width / 2 - width / 2;
+            const x = Math.max(left, Math.min(centered, right - width)) - centered;
+            const y = Math.max(top, Math.min(anchor.bottom, bottom - rect.height)) - anchor.bottom;
+            panel.style.transform = `translate(calc(-50% + ${x / scale}px), ${y / scale}px) scale(${1 / scale})`;
+        };
+        place();
+        const resize = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(place);
+        resize?.observe(section);
+        resize?.observe(panel);
+        const movement = new MutationObserver(place);
+        movement.observe(node, { attributes: true, attributeFilter: ["style"] });
+        if (node.parentElement) movement.observe(node.parentElement, { attributes: true, attributeFilter: ["style"] });
+        window.addEventListener("resize", place);
+        return () => { resize?.disconnect(); movement.disconnect(); window.removeEventListener("resize", place); };
+    }, [nodeId, scale]);
+    return <div ref={panelRef} className="thin-scrollbar absolute left-1/2 top-full z-[70] w-[min(600px,calc(100vw-16px))] overflow-y-auto pt-4" style={{ transform: `translateX(-50%) scale(${1 / scale})`, transformOrigin: "top center" }} data-node-panel={nodeId}>{children}</div>;
 }
 
 const nodeContentRenderers = {
@@ -529,6 +579,27 @@ function ErrorContent({ node, theme, onRetry }: Pick<NodeContentRendererProps, "
             </button>
         </div>
     );
+}
+
+function ImageTaskDiagnostics({ nodeId }: { nodeId: string }) {
+    const { id } = useParams();
+    const { t } = useTranslation();
+    const copyText = useCopyText();
+    const { message } = App.useApp();
+    return <button type="button" className="px-2 py-1 text-[11px] opacity-60 hover:opacity-100" title={t("tasks.copyDiagnosticsHint")} onMouseDown={(event) => event.stopPropagation()} onClick={(event) => {
+        event.stopPropagation();
+        if (id) void readCanvasTaskDiagnostics(id, nodeId).then((value) => copyText(value)).catch((error) => message.error(error instanceof Error ? error.message : String(error)));
+    }}>{t("tasks.copyDiagnostics")}</button>;
+}
+
+function ImageTaskContent({ node, theme, onRetry }: Pick<NodeContentRendererProps, "node" | "theme" | "onRetry">) {
+    const { t } = useTranslation();
+    const state = getCanvasImageTaskState(node)!;
+    return <div className="flex max-w-[280px] flex-col items-center gap-3 px-5 text-center" style={{ color: theme.node.text }}>
+        <span className="text-xs leading-5" data-image-task-state={state}>{state === "failed" ? node.metadata?.errorDetails || t(imageTaskMessageKey(state)) : t(imageTaskMessageKey(state))}</span>
+        <button type="button" className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs transition hover:bg-black/5 dark:hover:bg-white/10" onMouseDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); onRetry?.(node); }}><RefreshCw className="size-3.5" />{t(imageTaskActionKey(state))}</button>
+        <ImageTaskDiagnostics nodeId={node.id} />
+    </div>;
 }
 
 function MissingPluginContent({ theme, type }: Pick<NodeContentRendererProps, "theme"> & { type: string }) {
@@ -686,6 +757,7 @@ function ImageNodeContent(props: NodeContentRendererProps) {
             onDuplicateBatchImage={props.onDuplicateBatchImage}
             onDownloadBatchImage={props.onDownloadBatchImage}
             onRetryBatchImage={props.onRetryBatchImage}
+            onRecoverAllImages={props.onRecoverAllImages}
             onDeleteBatchImage={props.onDeleteBatchImage}
             onViewBatchImage={props.onViewBatchImage}
         />
@@ -745,6 +817,7 @@ function ImageContent({
     onDuplicateBatchImage,
     onDownloadBatchImage,
     onRetryBatchImage,
+    onRecoverAllImages,
     onDeleteBatchImage,
     onViewBatchImage,
 }: {
@@ -756,6 +829,7 @@ function ImageContent({
     onDuplicateBatchImage?: (imageId: string) => void;
     onDownloadBatchImage?: (imageId: string) => void;
     onRetryBatchImage?: (imageId: string) => void;
+    onRecoverAllImages?: (action: "query" | "save") => void;
     onDeleteBatchImage?: (imageId: string) => void;
     onViewBatchImage?: (imageId: string) => void;
 }) {
@@ -801,7 +875,13 @@ function ImageContent({
                     <ImageSlotStatus image={primaryImage} />
                 )}
             </div>
-            {primaryImage?.status === "error" ? <BatchImageFailureActions placement="left" recovery={Boolean(primaryImage.imageTaskRecordId)} onRetry={() => onRetryBatchImage?.(primaryImage.id)} onDelete={() => onDeleteBatchImage?.(primaryImage.id)} /> : null}
+            {primaryImage && primaryImage.status !== "loading" && (primaryImage.imageTaskRecordId || primaryImage.status === "error") ? <BatchImageFailureActions placement="left" image={primaryImage} onRetry={() => onRetryBatchImage?.(primaryImage.id)} onDelete={() => onDeleteBatchImage?.(primaryImage.id)} /> : null}
+            {isBatchRoot ? <div className="absolute bottom-2 left-2 right-2 z-30 flex flex-wrap items-center justify-center gap-1 text-[11px]" onMouseDown={(event) => event.stopPropagation()}>
+                {images.some((image) => image.status !== "loading" && image.imageTaskRecordId && image.imageTaskState === "pending") ? <button type="button" disabled={images.some((image) => image.status === "loading")} className="rounded px-2 py-1 hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/10" onClick={(event) => { event.stopPropagation(); onRecoverAllImages?.("query"); }}>{t("managed.queryAllImages")}</button> : null}
+                {images.some((image) => image.status !== "loading" && image.imageTaskRecordId && image.imageTaskState === "storage_failed") ? <button type="button" disabled={images.some((image) => image.status === "loading")} className="rounded px-2 py-1 hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/10" onClick={(event) => { event.stopPropagation(); onRecoverAllImages?.("save"); }}>{t("managed.recoverAllImages")}</button> : null}
+                <ImageTaskDiagnostics nodeId={node.id} />
+            </div> : null}
+            {!isBatchRoot && node.metadata?.generationType ? <div className="absolute bottom-2 right-2 z-30" onMouseDown={(event) => event.stopPropagation()}><ImageTaskDiagnostics nodeId={node.id} /></div> : null}
             {primaryImage?.content ? (
                 <button type="button" className="pointer-events-none absolute left-2.5 top-2.5 z-30 flex h-8 items-center gap-1 rounded-lg border px-2 text-[10px] font-medium opacity-0 shadow-[0_6px_18px_rgba(15,23,42,.16)] backdrop-blur-md transition hover:scale-[1.02] group-hover/node:pointer-events-auto group-hover/node:opacity-100" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.toolbar.activeText }} title={t("common.download")} onClick={(event) => (event.stopPropagation(), onDownloadBatchImage?.(primaryImage.id))}>
                     <Download className="size-3" />
@@ -896,19 +976,19 @@ function ExpandedImageCard({ node, image, index, scale, onView, onSetPrimary, on
                     </button>
                 </div>
             ) : null}
-            {image.status === "error" ? <BatchImageFailureActions placement="right" recovery={Boolean(image.imageTaskRecordId)} onRetry={onRetry} onDelete={onDelete} /> : null}
+            {image.status !== "loading" && (image.imageTaskRecordId || image.status === "error") ? <BatchImageFailureActions placement="right" image={image} onRetry={onRetry} onDelete={onDelete} /> : null}
         </div>
     );
 }
 
-function BatchImageFailureActions({ placement, recovery, onRetry, onDelete }: { placement: "left" | "right"; recovery: boolean; onRetry: () => void; onDelete: () => void }) {
+function BatchImageFailureActions({ placement, image, onRetry, onDelete }: { placement: "left" | "right"; image: CanvasNodeImage; onRetry: () => void; onDelete: () => void }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { t } = useTranslation();
     return (
         <div className={`absolute top-3 z-30 flex items-center gap-1.5 ${placement === "left" ? "left-3" : "right-3"}`}>
             <button type="button" className="flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium shadow-sm transition hover:scale-[1.02]" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }} onClick={(event) => (event.stopPropagation(), onRetry())}>
                 <RefreshCw className="size-3.5" />
-                {t(recovery ? "managed.resumeImage" : "canvas.node.retry")}
+                {t(image.imageTaskRecordId ? imageTaskActionKey(image.imageTaskState || "unknown") : "managed.regenerateImageTask")}
             </button>
             <button type="button" className="grid size-8 place-items-center rounded-lg border shadow-sm transition hover:scale-[1.02]" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.node.text }} onClick={(event) => (event.stopPropagation(), onDelete())} aria-label={t("common.delete")} title={t("common.delete")}>
                 <Trash2 className="size-3.5" />
@@ -921,10 +1001,11 @@ function ImageSlotStatus({ image }: { image?: CanvasNodeImage }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { t } = useTranslation();
     const failed = image?.status === "error";
+    const taskState = image?.imageTaskRecordId ? image.imageTaskState || "unknown" : undefined;
     return (
         <div className="flex h-full w-full flex-col items-center justify-center gap-3 px-6 text-center" style={{ background: theme.node.fill, color: failed ? theme.node.text : theme.node.activeStroke }}>
-            {failed ? <span className="text-xs leading-5">{image.errorDetails || t("canvas.node.failed")}</span> : <div className="size-10 animate-spin rounded-full border-2" style={{ borderColor: theme.node.stroke, borderTopColor: theme.node.activeStroke }} />}
-            {!failed ? <span className="text-[10px] tracking-[0.2em]">{t("canvas.node.generating")}</span> : null}
+            {taskState && image?.status !== "loading" ? <span className="text-xs leading-5" data-image-task-state={taskState}>{taskState === "failed" ? image?.errorDetails || t(imageTaskMessageKey(taskState)) : t(imageTaskMessageKey(taskState))}</span> : failed ? <span className="text-xs leading-5">{image?.errorDetails || t("canvas.node.failed")}</span> : <div className="size-10 animate-spin rounded-full border-2" style={{ borderColor: theme.node.stroke, borderTopColor: theme.node.activeStroke }} />}
+            {!failed && (!taskState || image?.status === "loading") ? <span className="text-[10px] tracking-[0.2em]">{t("canvas.node.generating")}</span> : null}
         </div>
     );
 }

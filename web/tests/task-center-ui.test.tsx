@@ -239,6 +239,21 @@ test("a failed source keeps other records visible and manual refresh recovers it
     expect(container!.querySelectorAll("[data-task-id]")).toHaveLength(2);
 });
 
+test("a canvas-scoped task link includes its orphan requests and can expand to all canvases", async () => {
+    load.mockResolvedValue({ items: [
+        item({ id: "canvas:p:n", source: "canvas", projectId: "p", nodeId: "n", href: "/canvas/p?focusNode=n", canResume: false }),
+        item({ id: "orphan", projectId: "p", nodeId: "deleted" }),
+        item({ id: "canvas:other:n", source: "canvas", projectId: "other", nodeId: "n", canResume: false }),
+        item({ id: "workbench" }),
+    ], errors: {} });
+    const router = await renderPage("/tasks?source=canvas&project=p");
+    expect([...container!.querySelectorAll("[data-task-id]")].map((element) => element.getAttribute("data-task-id"))).toEqual(["canvas:p:n", "orphan"]);
+    expect(container!.textContent).toContain(i18n.t("tasks.currentCanvas"));
+    await act(async () => button("tasks.allCanvases").click());
+    expect(router.state.location.search).toBe("?source=canvas");
+    expect(container!.querySelectorAll("[data-task-id]")).toHaveLength(3);
+});
+
 test("continuing a task is deduplicated and its returned status replaces the row", async () => {
     const record = item();
     load.mockResolvedValue({ items: [record], errors: {} });

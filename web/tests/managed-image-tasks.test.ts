@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import "./browser";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { browser } from "./browser";
@@ -15,6 +16,7 @@ import { defaultConfig, useConfigStore, buildApiUrl } from "../src/stores/use-co
 import { ImageGenerationUncertainError, requestAsyncImageGeneration, requestEdit, requestGeneration } from "../src/services/api/image";
 import { imageTaskHasResult, imageTaskImages, imageTaskPending, readImageTasks, refreshImageTask, type ImageTaskRecord } from "../src/services/api/image-tasks";
 import { recoverImageTaskRecords, saveImageTaskRecord, updateImageTaskRecord, type ImageTaskBatch } from "../src/services/image-task-records";
+import { CanvasImageTaskPendingError, readCanvasImageTask } from "../src/pages/canvas/image-task";
 
 const originalFetch = globalThis.fetch;
 const originalAdapter = axios.defaults.adapter;
@@ -218,6 +220,94 @@ test("transient polling failure and storage recovery never submit a replacement 
     expect(imageTaskHasResult(recovered)).toBe(true);
     expect(recovered.status).toBe("succeeded");
     expect(calls).toEqual(["/api/ai/v1/images/tasks_async/asyncimg_task1"]);
+});
+
+test("canvas async tasks without a gateway polling hint wait for an explicit query, never a replacement submission", async () => {
+    seedTasks([{ ...record, value: { model: "image-model" } }]);
+    const calls: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+        calls.push(`${init?.method || "GET"} ${url}`);
+        return Response.json({ status: "running", progress: 10 });
+    }) as typeof fetch;
+    const controller = new AbortController();
+    const current = () => controller.signal.throwIfAborted();
+    await expect(readCanvasImageTask(record.id, controller.signal, current)).rejects.toBeInstanceOf(CanvasImageTaskPendingError);
+    expect(calls).toEqual([]);
+    await expect(readCanvasImageTask(record.id, controller.signal, current, true)).rejects.toBeInstanceOf(CanvasImageTaskPendingError);
+    expect(calls).toEqual(["GET /api/ai/v1/images/tasks_async/asyncimg_task1"]);
+    expect((await readImageTasks())[0].task_id).toBe(record.task_id);
+});
+
+test("canvas ignores a late query result after its image slot is removed", async () => {
+    seedTasks([record]);
+    const started = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<Response>();
+    const calls: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+        calls.push(`${init?.method || "GET"} ${url}`);
+        started.resolve();
+        return response.promise;
+    }) as typeof fetch;
+    let attached = true;
+    const controller = new AbortController();
+    const recovering = readCanvasImageTask(record.id, controller.signal, () => {
+        if (!attached) throw new DOMException("Aborted", "AbortError");
+    }, true);
+    await started.promise;
+    attached = false;
+    response.resolve(Response.json({ status: "succeeded", data: [{ url: "/api/result-media/late" }] }));
+    await expect(recovering).rejects.toMatchObject({ name: "AbortError" });
+    expect(calls).toEqual(["GET /api/ai/v1/images/tasks_async/asyncimg_task1"]);
+    expect(fileWrites).toEqual([]);
+    expect(imageTaskHasResult((await readImageTasks())[0])).toBe(true);
+});
+
+test("stopping canvas polling cancels the gateway's advertised wait without querying or submitting again", async () => {
+    seedTasks([record]);
+    const waiting = Promise.withResolvers<number>();
+    const timeout = window.setTimeout.bind(window);
+    const timer = spyOn(window, "setTimeout").mockImplementation((handler, milliseconds, ...args) => {
+        waiting.resolve(Number(milliseconds));
+        return timeout(handler, milliseconds, ...args);
+    });
+    const calls: string[] = [];
+    globalThis.fetch = (async (url) => { calls.push(String(url)); throw new Error("Polling was stopped"); }) as typeof fetch;
+    const controller = new AbortController();
+    try {
+        const recovery = readCanvasImageTask(record.id, controller.signal, () => {});
+        expect(await waiting.promise).toBe(record.value.retryAfter! * 1000);
+        controller.abort();
+        await expect(recovery).rejects.toMatchObject({ name: "AbortError" });
+        expect(calls).toEqual([]);
+        expect((await readImageTasks())[0].task_id).toBe(record.task_id);
+    } finally {
+        controller.abort();
+        timer.mockRestore();
+    }
+});
+
+test("canvas retries received media locally and preserves all outputs without querying or regenerating", async () => {
+    const complete: ImageTaskRecord = { ...record, status: "succeeded", value: { result: { data: [{ url: "/api/result-media/first" }, { url: "/api/result-media/second" }] } } };
+    seedTasks([complete]);
+    const calls: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+        calls.push(`${init?.method || "GET"} ${url}`);
+        return new Response("image", { headers: { "Content-Type": "image/png" } });
+    }) as typeof fetch;
+    const imageClass = Object.getOwnPropertyDescriptor(globalThis, "Image")!;
+    const controller = new AbortController();
+    Object.defineProperty(globalThis, "Image", { configurable: true, value: class { src = ""; async decode() { throw new Error("decode failed"); } } });
+    try {
+        await expect(readCanvasImageTask(record.id, controller.signal, () => {})).rejects.toThrow("decode failed");
+    } finally {
+        Object.defineProperty(globalThis, "Image", imageClass);
+    }
+    expect((await readImageTasks())[0].value.result?.data).toHaveLength(2);
+    const restored = await readCanvasImageTask(record.id, controller.signal, () => {});
+    expect(restored.imageTaskRecordId).toBe(record.id);
+    expect(Object.keys((await readImageTasks())[0].value.localImages || {})).toEqual(["0", "1"]);
+    expect(fileWrites).toHaveLength(2);
+    expect(calls).toEqual(["GET /api/result-media/first", "GET /api/result-media/first", "GET /api/result-media/second"]);
 });
 
 test.each(["other-tab", "same-tab"])("a late image query preserves completed results and local files saved by %s", async (observer) => {

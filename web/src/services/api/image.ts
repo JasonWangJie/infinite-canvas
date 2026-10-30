@@ -727,7 +727,7 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
     return images;
 }
 
-export async function requestAsyncImageGeneration(config: AiConfig, prompt: string, references: ReferenceImage[], intentId: string) {
+export async function requestAsyncImageGeneration(config: AiConfig, prompt: string, references: ReferenceImage[], intentId: string, options?: ImageRequestOptions) {
     const epoch = sessionEpoch();
     const requests: GenerationRequestMeasurement[] = [];
     const records = await readImageTaskRecords();
@@ -735,26 +735,29 @@ export async function requestAsyncImageGeneration(config: AiConfig, prompt: stri
     // The same user intent never re-submits a paid request after a lost response.
     if (records[intentId]?.task_id) return records[intentId].task_id!;
     if (records[intentId]) throw new ImageGenerationUncertainError(i18n.t("managed.imageTaskUnknown"));
+    options?.signal?.throwIfAborted();
     let record: ImageTaskRecord = { id: intentId, task_id: null, status: "submitting", created_at: Math.floor(Date.now() / 1000), value: { model: config.model || config.imageModel, endpoint: references.length ? "/v1/images/edits_async" : "/v1/images/generations_async" } };
     await saveImageTaskRecord(record, true);
     if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
     try {
-        const task = await submitAsyncImageGeneration(config, prompt, references, intentId, requests);
+        await options?.onIntentSaved?.(intentId);
+        options?.signal?.throwIfAborted();
+        const task = await submitAsyncImageGeneration(config, prompt, references, intentId, requests, options?.signal);
         if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
         record = { ...record, task_id: task.taskId, status: "pending", value: { ...record.value, retryAfter: task.retryAfter, requests } };
-        await saveImageTaskRecord(record);
+        await updateImageTaskRecord(intentId, (current) => ({ ...current, ...record, value: { ...current.value, ...record.value } }));
         return task.taskId;
     } catch (error) {
         if (epoch === sessionEpoch()) {
             record = { ...record, status: record.task_id ? "pending" : error instanceof ImageGenerationUncertainError ? "execution_unknown" : "failed", value: { ...record.value, requests } };
-            await saveImageTaskRecord(record).catch(() => {});
+            await updateImageTaskRecord(intentId, (current) => ({ ...current, ...record, value: { ...current.value, ...record.value } })).catch(() => {});
             if (record.task_id) throw new ImageGenerationUncertainError(i18n.t("browserStorage.taskSaveFailed"));
         }
         throw error;
     }
 }
 
-async function submitAsyncImageGeneration(config: AiConfig, prompt: string, references: ReferenceImage[], intentId: string, requests: GenerationRequestMeasurement[]) {
+async function submitAsyncImageGeneration(config: AiConfig, prompt: string, references: ReferenceImage[], intentId: string, requests: GenerationRequestMeasurement[], signal?: AbortSignal) {
     const epoch = sessionEpoch();
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel, "image", "async");
     if (requestConfig.apiFormat !== "openai") throw new Error(i18n.t("managed.asyncImageModelRequired"));
@@ -763,11 +766,13 @@ async function submitAsyncImageGeneration(config: AiConfig, prompt: string, refe
     const background = normalizeBackground(config.background);
     const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
     if (epoch !== sessionEpoch()) throw new Error("登录会话已改变");
+    signal?.throwIfAborted();
     const finish = startGenerationRequest();
     let response: Response | undefined;
     try {
         response = await canvasFetch(aiApiUrl(requestConfig, images.length ? "/images/edits_async" : "/images/generations_async"), {
             method: "POST",
+            signal,
             headers: { "Content-Type": "application/json", "Idempotency-Key": intentId },
             body: JSON.stringify({
                 model: requestConfig.model,

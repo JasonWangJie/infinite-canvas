@@ -10,6 +10,7 @@ import { canvasJson, currentSession } from "@/services/api/canvas-client";
 export type ApiCallFormat = "openai" | "gemini";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
+export type ImageExecution = { sync: boolean; async: boolean; syncEndpoint?: "image-generation" | "gemini" };
 
 export type ChannelModel = {
     name: string;
@@ -17,6 +18,7 @@ export type ChannelModel = {
     script?: string;
     capabilities?: ModelCapability[];
     endpointTypes?: string[];
+    imageExecution?: ImageExecution;
 };
 
 export type ModelChannel = {
@@ -36,6 +38,7 @@ export type AiConfig = {
     channels: ModelChannel[];
     model: string;
     imageModel: string;
+    imageAsync?: boolean;
     videoModel: string;
     textModel: string;
     audioModel: string;
@@ -173,7 +176,15 @@ export function modelCapabilityOf(config: AiConfig, value: string): ModelCapabil
 export function modelMatchesCapability(config: AiConfig, value: string, capability?: ModelCapability) {
     if (!capability) return true;
     const model = findChannelModel(config, value)?.model;
-    return Boolean(model && (model.capabilities || [model.capability]).includes(capability));
+    return Boolean(model && modelSupportsCapability(model, capability));
+}
+
+function isDedicatedImageModel(name: string) {
+    return /^(?:.*\/)?(?:gpt-image|dall-e|dalle|seedream|imagen|flux|sdxl|stable-diffusion|midjourney|qwen-image)(?:[-.]|$)/i.test(name);
+}
+
+function modelSupportsCapability(model: ChannelModel, capability: ModelCapability) {
+    return (capability !== "text" || !isDedicatedImageModel(model.name)) && (model.capabilities || [model.capability]).includes(capability);
 }
 
 export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
@@ -191,7 +202,7 @@ export function resolveModelForCapability(config: AiConfig, currentModel: string
 
 export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
     if (!capability) return config.models;
-    return config.channels.flatMap((channel) => channel.models.filter((model) => (model.capabilities || [model.capability]).includes(capability)).map((model) => encodeChannelModel(channel.id, model.name)));
+    return config.channels.flatMap((channel) => channel.models.filter((model) => modelSupportsCapability(model, capability)).map((model) => encodeChannelModel(channel.id, model.name)));
 }
 
 /** The user script (if any) attached to a model; empty string means use the system default call. */
@@ -272,7 +283,7 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
-        result.push({ name, capability, script });
+        result.push({ name, capability, script, ...(typeof item === "string" ? {} : { capabilities: item.capabilities, endpointTypes: item.endpointTypes, imageExecution: item.imageExecution }) });
     }
     return result;
 }
@@ -353,14 +364,23 @@ export function resolveModelChannel(config: AiConfig, value: string) {
 }
 
 export function supportsAsyncImageGeneration(config: AiConfig, value: string) {
-    return Boolean(findChannelModel(config, value)?.model.endpointTypes?.includes("image-generation"));
+    return supportsImageGeneration(config, value, "async");
+}
+
+export function supportsImageGeneration(config: AiConfig, value: string, operation: "sync" | "async" = "sync") {
+    const model = findChannelModel(config, value)?.model;
+    if (!model || !modelSupportsCapability(model, "image") || model.imageExecution?.[operation] === false) return false;
+    const endpoints = model.endpointTypes || [];
+    return operation === "async" ? endpoints.includes("image-generation") : model.imageExecution?.syncEndpoint ? endpoints.includes(model.imageExecution.syncEndpoint) : endpoints.some((type) => type === "image-generation" || type === "gemini");
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string, capability: ModelCapability, operation?: "async") {
     const match = findChannelModel(useConfigStore.getState().config, value);
     if (!currentSession() || !match) throw new Error("当前用户无权调用所选模型，请刷新模型列表");
+    if (!modelSupportsCapability(match.model, capability)) throw new Error(i18n.t("managed.modelOperationMismatch"));
+    if (capability === "image" && !supportsImageGeneration(useConfigStore.getState().config, value, operation || "sync")) throw new Error(i18n.t("managed.imageExecutionUnsupported"));
     const endpoints = match.model.endpointTypes || [];
-    const supported = capability === "image" ? operation === "async" ? ["image-generation"] : ["image-generation", "gemini"] : capability === "text" ? ["openai-response", "openai", "gemini"] : capability === "video" ? ["openai-video"] : ["openai"];
+    const supported = capability === "image" ? operation === "async" ? ["image-generation"] : match.model.imageExecution?.syncEndpoint ? [match.model.imageExecution.syncEndpoint] : ["image-generation", "gemini"] : capability === "text" ? ["openai-response", "openai", "gemini"] : capability === "video" ? ["openai-video"] : ["openai"];
     const endpoint = supported.find((type) => endpoints.includes(type));
     if (!endpoint) throw new Error(operation === "async" ? i18n.t("managed.asyncImageModelRequired") : "当前模型不支持所选调用接口，请刷新模型列表");
     return {
@@ -405,19 +425,21 @@ export function withLocalProxy(url: string) {
 }
 
 export async function refreshGatewayModels() {
-    const payload = await canvasJson<{ data?: Array<{ id?: string; supported_endpoint_types?: string[] }> }>("/api/models");
+    const payload = await canvasJson<{ data?: Array<{ id?: string; supported_endpoint_types?: string[]; image_execution?: { sync: boolean; async: boolean; sync_endpoint?: "image-generation" | "gemini" } }> }>("/api/models");
     const models: ChannelModel[] = (payload.data || [])
         .filter((item): item is typeof item & { id: string } => Boolean(item.id))
         .map((item) => {
             const endpoints = item.supported_endpoint_types || [];
+            const execution = item.image_execution;
+            if (execution !== undefined && (!execution || typeof execution.sync !== "boolean" || typeof execution.async !== "boolean" || execution.sync_endpoint !== undefined && !["image-generation", "gemini"].includes(execution.sync_endpoint))) throw new Error(i18n.t("managed.loadFailed"));
             const capabilities: ModelCapability[] = [];
             const capability = guessCapability(item.id);
-            if (endpoints.includes("image-generation") || (endpoints.includes("gemini") && capability === "image")) capabilities.push("image");
+            if (execution || endpoints.includes("image-generation") || (endpoints.includes("gemini") && capability === "image")) capabilities.push("image");
             if (endpoints.includes("openai-video")) capabilities.push("video");
             if (endpoints.includes("openai") && capability === "audio") capabilities.push("audio");
-            if (endpoints.includes("openai-response") || endpoints.includes("gemini") || (endpoints.includes("openai") && capability !== "audio")) capabilities.push("text");
+            if (!isDedicatedImageModel(item.id) && (endpoints.includes("openai-response") || endpoints.includes("gemini") || (endpoints.includes("openai") && capability !== "audio"))) capabilities.push("text");
             if (!endpoints.length) capabilities.push(capability);
-            return { name: item.id, capability, capabilities, endpointTypes: endpoints };
+            return { name: item.id, capability, capabilities, endpointTypes: endpoints, imageExecution: execution ? { sync: execution.sync, async: execution.async, syncEndpoint: execution.sync_endpoint } : undefined };
         });
     useConfigStore.setState((state) => {
         const channel: ModelChannel = { id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai", models };
@@ -429,7 +451,8 @@ export async function refreshGatewayModels() {
             ["videoModel", "video"],
             ["audioModel", "audio"],
         ] as const) {
-            next[key] = normalizeModelOptionValue(next[key], channels) || next.models.find((value) => modelMatchesCapability(next, value, capability)) || "";
+            const selected = normalizeModelOptionValue(next[key], channels);
+            next[key] = selected && modelMatchesCapability(next, selected, capability) ? selected : next.models.find((value) => modelMatchesCapability(next, value, capability)) || "";
         }
         next.model = next.imageModel;
         return { config: next };

@@ -1,6 +1,7 @@
+import "./browser";
 import { expect, test } from "bun:test";
 
-import { focusViewportForNode, focusViewportForNodes } from "../src/lib/canvas/canvas-node-geometry";
+import { focusViewportForNode, focusViewportForNodes, measureFocusFrame } from "../src/lib/canvas/canvas-node-geometry";
 
 // Mirrors the canvas transform: screen = viewport.offset + world * viewport.k, origin at top-left.
 function projectPoint(world: { x: number; y: number }, viewport: { x: number; y: number; k: number }) {
@@ -80,4 +81,34 @@ test("focuses all batch nodes together without depending on their order or aspec
     }
     expect(focusViewportForNodes([nodes[0]], size)).toEqual(focusViewportForNode(nodes[0], size));
     expect(focusViewportForNodes([], size)).toBeNull();
+});
+
+test("repeated focus stays fixed when the panel and toolbar are clamped independently of the node", () => {
+    const container = document.createElement("div");
+    container.innerHTML = '<div data-node-id="focused"><div data-node-panel="focused"></div></div><div data-node-toolbar="focused"></div><div data-canvas-bottom-toolbar></div>';
+    document.body.append(container);
+    const size = { width: 900, height: 700 };
+    const node = { position: { x: 120, y: 194 }, width: 240, height: 135 };
+    let viewport = { x: 0, y: -682, k: 1 };
+    const rect = (top: number, height: number) => ({ top, bottom: top + height, height }) as DOMRect;
+    container.getBoundingClientRect = () => rect(0, size.height);
+    container.querySelector<HTMLElement>("[data-node-id]")!.getBoundingClientRect = () => rect(viewport.y + node.position.y * viewport.k, node.height * viewport.k);
+    container.querySelector<HTMLElement>("[data-node-panel]")!.getBoundingClientRect = () => rect(128, 396);
+    container.querySelector<HTMLElement>("[data-node-toolbar]")!.getBoundingClientRect = () => rect(72, 48);
+    container.querySelector<HTMLElement>("[data-canvas-bottom-toolbar]")!.getBoundingClientRect = () => rect(624, 76);
+    try {
+        const expected = focusViewportForNode(node, size, { above: 62, below: 396, bottomInset: 76 });
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const frame = measureFocusFrame(container, "focused");
+            expect(frame).toEqual({ above: 62, below: 396, bottomInset: 76 });
+            viewport = focusViewportForNode(node, size, frame);
+            expect(viewport).toEqual(expected);
+            const top = viewport.y + node.position.y * viewport.k;
+            const bottom = top + node.height * viewport.k;
+            expect(top).toBeGreaterThanOrEqual(62);
+            expect(bottom + 396).toBeLessThanOrEqual(624);
+        }
+    } finally {
+        container.remove();
+    }
 });

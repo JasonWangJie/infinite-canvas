@@ -393,6 +393,7 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         }
         let body: ArrayBuffer | undefined;
         let model: string | undefined = gemini?.[1];
+        let imageOperation: "sync" | "async" | undefined = path.startsWith("/v1/images/") ? path.endsWith("_async") ? "async" : "sync" : undefined;
         if (post) {
             const rejected = await measure(c, "model_validation", async () => {
                 const contentType = c.req.header("Content-Type") || "";
@@ -401,14 +402,15 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
                     const value = form.get("model");
                     if (typeof value === "string") model = value;
                 } else if (contentType.startsWith("application/json")) {
-                    const json = await c.req.raw.clone().json() as { model?: unknown };
+                    const json = await c.req.raw.clone().json() as { model?: unknown; generationConfig?: { responseModalities?: unknown } };
                     if (gemini && json.model !== undefined && json.model !== model) throw new GatewayError("MODEL_MISMATCH", 400, "模型路径与请求参数不一致");
                     if (!gemini && typeof json.model === "string") model = json.model;
+                    if (gemini && Array.isArray(json.generationConfig?.responseModalities) && json.generationConfig.responseModalities.includes("IMAGE")) imageOperation = "sync";
                 }
                 if (!model) throw new GatewayError("MODEL_REQUIRED", 400, "请选择要调用的模型");
                 const models = await gateway.relay("/v1/models", c.get("apiKey"), { headers: { "X-Request-Id": c.get("requestId") }, signal: c.req.raw.signal });
                 if (!models.ok) return new Response(models.body, { status: models.status, headers: { "Content-Type": "application/json" } });
-                let listing: { data?: { id: string; supported_endpoint_types?: string[] }[] };
+                let listing: { data?: { id: string; supported_endpoint_types?: string[]; image_execution?: unknown }[] };
                 try { listing = await models.json() as typeof listing; } catch { throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关模型列表响应格式无效"); }
                 if (!listing || !Array.isArray(listing.data)) throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关模型列表响应格式无效");
                 const selected = listing.data.find((entry) => entry.id === model);
@@ -418,6 +420,11 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
                 // retain its OpenAI category and let the gateway validate audio
                 // protocol support. Never turn a model-name guess into permission.
                 if (!Array.isArray(selected.supported_endpoint_types) || !selected.supported_endpoint_types.includes(endpoint)) throw new GatewayError("MODEL_ENDPOINT_FORBIDDEN", 403, "当前模型不支持所选调用接口");
+                if (imageOperation && selected.image_execution !== undefined) {
+                    const execution = selected.image_execution as { sync?: unknown; async?: unknown; sync_endpoint?: unknown } | null;
+                    if (!execution || typeof execution !== "object" || Array.isArray(execution) || typeof execution.sync !== "boolean" || typeof execution.async !== "boolean" || execution.sync_endpoint !== undefined && !["image-generation", "gemini"].includes(execution.sync_endpoint as string)) throw new GatewayError("GATEWAY_PROTOCOL_ERROR", 502, "网关图片执行能力响应格式无效");
+                    if (!execution[imageOperation]) throw new GatewayError("MODEL_IMAGE_EXECUTION_FORBIDDEN", 403, "当前模型不支持所选图片执行方式");
+                }
             });
             if (rejected) return rejected;
             body = await c.req.raw.arrayBuffer();

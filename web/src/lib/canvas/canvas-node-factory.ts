@@ -43,6 +43,7 @@ export function referenceUrl(image: ReferenceImage) {
 export function buildImageGenerationMetadata(type: CanvasImageGenerationType, config: AiConfig, count: number, references: ReferenceImage[]): CanvasNodeMetadata {
     return {
         generationType: type,
+        imageAsync: config.imageAsync === true,
         model: config.model,
         size: config.size,
         quality: config.quality,

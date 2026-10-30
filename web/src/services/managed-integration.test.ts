@@ -119,7 +119,7 @@ describe("managed session and storage boundary", () => {
         const config = {
             ...defaultConfig,
             model: "gateway::test-model",
-            channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [{ name: "test-model", capability: "text" as const, endpointTypes: ["openai-response", "openai-video"] }] }],
+            channels: [{ id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, models: [{ name: "test-model", capability: "text" as const, capabilities: ["text" as const, "video" as const], endpointTypes: ["openai-response", "openai-video"] }] }],
             models: ["gateway::test-model"],
         };
         useConfigStore.setState({ config });

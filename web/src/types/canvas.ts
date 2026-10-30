@@ -24,12 +24,14 @@ export type CanvasNodeTypeId = CanvasNodeType | (string & {});
 export type CanvasNodeStatus = "idle" | "success" | "loading" | "error";
 export type CanvasGenerationMode = "text" | "image" | "video" | "audio";
 export type CanvasImageGenerationType = "generation" | "edit";
+export type CanvasImageTaskState = "pending" | "unknown" | "storage_failed" | "failed";
 
 export type CanvasNodeImage = {
     id: string;
     status: CanvasNodeStatus;
     errorDetails?: string;
     imageTaskRecordId?: string;
+    imageTaskState?: CanvasImageTaskState;
     content: string;
     storageKey?: string;
     naturalWidth: number;
@@ -52,9 +54,11 @@ export type CanvasNodeMetadata = {
     status?: CanvasNodeStatus;
     errorDetails?: string;
     imageTaskRecordId?: string;
+    imageTaskState?: CanvasImageTaskState;
     fontSize?: number;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
+    imageAsync?: boolean;
     model?: string;
     reasoningEffort?: "auto" | "low" | "medium" | "high" | "xhigh";
     size?: string;

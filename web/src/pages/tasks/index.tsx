@@ -35,6 +35,7 @@ export default function TasksPage() {
     const query = params.get("q") || "";
     const source = sources.find((value) => value === params.get("source")) || "all";
     const status = statuses.find((value) => value === params.get("status")) || "all";
+    const projectId = params.get("project") || "";
 
     const refresh = useCallback(async () => {
         if (loadingRef.current || active.current.size) return;
@@ -91,11 +92,12 @@ export default function TasksPage() {
         const keyword = query.trim().toLocaleLowerCase();
         return items.filter((item) => {
             const records = [item, ...(item.relatedTasks || [])];
-            return (source === "all" || records.some((record) => record.source === source))
+            return (!projectId || records.some((record) => record.projectId === projectId))
+                && (source === "all" || records.some((record) => record.source === source || source === "canvas" && Boolean(record.projectId)))
                 && (status === "all" || records.some((record) => record.status === status))
                 && (!keyword || records.some((record) => [record.title, record.prompt, record.model, record.taskId, record.id].join(" ").toLocaleLowerCase().includes(keyword)));
         });
-    }, [items, query, source, status]);
+    }, [items, query, source, status, projectId]);
 
     const updateFilter = (key: string, value: string) => {
         setParams((current) => {
@@ -162,7 +164,7 @@ export default function TasksPage() {
         <div className="flex shrink-0 flex-wrap items-center gap-2">
             <Button type="text" icon={<Copy className="size-3.5" />} title={t("tasks.copyDiagnosticsHint")} onClick={() => { if (item.sessionEpoch === sessionEpoch()) copyText(taskCenterDiagnostics(item)); }}>{t("tasks.copyDiagnostics")}</Button>
             {item.canResume ? <Button icon={<Play className="size-3.5" />} title={t(item.resumeAction === "save" ? "tasks.restoreSaveHint" : "tasks.resumeHint", { defaultValue: "仅保存已收到的结果，不重新生成。" })} loading={busy.includes(item.id)} disabled={loading} onClick={() => void resume(item)}>{item.resumeAction === "save" ? t("tasks.restoreSave", { defaultValue: "恢复本地保存" }) : t("tasks.resume")}</Button> : null}
-            {item.source === "canvas" ? <Button type="link" icon={<ArrowUpRight className="size-3.5" />} loading={busy.includes(`${item.id}:open`)} disabled={Boolean(opening.current)} onClick={() => void openCanvasSource(item)}>{t("tasks.openSource")}</Button> : <Link to={item.href} className="inline-flex min-h-8 items-center gap-1 px-2 text-sm" style={{ color: token.colorLink }}>{item.status === "attention" && !item.canResume ? t("tasks.verifyStatus", { defaultValue: "核实原记录" }) : t("tasks.openSource")}<ArrowUpRight className="size-3.5" /></Link>}
+            {item.projectId && item.nodeId && item.href.startsWith("/canvas/") ? <Button type="link" icon={<ArrowUpRight className="size-3.5" />} loading={busy.includes(`${item.id}:open`)} disabled={Boolean(opening.current)} onClick={() => void openCanvasSource(item)}>{t("tasks.openSource")}</Button> : <Link to={item.href} className="inline-flex min-h-8 items-center gap-1 px-2 text-sm" style={{ color: token.colorLink }}>{item.status === "attention" && !item.canResume ? t("tasks.verifyStatus", { defaultValue: "核实原记录" }) : t("tasks.openSource")}<ArrowUpRight className="size-3.5" /></Link>}
         </div>
     );
 
@@ -184,6 +186,7 @@ export default function TasksPage() {
                 </div>
 
                 <div className="mt-4 space-y-3" aria-live="polite">
+                    {projectId ? <div className="flex flex-wrap items-center gap-2 text-sm"><span>{t("tasks.currentCanvas")}</span><Button type="text" size="small" onClick={() => updateFilter("project", "")}>{t("tasks.allCanvases")}</Button></div> : null}
                     {loadError ? <Alert type="error" showIcon title={t("tasks.loadFailed")} description={loadError} /> : null}
                     {sources.filter((key) => errors[key]).map((key) => <Alert key={key} type="warning" showIcon title={t("tasks.sourceFailed", { source: t(`tasks.sources.${key}`) })} description={errors[key]} />)}
                     <p className="text-sm" style={{ color: token.colorTextSecondary }}>{t("tasks.count", { count: visibleItems.length, total: items.length })}</p>
@@ -234,7 +237,7 @@ export default function TasksPage() {
                         })}
                     </ul>
                 )}
-                {!loading && !visibleItems.length ? <div className="py-12"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t(items.length ? "tasks.noMatches" : loadError || Object.keys(errors).length ? "tasks.unavailable" : "tasks.empty")} />{query || source !== "all" || status !== "all" ? <div className="mt-3 text-center"><Button type="text" onClick={() => setParams({}, { replace: true })}>{t("tasks.clearFilters")}</Button></div> : null}</div> : null}
+                {!loading && !visibleItems.length ? <div className="py-12"><Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t(items.length ? "tasks.noMatches" : loadError || Object.keys(errors).length ? "tasks.unavailable" : "tasks.empty")} />{query || source !== "all" || status !== "all" || projectId ? <div className="mt-3 text-center"><Button type="text" onClick={() => setParams({}, { replace: true })}>{t("tasks.clearFilters")}</Button></div> : null}</div> : null}
             </div>
         </main>
     );

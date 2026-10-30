@@ -302,6 +302,45 @@ test("a missing history source keeps its original image requests independently r
     expect(snapshot.items.find((entry) => entry.recordId === "async/1")).toMatchObject({ source: "image-tasks", canResume: true, resumeAction: "query" });
 });
 
+test("completed canvas requests keep their source and generation time without old failures changing the current result", async () => {
+    const project = canvas("source canvas");
+    project.state.projects[0].nodes[1].metadata.images = [{ id: "a", status: "success" }];
+    documents.canvas.value = project;
+    const source = { kind: "canvas" as const, canvasId: "project/one", nodeId: "generated/one" };
+    documents["image-tasks"].value = {
+        previous: { id: "previous", task_id: "old", status: "failed", created_at: 2, value: { source } },
+        latest: { id: "latest", task_id: "new", status: "succeeded", created_at: 4, value: { source, result: { data: [{ url: "/api/result-media/new" }] } } },
+    };
+    const result = await loadTaskCenter();
+    const parent = result.items.find((item) => item.nodeId === "generated/one")!;
+    expect(parent).toMatchObject({ status: "completed", createdAt: 4000 });
+    expect(parent.relatedTasks?.map((item) => item.recordId).sort()).toEqual(["latest", "previous"]);
+    expect(result.items.filter((item) => item.source === "image-tasks")).toEqual([]);
+    expect(parent.relatedTasks?.every((item) => item.projectId === "project/one" && item.nodeId === "generated/one")).toBe(true);
+    expect(requests.every((request) => request.startsWith("GET "))).toBe(true);
+});
+
+test("an accepted canvas task is processing while received but uncommitted output still needs recovery", async () => {
+    const project = canvas("pending canvas");
+    project.state.projects[0].nodes = [{ id: "waiting", type: "image", title: "waiting", metadata: { status: "idle", imageTaskRecordId: "async/1" } }] as typeof project.state.projects[0].nodes;
+    documents.canvas.value = project;
+    let parent = (await loadTaskCenter()).items.find((item) => item.nodeId === "waiting")!;
+    expect(parent.status).toBe("active");
+    expect(parent.createdAt).toBe(3000);
+    (documents["image-tasks"].value as Record<string, ImageTaskRecord>)["async/1"] = { id: "async/1", task_id: "asyncimg_1", status: "succeeded", created_at: 3, value: { result: { data: [{ url: "/api/result-media/received" }] } } };
+    parent = (await loadTaskCenter()).items.find((item) => item.nodeId === "waiting")!;
+    expect(parent.status).toBe("attention");
+    expect(parent.relatedTasks?.[0].status).toBe("completed");
+});
+
+test("deleting a canvas source does not hide its independently recoverable image task", async () => {
+    documents.canvas.value = { state: { projects: [], deletedProjects: [] }, version: 0 };
+    const record = (documents["image-tasks"].value as Record<string, ImageTaskRecord>)["async/1"];
+    record.value.source = { kind: "canvas", canvasId: "removed", nodeId: "removed-node" };
+    const task = (await loadTaskCenter()).items.find((item) => item.recordId === "async/1")!;
+    expect(task).toMatchObject({ source: "image-tasks", projectId: "removed", canResume: true, href: "/image?task=async%2F1" });
+});
+
 test("unknown records stay attention and local storage recovery never queries a paid task", async () => {
     documents["image-tasks"].value = {
         unknown: { id: "unknown", task_id: null, status: "execution_unknown", value: {} },
