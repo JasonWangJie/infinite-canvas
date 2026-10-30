@@ -205,7 +205,10 @@ test("removing a model still permits original video queries but prevents new sub
     expect(requests).toEqual(["GET /api/ai/v1/videos/original-task"]);
 });
 
-test.each(["gpt-image-2", "dall-e-3", "seedream-5-pro", "qwen-image", "flux.1-pro"])("dedicated image model %s cannot use text endpoints, including stale selections", async (name) => {
+const dedicatedImageModels = ["gpt-image-2", "dall-e-3", "seedream-5-pro", "qwen-image", "flux.1-pro", "gemini-nano-banana-2.1", "gemini-3-pro-image-preview", "gemini-2.5-flash-image-preview"];
+const videoModels = ["veo-3.1-fast-generate-preview", "seedance2.0-E", "seedance2.5-A", "minimax-h3-2k", "minimax-h3-720p", "video-model", "opaque-generator"];
+
+test.each(dedicatedImageModels)("dedicated image model %s cannot use text endpoints, including stale selections", async (name) => {
     const config = configure(["image-generation", "openai", "openai-response", "gemini"], name);
     globalThis.fetch = (async (url) => { requests.push(String(url)); throw new Error("Unexpected text request"); }) as typeof fetch;
     expect(modelMatchesCapability(config, config.model, "image")).toBe(true);
@@ -213,6 +216,37 @@ test.each(["gpt-image-2", "dall-e-3", "seedream-5-pro", "qwen-image", "flux.1-pr
     expect(selectableModelsByCapability(config, "text")).toEqual([]);
     await expect(requestImageQuestion(config, [{ role: "user", content: "draw" }], () => {})).rejects.toThrow("当前模型不支持此操作");
     expect(requests).toEqual([]);
+});
+
+test.each(videoModels)("video model %s rejects stale text capabilities before any request", async (name) => {
+    const config = configure(["openai-video", "openai", "openai-response", "gemini"], name);
+    globalThis.fetch = (async (url) => { requests.push(String(url)); throw new Error("Unexpected text request"); }) as typeof fetch;
+    expect(modelMatchesCapability(config, config.model, "text")).toBe(false);
+    expect(selectableModelsByCapability(config, "text")).toEqual([]);
+    await expect(requestImageQuestion(config, [{ role: "user", content: "answer" }], () => {})).rejects.toThrow("当前模型不支持此操作");
+    expect(requests).toEqual([]);
+});
+
+test.each([...dedicatedImageModels, ...videoModels])("model refresh removes the media text default %s and preserves general text models", async (name) => {
+    configure(["openai", "openai-response", "gemini"], name);
+    const textModels = [
+        { id: "gemini-2.5-pro", supported_endpoint_types: ["gemini"] },
+        { id: "gemini-2.5-flash", supported_endpoint_types: ["gemini"] },
+        { id: "gpt-5.5", supported_endpoint_types: ["openai-response", "openai"] },
+        { id: "MiniMax-M2", supported_endpoint_types: ["openai"] },
+        { id: "gemini-image", supported_endpoint_types: ["gemini", "image-generation"] },
+    ];
+    globalThis.fetch = (async () => Response.json({ data: [
+        ...dedicatedImageModels.map((id) => ({ id, supported_endpoint_types: ["image-generation", "openai", "openai-response", "gemini"] })),
+        ...videoModels.map((id) => ({ id, supported_endpoint_types: ["openai-video", "openai", "openai-response", "gemini"] })),
+        ...textModels,
+    ] })) as typeof fetch;
+    await refreshGatewayModels();
+    const { config } = useConfigStore.getState();
+    expect(config.textModel).toBe("gateway::gemini-2.5-pro");
+    expect(selectableModelsByCapability(config, "text")).toEqual(textModels.map((model) => `gateway::${model.id}`));
+    expect(modelMatchesCapability(config, `gateway::${name}`, videoModels.includes(name) ? "video" : "image")).toBe(true);
+    expect(modelMatchesCapability(config, "gateway::gemini-image", "image")).toBe(true);
 });
 
 test("model refresh replaces an image-only text default while preserving genuine Gemini multi-capability", async () => {

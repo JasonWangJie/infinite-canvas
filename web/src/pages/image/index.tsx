@@ -226,7 +226,7 @@ export default function ImagePage() {
         setRunning(true);
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
         setPreviewLog(null);
-        setResults(Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })));
+        setResults([{ id: nanoid(), status: "pending" }]);
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
 
@@ -439,7 +439,7 @@ export default function ImagePage() {
             openConfigDialog(true);
             return null;
         }
-        return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
+        return { text, config: { ...effectiveConfig, model, count: String(generationCount) }, references: [...references] };
     };
 
     const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, onIntentSaved: (id: string) => Promise<void>): Promise<GenerationResult> => {
@@ -480,13 +480,14 @@ export default function ImagePage() {
 
     const runImageBatch = async (snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, count: number, started: number, retryIndex?: number) => {
         const epoch = sessionEpoch(), version = interactionVersion.current;
-        const slots: GenerationResult[] = Array.from({ length: count }, () => ({ id: nanoid(), status: "pending" }));
-        const log = buildLog({ prompt: snapshot.text, model: snapshot.config.model, config: { ...snapshot.config, count: String(count) }, references: snapshot.references, requestCount: count });
+        const requestSnapshot = { ...snapshot, config: { ...snapshot.config, count: String(count) } };
+        const slots: GenerationResult[] = [{ id: nanoid(), status: "pending" }];
+        const log = buildLog({ prompt: snapshot.text, model: snapshot.config.model, config: requestSnapshot.config, references: snapshot.references, requestCount: 1 });
         let created = false;
         const summarize = () => {
             log.images = slots.flatMap((slot) => slot.images || []);
             log.imageCount = log.successCount = log.images.length;
-            log.failCount = slots.reduce((count, slot) => count + (slot.status === "failed" ? 1 : slot.partialFailureCount || 0), 0);
+            log.failCount = slots.reduce((count, slot) => count + (slot.partialFailureCount || Number(slot.status === "failed")), 0);
             log.recoverableCount = slots.filter((slot) => slot.status === "pending" || slot.status === "recoverable").length;
             log.recoverableRecordIds = slots.flatMap((slot) => slot.recordId && (slot.status === "pending" || slot.status === "recoverable") ? [slot.recordId] : []);
             log.status = log.recoverableCount || (log.failCount && log.imageCount) ? "attention" : log.failCount ? "failed" : "success";
@@ -504,12 +505,16 @@ export default function ImagePage() {
         };
         await Promise.all(slots.map(async (_, index) => {
             const resultIndex = retryIndex ?? index;
-            slots[index] = await runGenerationSlot(resultIndex, snapshot, async (id) => {
+            slots[index] = await runGenerationSlot(resultIndex, requestSnapshot, async (id) => {
                 slots[index] = { ...slots[index], recordId: id };
                 log.imageTaskRecordIds = [...log.imageTaskRecordIds, id];
                 await save();
             });
             if (epoch !== sessionEpoch()) return;
+            const record = await readImageTaskRecords().then((records) => records[slots[index].recordId || ""]).catch(() => undefined);
+            if (epoch !== sessionEpoch()) return;
+            log.requestCount = record?.value.requests?.length || 1;
+            slots[index].partialFailureCount = Math.max(slots[index].partialFailureCount || 0, record?.value.batch?.failed || 0);
             try { await save(); } catch (error) {
                 slots[index] = { ...slots[index], status: "recoverable", error: error instanceof Error ? error.message : String(error) };
                 if (mounted.current && version === interactionVersion.current) setResults((value) => updateResultAt(value, resultIndex, slots[index]));

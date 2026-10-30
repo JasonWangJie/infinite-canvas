@@ -144,13 +144,13 @@ type ConfigStore = {
     clearPromptContinue: () => void;
 };
 
-const VIDEO_KEYWORDS = ["video", "sora", "veo", "kling", "wan", "hailuo"];
+const VIDEO_KEYWORDS = ["video", "sora", "veo", "kling", "wan", "hailuo", "seedance", "minimax-h3"];
 
 export function boolConfig(value: string, fallback: boolean) {
     return value ? value === "true" : fallback;
 }
 const AUDIO_KEYWORDS = ["audio", "tts", "speech", "voice", "music", "sound"];
-const IMAGE_KEYWORDS = ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "flux", "sdxl", "stable-diffusion", "midjourney"];
+const IMAGE_KEYWORDS = ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "flux", "sdxl", "stable-diffusion", "midjourney", "nano-banana"];
 
 /** Best-effort default capability for a freshly fetched model name; user can override in the channel editor. */
 export function guessCapability(name: string): ModelCapability {
@@ -179,12 +179,12 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
     return Boolean(model && modelSupportsCapability(model, capability));
 }
 
-function isDedicatedImageModel(name: string) {
-    return /^(?:.*\/)?(?:gpt-image|dall-e|dalle|seedream|imagen|flux|sdxl|stable-diffusion|midjourney|qwen-image)(?:[-.]|$)/i.test(name);
+function isDedicatedMediaModel(name: string) {
+    return guessCapability(name) === "video" || /^(?:.*\/)?(?:gpt-image|image|dall-e|dalle|seedream|imagen|flux|sdxl|stable-diffusion|midjourney|qwen-image|nano-banana|gemini-(?:nano-banana|[\d.]+-(?:pro|flash)-image))(?:[-.]|$)/i.test(name);
 }
 
 function modelSupportsCapability(model: ChannelModel, capability: ModelCapability) {
-    return (capability !== "text" || !isDedicatedImageModel(model.name)) && (model.capabilities || [model.capability]).includes(capability);
+    return (capability !== "text" || (!model.endpointTypes?.includes("openai-video") && !isDedicatedMediaModel(model.name))) && (model.capabilities || [model.capability]).includes(capability);
 }
 
 export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
@@ -437,7 +437,7 @@ export async function refreshGatewayModels() {
             if (execution || endpoints.includes("image-generation") || (endpoints.includes("gemini") && capability === "image")) capabilities.push("image");
             if (endpoints.includes("openai-video")) capabilities.push("video");
             if (endpoints.includes("openai") && capability === "audio") capabilities.push("audio");
-            if (!isDedicatedImageModel(item.id) && (endpoints.includes("openai-response") || endpoints.includes("gemini") || (endpoints.includes("openai") && capability !== "audio"))) capabilities.push("text");
+            if (!endpoints.includes("openai-video") && !isDedicatedMediaModel(item.id) && (endpoints.includes("openai-response") || endpoints.includes("gemini") || (endpoints.includes("openai") && capability !== "audio"))) capabilities.push("text");
             if (!endpoints.length) capabilities.push(capability);
             return { name: item.id, capability, capabilities, endpointTypes: endpoints, imageExecution: execution ? { sync: execution.sync, async: execution.async, syncEndpoint: execution.sync_endpoint } : undefined };
         });

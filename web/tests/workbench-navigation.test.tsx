@@ -147,6 +147,12 @@ async function selectAllResults() {
     await act(async () => checkbox!.click());
 }
 
+async function chooseImageCount(count: number) {
+    const button = [...container!.querySelectorAll<HTMLButtonElement>("button")].find((element) => element.textContent === i18n.t("settingsPanels.image.images", { count }));
+    expect(button).toBeDefined();
+    await act(async () => button!.click());
+}
+
 async function chooseReferences(files: File[]) {
     const input = container!.querySelector<HTMLInputElement>('input[type="file"][accept="image/*"]')!;
     Object.defineProperty(input, "files", { configurable: true, value: files });
@@ -763,23 +769,29 @@ test.each(["image", "video"])("%s asset reference import shares busy state, reus
     } finally { resolveUrl.mockRestore(); upload.mockRestore(); }
 });
 
-test("one image request keeps every returned image, links its intent before payment and saves an asset once", async () => {
+test.each([false, true])("choosing two images sends one request, retains both results and saves an asset once, with references: %s", async (withReferences) => {
     let uploadCount = 0, modelCalls = 0;
     const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async () => importedImage(`returned-${++uploadCount}`));
     axios.defaults.adapter = async (request) => {
         modelCalls += 1;
+        expect(request.method).toBe("post");
+        expect(request.url).toBe(`/api/ai/v1/images/${withReferences ? "edits" : "generations"}`);
+        expect(withReferences ? (request.data as FormData).get("n") : JSON.parse(request.data).n).toBe(withReferences ? "2" : 2);
         expect(newImageLog().imageTaskRecordIds).toEqual(Object.keys(documents["image-tasks"].value as object));
         expect(newImageLog().imageTaskRecordIds).toHaveLength(1);
         return { config: request, status: 200, statusText: "OK", headers: {}, data: { data: [{ b64_json: "Zmlyc3Q=" }, { b64_json: "c2Vjb25k" }] } };
     };
     documents.assets = { value: { state: { assets: [] }, version: 0 }, revision: 1 };
+    if (withReferences) documents["image-workbench"].value = { alpha: { ...log("alpha", "edit reference"), references: [{ id: "reference", name: "reference.png", type: "image/png", dataUrl: "data:image/png;base64,aW1hZ2U=" }] } };
     try {
         await useAssetStore.persist.rehydrate();
         await renderPage("/image?log=alpha");
+        await chooseImageCount(2);
+        expect(useConfigStore.getState().config.count).toBe("2");
         await click("workbench.generate");
         expect(modelCalls).toBe(1);
         expect(uploadCount).toBe(2);
-        expect(newImageLog()).toMatchObject({ status: "success", imageCount: 2, successCount: 2, requestCount: 1, failCount: 0, recoverableCount: 0, recoverableRecordIds: [] });
+        expect(newImageLog()).toMatchObject({ config: { count: "2" }, status: "success", imageCount: 2, successCount: 2, requestCount: 1, failCount: 0, recoverableCount: 0, recoverableRecordIds: [] });
         expect(newImageLog().images.map((image) => image.storageKey)).toEqual(["image:returned-1", "image:returned-2"]);
         await selectAllResults();
         expect(container!.textContent).toContain(i18n.t("resultToCanvas.selectedCount", { count: 2 }));
@@ -802,8 +814,10 @@ test("one image request keeps every returned image, links its intent before paym
 test.each(["network", "local-media", "rejection"])("image history distinguishes %s from a definite failed request", async (failure) => {
     const upload = spyOn(imageStorage, "uploadImage").mockRejectedValue(new Error("local quota reached"));
     let calls = 0;
+    const submittedCounts: number[] = [];
     axios.defaults.adapter = async (request) => {
         calls += 1;
+        submittedCounts.push(JSON.parse(request.data).n);
         expect(newImageLog().imageTaskRecordIds).toHaveLength(1);
         if (failure === "network") throw new axios.AxiosError("response lost", "ERR_NETWORK", request);
         if (failure === "rejection") throw new axios.AxiosError("rejected", "ERR_BAD_REQUEST", request, undefined, { config: request, status: 400, statusText: "Bad Request", headers: {}, data: { error: { message: "rejected" } } });
@@ -811,12 +825,15 @@ test.each(["network", "local-media", "rejection"])("image history distinguishes 
     };
     try {
         const router = await renderPage("/image?log=alpha");
+        await chooseImageCount(2);
         await click("workbench.generate");
         const saved = newImageLog();
         expect(saved).toMatchObject({ status: failure === "rejection" ? "failed" : "attention", failCount: failure === "rejection" ? 1 : 0, recoverableCount: failure === "rejection" ? 0 : 1, requestCount: 1, imageCount: 0 });
         expect(saved.recoverableRecordIds).toEqual(failure === "rejection" ? [] : saved.imageTaskRecordIds);
+        if (failure === "rejection") await click("workbench.retry");
         await act(async () => router.navigate(`/image?log=${saved.id}`));
-        expect(calls).toBe(1);
+        expect(calls).toBe(failure === "rejection" ? 2 : 1);
+        expect(submittedCounts).toEqual(failure === "rejection" ? [2, 1] : [2]);
         if (failure !== "rejection") expect(container!.textContent).toContain(i18n.t("managed.imageTaskUnknown"));
     } finally { upload.mockRestore(); }
 });

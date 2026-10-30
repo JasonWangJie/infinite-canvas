@@ -836,7 +836,7 @@ function ImageContent({
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { t } = useTranslation();
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
-    const images = node.metadata?.images || [];
+    const images = (node.metadata?.images || []).map((image) => !image.imageTaskRecordId && node.metadata?.imageTaskRecordId ? { ...image, imageTaskRecordId: node.metadata.imageTaskRecordId, imageTaskState: node.metadata.imageTaskState } : image);
     const batchCount = images.length;
     const isBatchRoot = batchCount > 1;
     const primaryImageId = node.metadata?.primaryImageId || images[0]?.id;

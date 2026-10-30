@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Bot, Download, Home, Images, Keyboard, Menu, PanelLeftClose, PanelLeftOpen, Plus, Puzzle, Redo2, Trash2, Undo2, Upload } from "lucide-react";
+import { Bot, Download, Home, Images, Keyboard, Menu, PanelLeftClose, PanelLeftOpen, Plus, Puzzle, Redo2, Trash2, Undo2, Upload } from "lucide-react";
 import { Button, Dropdown, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -8,7 +8,6 @@ import { CanvasSaveStatus } from "@/components/canvas/canvas-save-status";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
 import { useThemeStore } from "@/stores/use-theme-store";
-import { DOCS_URL } from "@/constant/env";
 
 export function CanvasTopBar({
     title,
@@ -92,7 +91,6 @@ export function CanvasTopBar({
                         menu={{
                             items: [
                                 { key: "home", icon: <Home className="size-4" />, label: t("canvas.home"), onClick: onHome },
-                                { key: "docs", icon: <BookOpen className="size-4" />, label: t("canvas.docs"), onClick: () => window.open(DOCS_URL, "_blank", "noopener,noreferrer") },
                                 { key: "plugins", icon: <Puzzle className="size-4" />, label: t("topNav.plugins"), onClick: onOpenPlugins },
                                 { key: "shortcuts", icon: <Keyboard className="size-4" />, label: t("topNav.shortcuts"), onClick: () => setShortcutsOpen(true) },
                                 { key: "projects", icon: <Images className="size-4" />, label: t("canvas.projects"), onClick: onProjects },

@@ -1043,7 +1043,7 @@ test("canvas logout queues the latest viewport before its debounce and ignores e
     } finally { await fixture.close(); }
 });
 
-test("canvas batch images persist a separate intent per slot and querying an unknown slot cannot submit again", async () => {
+test("a synchronous canvas batch submits n=2 once with one saved intent and unknown recovery cannot submit again", async () => {
     const projects = imageProjects({ status: "idle", prompt: "batch", generationMode: "image", count: 2 });
     projects[0].nodes[0].type = "config";
     projects[0].nodes[0].position.x = -240;
@@ -1052,9 +1052,14 @@ test("canvas batch images persist a separate intent per slot and querying an unk
         const child = saved.nodes.find((node) => node.type === "image")!;
         expect(Boolean(child)).toBe(true);
         expect(saved.connections).toHaveLength(1);
-        const ids = child.metadata!.images!.map((image) => image.imageTaskRecordId);
-        expect(ids.every(Boolean)).toBe(true);
-        expect(new Set(ids).size).toBe(2);
+        expect(JSON.parse(String(request.data)).n).toBe(2);
+        expect(child.metadata?.images).toHaveLength(2);
+        expect(child.metadata?.images?.every((image) => !image.imageTaskRecordId)).toBe(true);
+        const records = Object.values(await readImageTaskRecords());
+        expect(records).toHaveLength(1);
+        expect(child.metadata?.imageTaskRecordId).toBe(records[0].id);
+        expect(records[0]).toMatchObject({ status: "pending", value: { source: { kind: "canvas", canvasId: "a", nodeId: child.id } } });
+        expect(records[0].value.source?.slotId).toBeUndefined();
         throw new axios.AxiosError("response lost", "ERR_NETWORK", request);
     };
     const fixture = await canvasVideoFixture(projects);
@@ -1064,14 +1069,79 @@ test("canvas batch images persist a separate intent per slot and querying an unk
         await fixture.act(async () => generate!.click());
         const child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.type === "image")!;
         expect(child.metadata!.images!.map((image) => image.status)).toEqual(["idle", "idle"]);
-        expect(child.metadata!.images!.map((image) => image.imageTaskState)).toEqual(["unknown", "unknown"]);
-        expect(new Set(child.metadata!.images!.map((image) => image.imageTaskRecordId)).size).toBe(2);
-        expect(requests).toHaveLength(2);
+        expect(child.metadata?.imageTaskState).toBe("unknown");
+        expect(Object.values(await readImageTaskRecords()).map((record) => record.status)).toEqual(["execution_unknown"]);
+        expect(requests).toEqual([{ method: "post", url: "/api/ai/v1/images/generations" }]);
         const query = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.verifyImageTask"));
         expect(Boolean(query)).toBe(true);
         await fixture.act(async () => query!.click());
-        expect(requests).toHaveLength(2);
+        expect(fixture.router.state.location.pathname).toBe("/image");
+        expect(requests).toHaveLength(1);
     } finally { await fixture.close(); }
+});
+
+test.each(["none", "media", "canvas"])("a synchronous canvas n=2 response retains both images after %s storage failure without another POST", async (failure) => {
+    const projects = imageProjects({ status: "idle", prompt: "two trees", generationMode: "image", count: 2 });
+    projects[0].nodes[0].type = "config";
+    projects[0].nodes[0].position.x = -240;
+    const stored = (key: string) => ({ url: `blob:${key}`, storageKey: key, width: key === "image:first" ? 320 : 160, height: key === "image:first" ? 160 : 320, bytes: 5, mimeType: "image/png" });
+    let failMediaSave = failure === "media", failCanvasSave = false;
+    const upload = spyOn(imageStorage, "uploadImage").mockImplementation(async (input) => {
+        const key = String(input).includes("Zmlyc3Q=") ? "image:first" : "image:second";
+        if (key === "image:second" && failMediaSave) { failMediaSave = false; throw new Error("second image storage unavailable"); }
+        return stored(key);
+    });
+    const read = spyOn(imageStorage, "readStoredImage").mockImplementation(async (key) => stored(key));
+    const transport = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => String(input) === "/api/data/canvas" && init?.method === "PUT" && failCanvasSave
+        ? Response.json({ error: { message: "canvas storage unavailable" } }, { status: 503 })
+        : transport(input, init)) as typeof fetch;
+    let slotIds: string[] = [];
+    poll = async (request) => {
+        expect(JSON.parse(String(request.data)).n).toBe(2);
+        const saved = (documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects.find((project) => project.id === "a")!;
+        const child = saved.nodes.find((node) => node.type === "image")!;
+        slotIds = child.metadata!.images!.map((image) => image.id);
+        expect(slotIds).toHaveLength(2);
+        const records = Object.values(await readImageTaskRecords());
+        expect(records).toHaveLength(1);
+        expect(child.metadata?.imageTaskRecordId).toBe(records[0].id);
+        expect(records[0].value.source).toEqual({ kind: "canvas", canvasId: "a", nodeId: child.id });
+        failCanvasSave = failure === "canvas";
+        return response(request, { data: [{ b64_json: "Zmlyc3Q=" }, { b64_json: "c2Vjb25k" }] });
+    };
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        const generate = [...fixture.container.querySelectorAll<HTMLButtonElement>("[data-node-id='shared-node'] button")].find(isConfigGenerateButton)!;
+        expect(Boolean(generate)).toBe(true);
+        await fixture.act(async () => generate.click());
+        let child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.type === "image")!;
+        const records = Object.values(await readImageTaskRecords());
+        expect(records).toHaveLength(1);
+        expect(records[0].value.result?.data).toHaveLength(2);
+        if (failure !== "none") {
+            expect(child.metadata?.imageTaskRecordId).toBe(records[0].id);
+            expect(child.metadata?.imageTaskState).toBe("storage_failed");
+            failCanvasSave = false;
+            const recover = [...fixture.container.querySelectorAll<HTMLButtonElement>(`[data-node-id='${child.id}'] button`)].find((button) => button.textContent === i18n.t("managed.recoverAllImages"))!;
+            expect(Boolean(recover)).toBe(true);
+            await fixture.act(async () => recover.click());
+            child = fixture.useCanvasStore.getState().openProject("a")!.nodes.find((node) => node.id === child.id)!;
+        }
+        expect(child.metadata?.images?.map((image) => image.storageKey)).toEqual(["image:first", "image:second"]);
+        expect(child.metadata?.images?.map((image) => image.id)).toEqual(slotIds);
+        expect(child.metadata?.images?.map((image) => image.status)).toEqual(["success", "success"]);
+        expect(child.metadata?.primaryImageId).toBe(slotIds[0]);
+        expect(child.metadata?.content).toBe("blob:image:first");
+        expect(child.metadata?.imageTaskRecordId).toBeUndefined();
+        expect(child.metadata?.imageTaskState).toBeUndefined();
+        expect(requests).toEqual([{ method: "post", url: "/api/ai/v1/images/generations" }]);
+        expect(upload).toHaveBeenCalledTimes(failure === "media" ? 3 : 2);
+        const saved = (documents.canvas.value as { state: { projects: CanvasProject[] } }).state.projects.find((project) => project.id === "a")!.nodes.find((node) => node.id === child.id)!;
+        expect(saved.metadata?.images?.map((image) => image.storageKey)).toEqual(["image:first", "image:second"]);
+        expect(saved.metadata?.imageTaskRecordId).toBeUndefined();
+        expect(Object.keys(await readImageTaskRecords())).toEqual([records[0].id]);
+    } finally { failCanvasSave = false; await fixture.close(); upload.mockRestore(); read.mockRestore(); }
 });
 
 test.each(["execution_unknown", "succeeded"])("batch %s recovery retains the successful primary and skipped sibling remains recoverable", async (status) => {

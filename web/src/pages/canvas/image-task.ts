@@ -1,10 +1,13 @@
 import i18n from "@/i18n";
+import { nanoid } from "nanoid";
+import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
+import { fitNodeSize } from "@/lib/canvas/canvas-node-size";
 import { ImageGenerationUncertainError } from "@/services/api/image";
 import { imageTaskHasResult, imageTaskImages, imageTaskPending, refreshImageTask } from "@/services/api/image-tasks";
 import { readImageTaskRecords } from "@/services/image-task-records";
 import { readStoredImage } from "@/services/image-storage";
 import type { ImageTaskRecord } from "@/services/image-task-records";
-import type { CanvasImageTaskState } from "@/types/canvas";
+import type { CanvasImageTaskState, CanvasNodeData, CanvasNodeImage } from "@/types/canvas";
 
 export function canvasImageTaskState(record: ImageTaskRecord): CanvasImageTaskState {
     if (imageTaskHasResult(record)) return "storage_failed";
@@ -48,12 +51,40 @@ export async function readCanvasImageTask(recordId: string, signal: AbortSignal,
         record = await refreshImageTask(record);
         check();
     }
-    await imageTaskImages(record);
+    const stored = await imageTaskImages(record);
     check();
-    const key = (await readImageTaskRecords())[recordId]?.value.localImages?.[0];
+    const localImages = (await readImageTaskRecords())[recordId]?.value.localImages;
     check();
-    if (!key) throw new Error(i18n.t("taskCenter.recordRemoved"));
-    const image = await readStoredImage(key);
-    check();
-    return { ...image, imageTaskRecordId: recordId };
+    const images: Awaited<ReturnType<typeof readStoredImage>>[] = [];
+    for (const [index, result] of stored.entries()) {
+        const key = localImages?.[index];
+        if (!key || key !== result.storageKey) throw new Error(i18n.t("taskCenter.recordRemoved"));
+        images.push(await readStoredImage(key));
+        check();
+    }
+    return { ...images[0], images, imageTaskRecordId: recordId };
+}
+
+export function applyCanvasImageBatch(node: CanvasNodeData, images: Awaited<ReturnType<typeof readStoredImage>>[]): CanvasNodeData {
+    if (!images.length) return node;
+    const previous = node.metadata?.images || [];
+    const used = new Set<string>();
+    const slots: CanvasNodeImage[] = images.map((image, index) => {
+        const matching = image.storageKey ? previous.find((slot) => slot.storageKey === image.storageKey && !used.has(slot.id)) : undefined;
+        const placeholder = previous[index];
+        const id = matching?.id || (placeholder && !placeholder.content && !used.has(placeholder.id) ? placeholder.id : nanoid());
+        used.add(id);
+        return { id, status: "success", content: image.url, storageKey: image.storageKey, naturalWidth: image.width, naturalHeight: image.height, bytes: image.bytes, mimeType: image.mimeType };
+    });
+    const primaryStorageKey = previous.find((slot) => slot.id === node.metadata?.primaryImageId)?.storageKey || node.metadata?.storageKey;
+    const primaryIndex = Math.max(0, images.findIndex((image) => image.storageKey && image.storageKey === primaryStorageKey));
+    const primary = images[primaryIndex];
+    const edge = Math.max(node.width, node.height);
+    const size = node.metadata?.freeResize ? { width: node.width, height: node.height } : fitNodeSize(primary.width, primary.height, edge, edge);
+    return {
+        ...node,
+        ...size,
+        position: { x: node.position.x + node.width / 2 - size.width / 2, y: node.position.y + node.height / 2 - size.height / 2 },
+        metadata: { ...node.metadata, ...imageMetadata(primary), images: slots, primaryImageId: slots[primaryIndex].id, imageTaskRecordId: undefined, imageTaskState: undefined, errorDetails: undefined },
+    };
 }
