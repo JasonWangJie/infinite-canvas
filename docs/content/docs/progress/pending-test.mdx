@@ -7,6 +7,9 @@ description: Implemented changes that still need manual verification
 
 ## New API 受管画布变更
 
+- 生图结果保存的 CSP 修复：受管页面的 `connect-src` 增加本地 `data:`、`blob:`，使 Base64 生图响应与本地 Blob 可以被读取后保存到浏览器 IndexedDB，外部 HTTP/HTTPS 模型与素材仍只允许同源授权入口。原响应已保存在浏览器任务记录中时，刷新页面后应能通过“恢复全部结果”保存已有图片，不重新提交生图或再次付费；清理站点数据仍会丢失本地记录。故障已在隔离真实 Chrome、生产页面策略下复现，旧策略对 `fetch(data:)` 和 `fetch(blob:)` 都抛出 `TypeError: Failed to fetch`，直接图片解码和同源读取正常。
+- CSP 修复已热加载到现有前端 Nginx；配置检查与公网响应头核对通过，前端、BFF 和 New API 容器均未替换。隔离真实 Chrome 复验通过本地 Data URL、Blob、同源读取、图片解码、IndexedDB Blob 保存及重新读取，保存前后均为 68 字节、1×1 像素；外部测试地址仍明确被 CSP 拦截。公网页面、45 个静态资源、鉴权入口及服务健康状态仍正常。原配置、回退脚本和浏览器前后对照记录保存在服务器 `/opt/infinite-canvas-backups/20261030-csp-media-local-reload/`。本次未提交新模型请求或访问用户浏览器数据；用户原任务的实际多图恢复仍待本人刷新页面后确认。
+
 - 顶部入口与模型分类修复已发布前端镜像 `infinite-canvas:20261030-model-filter-d3215e95`，沿用上一轮多图修复，仅新增两处顶部入口和模型分类逻辑的运行时代码变更。构建及受管 Nginx 配置检查通过；公网首页、图片工作台、画布、任务中心和运行配置正常，45 个静态资源可访问，公网 HTML 与新镜像一致，未登录会话和模型接口返回预期 `401 AUTH_REQUIRED`。BFF 与 New API 容器未替换，三个服务均为 healthy；原前端镜像和配置、回退脚本保留在 `/opt/infinite-canvas-backups/20261030-model-filter-d3215e95/`。未执行自动化回归、登录后的浏览器交互验收或真实模型调用；刷新页面及可用模型后检查下述候选和默认选择。
 
 - 顶部入口与模型分类：全局顶部及画布顶部不再显示文档、GitHub 图标链接，画布顶部菜单也移除文档入口。文本模型候选、能力统计和请求前校验共用专用媒体过滤，`gemini-nano-banana-2.1`、`gemini-3-pro-image-preview`、`gemini-2.5-flash-image-preview`、Veo、Seedance、MiniMax H3 等生图/视频系列不应再出现在文本列表；声明视频生成接口的模型也不归为文本。通用 Gemini、GPT、MiniMax 文本模型和真正的图文多能力模型仍按网关声明的接口能力保留。刷新可用模型后，错误的全局文本默认值应改为有效文本模型；旧节点或旧配置中的专用媒体选择也不得继续发出文本请求。待人工确认桌面、窄屏、深浅主题下入口消失、模型统计与候选一致，以及刷新后的默认模型选择；未执行自动化回归。
