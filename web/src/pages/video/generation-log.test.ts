@@ -388,6 +388,46 @@ test("canvas video saves its unknown intent before POST and never retries it aft
     } finally { await fixture.close(); }
 });
 
+test.each(["generated-image", "video-config", "removed-reference"])("canvas video retry keeps the current %s inputs and then resumes its saved task by GET only", async (source) => {
+    const projects = videoProjects({ status: "error", prompt: "animate the tree", model: config.model, videoMode: "reference", references: ["image:old-reference"] });
+    const base = { position: { x: -240, y: 0 }, width: 100, height: 100 };
+    projects[0].nodes.push(
+        { ...base, id: "image-config", type: "config", title: "Image config", metadata: { prompt: "draw the tree", generationMode: "image", model: config.model } },
+        { ...base, id: "reference-image", type: "image", title: "Reference image", metadata: { status: "success", content: "blob:reference-image", naturalWidth: 100, naturalHeight: 100, mimeType: "image/png" } },
+    );
+    projects[0].connections = [{ id: "image-result", fromNodeId: "image-config", toNodeId: "reference-image" }];
+    if (source === "video-config") {
+        projects[0].nodes.push({ ...base, id: "video-config", type: "config", title: "Video config", metadata: { prompt: "animate from the video config", generationMode: "video", model: config.model, videoMode: "reference" } });
+        projects[0].connections.push({ id: "video-input", fromNodeId: "reference-image", toNodeId: "video-config" }, { id: "video-result", fromNodeId: "video-config", toNodeId: "shared-node" });
+    } else if (source === "generated-image") projects[0].connections.push({ id: "video-input", fromNodeId: "reference-image", toNodeId: "shared-node" });
+    const image = spyOn(imageStorage, "imageToDataUrl").mockResolvedValue("data:image/png;base64,aW1hZ2U=");
+    let submitted: FormData | undefined;
+    poll = async (request) => {
+        if (request.method === "post") {
+            submitted = request.data as FormData;
+            return response(request, { id: "reference-retry-task" });
+        }
+        throw new Error("temporary query failure");
+    };
+    const fixture = await canvasVideoFixture(projects);
+    try {
+        await retryCanvasVideo(fixture);
+        expect(submitted).toBeInstanceOf(FormData);
+        expect(submitted!.get("prompt")).toBe(source === "video-config" ? "animate from the video config" : "animate the tree");
+        const references = submitted!.getAll("images") as File[];
+        expect(references).toHaveLength(source === "removed-reference" ? 0 : 1);
+        if (references.length) expect(await references[0].text()).toBe("image");
+        if (source === "removed-reference") expect(image).not.toHaveBeenCalled();
+        expect(fixture.useCanvasStore.getState().openProject("a")!.nodes[0].metadata).toMatchObject({ videoSubmissionUnknown: false, videoTaskId: "reference-retry-task" });
+        await retryCanvasVideo(fixture);
+        expect(requests).toEqual([
+            { method: "post", url: "/api/ai/v1/videos" },
+            { method: "get", url: "/api/ai/v1/videos/reference-retry-task" },
+            { method: "get", url: "/api/ai/v1/videos/reference-retry-task" },
+        ]);
+    } finally { await fixture.close(); image.mockRestore(); }
+});
+
 test("canvas video does not POST when the intent cannot be saved", async () => {
     const transport = globalThis.fetch;
     globalThis.fetch = (async (input, init) => String(input) === "/api/data/canvas" && init?.method === "PUT"

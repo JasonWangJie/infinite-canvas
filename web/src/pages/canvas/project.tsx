@@ -3160,7 +3160,9 @@ function InfiniteCanvasPage() {
                 await pollVideoNodeTask(node);
                 return;
             }
-            const sourceNode = findRetrySourceNode(node.id, nodesRef.current, connectionsRef.current) || node;
+            const sourceNode = (node.type === CanvasNodeType.Video
+                ? nodesRef.current.find((item) => item.type === CanvasNodeType.Config && connectionsRef.current.some((connection) => connection.fromNodeId === item.id && connection.toNodeId === node.id))
+                : findRetrySourceNode(node.id, nodesRef.current, connectionsRef.current)) || node;
             const savedImageMetadata = node.type === CanvasNodeType.Image ? node.metadata : undefined;
             const hasSavedImageMetadata = Boolean(savedImageMetadata?.generationType);
             const generationConfig =
