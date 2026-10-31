@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [修复] Seedance 与 MiniMax H3 视频按 JSON 协议提交，画布参考图经网关临时签名上传后引用，避免文件表单被渠道拒绝。
+
 + [修复] 受管页面允许读取本地 Data URL 与 Blob，修复生图成功后被安全策略拦截而无法保存和恢复结果的问题。
 
 + [修复] 文本模型候选与调用校验排除专用图片、视频模型，补齐 Banana、Gemini 生图、Seedance 与 MiniMax H3 系列识别。

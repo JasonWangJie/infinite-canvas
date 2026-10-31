@@ -1,5 +1,6 @@
-import { csrfHeaders, readPrivateBlob, sessionEpoch } from "@/services/api/canvas-client";
+import { canvasFetch, csrfHeaders, readPrivateBlob, sessionEpoch } from "@/services/api/canvas-client";
 import axios from "axios";
+import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -84,6 +85,25 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
     const epoch = sessionEpoch();
+    const name = modelOptionName(model);
+    const drama = /^(?:seedance2\.(?:0|5)-(?:fast-|mini-)?[AEFG](?:-|$)|minimax-h3(?:-|$))/i.test(name);
+    const body = drama ? await buildDramaVideoBody(config, name, prompt, references, epoch, options) : await buildNativeVideoBody(config, model, prompt, references, options);
+    assertVideoSession(epoch, options?.signal);
+    try {
+        const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config, drama ? "application/json" : undefined), signal: options?.signal })).data);
+        if (typeof created.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(created.id)) throw new Error(apiText("noVideoTaskId"));
+        return { id: created.id, provider: "openai", model };
+    } catch (error) {
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        const message = readAxiosError(error, apiText("videoTaskCreateFailed"));
+        // A lost response, timeout, server error or malformed success may hide an
+        // accepted paid task. Do not offer the failed-task resubmission action.
+        if (status && status >= 400 && status < 500 && status !== 408) throw new Error(message);
+        throw new VideoGenerationUncertainError(`${message} ${i18n.t("managed.imageTaskUnknown")}`);
+    }
+}
+
+async function buildNativeVideoBody(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions) {
     const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
     const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
@@ -118,20 +138,68 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     }
     videos.forEach((file) => body.append("video[]", file));
     audios.forEach((file) => body.append("audio[]", file));
-    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
-    options?.signal?.throwIfAborted();
-    try {
-        const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config), signal: options?.signal })).data);
-        if (typeof created.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(created.id)) throw new Error(apiText("noVideoTaskId"));
-        return { id: created.id, provider: "openai", model };
-    } catch (error) {
-        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
-        const message = readAxiosError(error, apiText("videoTaskCreateFailed"));
-        // A lost response, timeout, server error or malformed success may hide an
-        // accepted paid task. Do not offer the failed-task resubmission action.
-        if (status && status >= 400 && status < 500 && status !== 408) throw new Error(message);
-        throw new VideoGenerationUncertainError(`${message} ${i18n.t("managed.imageTaskUnknown")}`);
+    return body;
+}
+
+async function buildDramaVideoBody(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], epoch: number, options?: VideoMediaOptions) {
+    assertVideoSession(epoch, options?.signal);
+    // Local video/audio cannot be published through the image-only upload route.
+    const videos = (options?.videos || []).map((video) => publicVideoReferenceUrl(video.url, "publicReferenceVideoRequired"));
+    const audios = (options?.audios || []).map((audio) => publicVideoReferenceUrl(audio.url, "publicReferenceAudioRequired"));
+    const images: string[] = [];
+    for (const image of references) {
+        const file = dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image, options) });
+        assertVideoSession(epoch, options?.signal);
+        const upload = new FormData();
+        upload.append("file", file);
+        const response = await canvasFetch("/api/video-reference-images", { method: "POST", body: upload, headers: { "Idempotency-Key": nanoid() }, signal: options?.signal });
+        assertVideoSession(epoch, options?.signal);
+        const result = await response.json().catch(() => ({}));
+        assertVideoSession(epoch, options?.signal);
+        if (!response.ok) throw new Error(readApiErrorMessage(result) || apiText("referenceImageReadFailed"));
+        images.push(publicVideoReferenceUrl(result.url, "videoReferenceUploadInvalid"));
     }
+    const name = model.toLowerCase();
+    const legacy = name.startsWith("seedance") && /-(?:720p|1080p)$/.test(name);
+    const series = legacy ? "legacy" : name.startsWith("minimax-h3") ? "H3" : name.match(/-([aefg])$/)?.[1].toUpperCase();
+    const frames = config.videoMode !== "reference" && !videos.length && !audios.length && (name === "seedance2.0-a" && images.length === 2 || series === "G" && images.length > 0 && images.length <= 2);
+    const ratio = inferVideoRatio(config.size || "16:9");
+    let resolution = config.vquality.toLowerCase() === "4k" ? "4k" : normalizeVideoResolution(config.vquality);
+    if (legacy) resolution = name.match(/-(720p|1080p)$/)![1];
+    if (name === "seedance2.0-f") resolution = "720px";
+    const body: Record<string, unknown> = {
+        model,
+        prompt: series === "A" && !frames ? dramaReferencePrompt(prompt, images.length, videos.length, audios.length) : prompt,
+        seconds: Number(normalizeVideoSeconds(config.videoSeconds)),
+        resolution,
+        aspect_ratio: frames && name === "seedance2.0-a" ? "Auto" : frames && name === "seedance2.5-g" ? "adaptive" : ratio === "auto" ? series === "G" ? "adaptive" : name === "seedance2.0-a" ? "Auto" : "16:9" : ratio,
+        ...(frames ? { image: images[0], ...(images[1] ? { last_frame: images[1] } : {}) } : images.length ? { reference_images: images } : {}),
+        ...(videos.length ? { reference_videos: videos } : {}),
+        ...(audios.length ? { reference_audios: audios } : {}),
+    };
+    if (["F", "H3", "G"].includes(series || "")) body.generate_audio = boolConfig(config.videoGenerateAudio, true);
+    if (series === "G") body.watermark = boolConfig(config.videoWatermark, false);
+    return body;
+}
+
+function publicVideoReferenceUrl(value: unknown, errorKey: string) {
+    try {
+        if (typeof value !== "string" || value !== value.trim()) throw new Error();
+        const url = new URL(value);
+        if (url.protocol === "https:" && !url.username && !url.password) return url.href;
+    } catch { /* The caller reports which reference cannot be submitted. */ }
+    throw new Error(i18n.t(`videoReferences.${errorKey}`));
+}
+
+function dramaReferencePrompt(prompt: string, images: number, videos: number, audios: number) {
+    const mentioned = new Set([...prompt.matchAll(/@(图片|图|视频|音频)([+-]?[0-9]+(?:\.[0-9]+)?)/g)].map((match) => `${match[1] === "图片" ? "图" : match[1]}${match[2]}`));
+    const missing = ([["图", images], ["视频", videos], ["音频", audios]] as const).flatMap(([kind, count]) => Array.from({ length: count }, (_, index) => `${kind}${index + 1}`).filter((label) => !mentioned.has(label)).map((label) => `@${label}`));
+    return missing.length ? i18n.t("videoReferences.promptPrefix", { labels: missing.join("、"), prompt }) : prompt;
+}
+
+function assertVideoSession(epoch: number, signal?: AbortSignal) {
+    if (epoch !== sessionEpoch()) throw new Error(i18n.t("saveRecovery.sessionChanged"));
+    signal?.throwIfAborted();
 }
 
 async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {

@@ -336,6 +336,113 @@ describe("Canvas authorization and owner isolation", () => {
         expect(f.calls.find((call) => call.path.includes("streamGenerateContent"))?.url).toBe("http://new-api.internal/v1beta/models/allowed-gemini:streamGenerateContent?alt=sse");
     });
 
+    test("requires a live session, origin and CSRF before uploading video reference images", async () => {
+        const f = setup();
+        const endpoint = `${f.config.origin}/api/video-reference-images`;
+        expect((await f.app.request(endpoint, { method: "POST", headers: { Origin: f.config.origin } })).status).toBe(401);
+        const a = await login(f, 1);
+        for (const requestHeaders of [
+            { ...headers(f, a), "X-CSRF-Token": "wrong" },
+            { ...headers(f, a), Origin: "https://evil.example" },
+        ]) expect((await f.app.request(endpoint, { method: "POST", headers: requestHeaders })).status).toBe(403);
+        expect((await f.app.request(endpoint, { method: "POST", headers: headers(f, a), body: "{}" })).status).toBe(400);
+        expect((await f.app.request(`${f.config.origin}/api/ai/v1/uploads/images_sc`, { method: "POST", headers: headers(f, a), body: "{}" })).status).toBe(403);
+        for (const grant of f.grants.values()) grant.active = false;
+        expect((await f.app.request(endpoint, { method: "POST", headers: headers(f, a) })).status).toBe(401);
+        expect(f.calls.some((call) => call.path === "/v1/uploads/images_sc")).toBe(false);
+    });
+
+    test("forwards a real reference image once with server credentials and preserves only its owner-bound input URL", async () => {
+        const f = setup();
+        const a = await login(f, 1);
+        const grantId = [...f.grants.keys()][0];
+        const signedUrl = `${f.config.gatewayPublicUrl}/api/integrations/canvas/inputs/sci_reference-1/content?${new URLSearchParams({ grant: grantId, expires: String(f.clock() + 600), signature: "a".repeat(64) })}`;
+        f.intercept((path) => path === "/v1/uploads/images_sc" ? Response.json({ url: signedUrl, created_at: f.clock(), private_metadata: "must not escape" }) : undefined);
+        const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a0z8AAAAASUVORK5CYII=", "base64"));
+        const form = new FormData();
+        form.set("file", new File([png], "reference.png", { type: "image/png" }));
+        const requestHeaders = headers(f, a);
+        delete requestHeaders["Content-Type"];
+        const request = new Request(`${f.config.origin}/api/video-reference-images`, {
+            method: "POST", body: form, headers: { ...requestHeaders, Accept: "application/json", "Idempotency-Key": "reference-upload-1", "X-Request-Id": "browser-controlled", Authorization: "Bearer browser-injected", "X-Infinite-Canvas-Client": "forged", "New-Api-User": "2", "X-Channel-Id": "99" },
+        });
+        const original = await request.clone().arrayBuffer();
+        const previousCalls = f.calls.length;
+        const response = await f.app.fetch(request);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ url: signedUrl, created_at: f.clock() });
+        expect(f.calls.slice(previousCalls).map((call) => call.path)).toEqual(["/api/integrations/canvas/introspect", "/v1/uploads/images_sc"]);
+        const uploaded = f.calls.find((call) => call.path === "/v1/uploads/images_sc")!;
+        const forwarded = new Headers(uploaded.init?.headers);
+        expect(uploaded.url).toBe("http://new-api.internal/v1/uploads/images_sc");
+        expect(uploaded.init?.method).toBe("POST");
+        expect(Buffer.from(uploaded.init!.body as ArrayBuffer)).toEqual(Buffer.from(original));
+        expect(forwarded.get("Content-Type")).toBe(request.headers.get("Content-Type"));
+        expect(forwarded.get("Accept")).toBe("application/json");
+        expect(forwarded.get("Idempotency-Key")).toBe("reference-upload-1");
+        expect(forwarded.get("X-Request-Id")).toBe(response.headers.get("X-Request-Id"));
+        expect(forwarded.get("X-Request-Id")).not.toBe("browser-controlled");
+        expect(forwarded.get("Authorization")).toBe(`Bearer ic_server-key-${grantId}`);
+        expect(forwarded.get("X-Infinite-Canvas-Client")).toBe(`Basic ${Buffer.from("infinite-canvas:test-client-secret").toString("base64")}`);
+        for (const name of ["Cookie", "X-CSRF-Token", "New-Api-User", "X-Channel-Id"]) expect(forwarded.has(name)).toBe(false);
+        const submitted = await new Request("https://fixture.example", { method: "POST", body: uploaded.init!.body, headers: forwarded }).formData();
+        const file = submitted.get("file") as File;
+        expect([...submitted.keys()]).toEqual(["file"]);
+        expect(file.name).toBe("reference.png");
+        expect(file.type).toBe("image/png");
+        expect(new Uint8Array(await file.arrayBuffer())).toEqual(png);
+        expect(f.resourceCalls).toEqual([]);
+        expect(existsSync(join(f.directory, "files"))).toBe(false);
+        expect(f.storage.db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()).toEqual([
+            { name: "login_transactions" }, { name: "pending_revocations" }, { name: "sessions" }, { name: "users" },
+        ]);
+    });
+
+    test.each(["origin", "http", "path", "owner", "expired", "duplicate", "extra", "hash", "signature"])("rejects an invalid reference upload URL with %s tampering", async (tamper) => {
+        const f = setup();
+        const a = await login(f, 1);
+        const url = new URL(`${f.config.gatewayPublicUrl}/api/integrations/canvas/inputs/sci_reference/content`);
+        url.search = new URLSearchParams({ grant: [...f.grants.keys()][0], expires: String(f.clock() + 600), signature: "b".repeat(64) }).toString();
+        if (tamper === "origin") url.hostname = "evil.example";
+        if (tamper === "http") url.protocol = "http:";
+        if (tamper === "path") url.pathname = "/api/media-inputs/private-object/content";
+        if (tamper === "owner") url.searchParams.set("grant", "another-owner-grant");
+        if (tamper === "expired") url.searchParams.set("expires", String(f.clock()));
+        if (tamper === "duplicate") url.searchParams.append("grant", [...f.grants.keys()][0]);
+        if (tamper === "extra") url.searchParams.set("redirect", "https://evil.example");
+        if (tamper === "hash") url.hash = "private-fragment";
+        if (tamper === "signature") url.searchParams.set("signature", "invalid");
+        f.intercept((path) => path === "/v1/uploads/images_sc" ? Response.json({ url: url.href }) : undefined);
+        const form = new FormData();
+        form.set("file", new File(["reference"], "reference.png", { type: "image/png" }));
+        const requestHeaders = headers(f, a);
+        delete requestHeaders["Content-Type"];
+        const response = await f.app.request(`${f.config.origin}/api/video-reference-images`, { method: "POST", body: form, headers: requestHeaders });
+        expect(response.status).toBe(502);
+        const result = await response.json();
+        expect(result.error.code).toBe("REFERENCE_UPLOAD_INVALID");
+        expect(JSON.stringify(result)).not.toContain(url.href);
+        expect(f.calls.filter((call) => call.path === "/v1/uploads/images_sc")).toHaveLength(1);
+        expect(f.resourceCalls).toEqual([]);
+    });
+
+    test.each([400, 403, 413, 429, 503])("preserves gateway reference upload HTTP %s errors without retrying or creating a video", async (status) => {
+        const f = setup();
+        const a = await login(f, 1);
+        const error = { error: { code: "upload_rejected", message: "The existing upload policy rejected this image" } };
+        f.intercept((path) => path === "/v1/uploads/images_sc" ? Response.json(error, { status, headers: { "Retry-After": "7" } }) : undefined);
+        const form = new FormData();
+        form.set("file", new File(["reference"], "reference.png", { type: "image/png" }));
+        const requestHeaders = headers(f, a);
+        delete requestHeaders["Content-Type"];
+        const response = await f.app.request(`${f.config.origin}/api/video-reference-images`, { method: "POST", body: form, headers: requestHeaders });
+        expect(response.status).toBe(status);
+        expect(await response.json()).toEqual(error);
+        expect(response.headers.get("Retry-After")).toBe("7");
+        expect(f.calls.filter((call) => call.path === "/v1/uploads/images_sc")).toHaveLength(1);
+        expect(f.calls.some((call) => call.path === "/v1/videos" || call.path === "/v1/models")).toBe(false);
+    });
+
     test.each(["generations", "edits", "generations_async", "edits_async"])("rejects disabled image execution for %s before forwarding its paid request", async (operation) => {
         const f = setup();
         const a = await login(f, 1);

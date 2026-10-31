@@ -260,6 +260,37 @@ export function createApp(config: ServerConfig, options: { storage?: CanvasStora
         return c.body(null, 204);
     });
 
+    app.post("/api/video-reference-images", async (c) => {
+        if (new URL(c.req.url).search) return c.notFound();
+        const contentType = c.req.header("Content-Type") || "";
+        if (!contentType.startsWith("multipart/form-data;")) throw new GatewayError("REFERENCE_UPLOAD_INVALID", 400, "视频参考图片需要使用文件表单上传");
+        const headers = new Headers({ "Content-Type": contentType, "X-Request-Id": c.get("requestId") });
+        for (const name of ["Accept", "Idempotency-Key"]) {
+            const value = c.req.header(name);
+            if (value) headers.set(name, value);
+        }
+        // New API validates the actual image and owns temporary input storage.
+        const body = await c.req.raw.arrayBuffer();
+        const response = await measure(c, "upstream_headers", () => gateway.relay("/v1/uploads/images_sc", c.get("apiKey"), { method: "POST", headers, body, signal: c.req.raw.signal }));
+        const result = await response.json().catch(() => null);
+        const outbound = new Headers({ "Content-Type": "application/json" });
+        const retryAfter = response.headers.get("Retry-After");
+        if (retryAfter) outbound.set("Retry-After", retryAfter);
+        if (!response.ok) return new Response(JSON.stringify(result || { error: { code: "REFERENCE_UPLOAD_FAILED", message: "视频参考图片上传失败" } }), { status: response.status, headers: outbound });
+        const link = typeof result?.url === "string" ? result.url : "";
+        let source: URL;
+        try { source = new URL(link); }
+        catch { throw new GatewayError("REFERENCE_UPLOAD_INVALID", 502, "网关返回了无效的参考图片地址"); }
+        const query = source.searchParams;
+        const expires = Number(query.get("expires"));
+        if (link !== link.trim() || source.protocol !== "https:" || source.origin !== new URL(config.gatewayPublicUrl).origin || source.username || source.password || source.hash
+            || !/^\/api\/integrations\/canvas\/inputs\/sci_[A-Za-z0-9_-]+\/content$/.test(source.pathname)
+            || [...query].length !== 3 || ["grant", "expires", "signature"].some((name) => query.getAll(name).length !== 1)
+            || query.get("grant") !== c.get("session").grant_id || !/^[1-9][0-9]*$/.test(query.get("expires") || "") || !Number.isSafeInteger(expires) || expires <= now()
+            || !/^[a-f0-9]{64}$/i.test(query.get("signature") || "")) throw new GatewayError("REFERENCE_UPLOAD_INVALID", 502, "网关返回了无效的参考图片地址");
+        return new Response(JSON.stringify({ url: link, ...(typeof result.created_at === "number" ? { created_at: result.created_at } : {}) }), { status: response.status, headers: outbound });
+    });
+
     // Only trusted gateway results and registry catalogs can issue these URLs.
     // The capability contains its source, so neither user content nor a lookup
     // table needs to survive on the Canvas server between requests.
