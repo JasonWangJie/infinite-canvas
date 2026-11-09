@@ -205,7 +205,7 @@ test("removing a model still permits original video queries but prevents new sub
     expect(requests).toEqual(["GET /api/ai/v1/videos/original-task"]);
 });
 
-const dedicatedImageModels = ["gpt-image-2", "dall-e-3", "seedream-5-pro", "qwen-image", "flux.1-pro", "gemini-nano-banana-2.1", "gemini-3-pro-image-preview", "gemini-2.5-flash-image-preview"];
+const dedicatedImageModels = ["gpt-image-2", "dall-e-3", "seedream-5-pro", "doubao-seedream-5-0-lite", "doubao-seedream-5-0-pro", "qwen-image", "flux.1-pro", "gemini-nano-banana-2.1", "gemini-3-pro-image-preview", "gemini-2.5-flash-image-preview"];
 const videoModels = ["veo-3.1-fast-generate-preview", "seedance2.0-E", "seedance2.5-A", "minimax-h3-2k", "minimax-h3-720p", "video-model", "opaque-generator"];
 
 test.each(dedicatedImageModels)("dedicated image model %s cannot use text endpoints, including stale selections", async (name) => {
@@ -233,6 +233,7 @@ test.each([...dedicatedImageModels, ...videoModels])("model refresh removes the 
         { id: "gemini-2.5-pro", supported_endpoint_types: ["gemini"] },
         { id: "gemini-2.5-flash", supported_endpoint_types: ["gemini"] },
         { id: "gpt-5.5", supported_endpoint_types: ["openai-response", "openai"] },
+        { id: "doubao-seed-1-6", supported_endpoint_types: ["openai"] },
         { id: "MiniMax-M2", supported_endpoint_types: ["openai"] },
         { id: "gemini-image", supported_endpoint_types: ["gemini", "image-generation"] },
     ];

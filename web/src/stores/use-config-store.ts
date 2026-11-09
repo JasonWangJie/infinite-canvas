@@ -180,7 +180,7 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
 }
 
 function isDedicatedMediaModel(name: string) {
-    return guessCapability(name) === "video" || /^(?:.*\/)?(?:gpt-image|image|dall-e|dalle|seedream|imagen|flux|sdxl|stable-diffusion|midjourney|qwen-image|nano-banana|gemini-(?:nano-banana|[\d.]+-(?:pro|flash)-image))(?:[-.]|$)/i.test(name);
+    return guessCapability(name) === "video" || /^(?:.*\/)?(?:gpt-image|image|dall-e|dalle|(?:doubao-)?seedream|imagen|flux|sdxl|stable-diffusion|midjourney|qwen-image|nano-banana|gemini-(?:nano-banana|[\d.]+-(?:pro|flash)-image))(?:[-.]|$)/i.test(name);
 }
 
 function modelSupportsCapability(model: ChannelModel, capability: ModelCapability) {
