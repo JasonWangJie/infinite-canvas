@@ -8,6 +8,7 @@ description: Implemented changes that still need manual verification
 ## New API 受管画布变更
 
 - 豆包 Seedream 模型分类：刷新可用模型后，`doubao-seedream-5-0-lite` 和 `doubao-seedream-5-0-pro` 应从文本下拉移除，并在网关声明生图能力时继续出现在生图下拉中。旧文本选择仍指向这些模型时，请求校验应阻止调用文本接口。具备文本能力的其他豆包模型可继续选择。
+- Seedream 分类修复已发布前端镜像 `infinite-canvas:20261109-seedream-filter-9978163`。模型路由回归 69 项、279 断言通过。隔离 Chrome 加载线上页面并使用模拟授权与模型目录，确认文本下拉仅显示测试目录中的豆包文本模型，生图下拉仍显示 Seedream Lite 和 Pro。公网首页与镜像一致，45 个静态资源可访问，未登录的会话与模型接口返回 `401 AUTH_REQUIRED`。前端、Canvas BFF 与 New API 均为 healthy。前端回退脚本见 `/opt/infinite-canvas-backups/20261109-seedream-filter-9978163/rollback.sh`。
 
 - 应用名称：确认顶部导航、首页主标题、画布列表页标题及浏览器标签页均显示「Aiimg图网For无限画布」，切换语言后名称一致，窄屏导航按钮仍可操作。
 

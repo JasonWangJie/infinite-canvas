@@ -13,7 +13,7 @@
 | Canvas BFF | 服务 `canvas-server`，容器 `infinite-canvas-canvas-server-1`，容器内端口 `3001/tcp` |
 | 发布与备份目录 | `/opt/infinite-canvas-releases/` 和 `/opt/infinite-canvas-backups/`，按发布批次归档 |
 
-已核对的前端镜像为 `infinite-canvas:20261109-aiimg-brand-8f5976f7`，对应发布源码位于 `/opt/infinite-canvas-releases/20261109-aiimg-brand-8f5976f7/source/`，本次发布的回退脚本在 `/opt/infinite-canvas-backups/20261109-aiimg-brand-8f5976f7/rollback.sh`。发布版本会更新，排查前在服务器上运行以下命令确认实际运行的容器和镜像。
+已核对的前端镜像为 `infinite-canvas:20261109-seedream-filter-9978163`，对应发布源码位于 `/opt/infinite-canvas-releases/20261109-seedream-filter-9978163/source/`，本次发布的回退脚本在 `/opt/infinite-canvas-backups/20261109-seedream-filter-9978163/rollback.sh`。发布版本会更新，排查前在服务器上运行以下命令确认实际运行的容器和镜像。
 
 ```sh
 docker compose -f /etc/infinite-canvas/compose.yml ps
