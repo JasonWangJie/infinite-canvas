@@ -1,5 +1,27 @@
 # Infinite Canvas Documentation Index
 
+## 二开服务器部署
+
+本节适用于本仓库二开的 **无限画布（Infinite Canvas）New API 受管版**。正式访问地址为 `https://canvas.aiimg.lol`，服务器 `40.160.139.185` 上的 `4000` 端口由 Docker Compose 发布。
+
+| 项目 | 实际配置 |
+| --- | --- |
+| Compose 项目 | `infinite-canvas` |
+| 服务器部署配置 | `/etc/infinite-canvas/compose.yml`，同目录下有 `nginx.conf.template` 和 `canvas.env` |
+| 前端 | 服务 `app`，容器 `infinite-canvas-app-1`，宿主机 `4000` 映射到容器 `3000/tcp` |
+| 前端静态文件 | 前端镜像内的 `/usr/share/nginx/html/` |
+| Canvas BFF | 服务 `canvas-server`，容器 `infinite-canvas-canvas-server-1`，容器内端口 `3001/tcp` |
+| 发布与备份目录 | `/opt/infinite-canvas-releases/` 和 `/opt/infinite-canvas-backups/`，按发布批次归档 |
+
+已核对的前端镜像为 `infinite-canvas:20261109-aiimg-brand-8f5976f7`，对应发布源码位于 `/opt/infinite-canvas-releases/20261109-aiimg-brand-8f5976f7/source/`，本次发布的回退脚本在 `/opt/infinite-canvas-backups/20261109-aiimg-brand-8f5976f7/rollback.sh`。发布版本会更新，排查前在服务器上运行以下命令确认实际运行的容器和镜像。
+
+```sh
+docker compose -f /etc/infinite-canvas/compose.yml ps
+docker inspect --format '{{.Config.Image}}' infinite-canvas-app-1 infinite-canvas-canvas-server-1
+```
+
+构建前端镜像前，确保发布包中的 `web/docker-entrypoint.sh` 使用 LF 换行。切换镜像前，用实际部署模板在临时容器中执行 `nginx -t` 检查启动脚本和配置。
+
 ## Overview
 
 - [Quick Start](/docs/overview/quick-start)

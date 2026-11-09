@@ -178,7 +178,7 @@ export default {
         logoutSaving: "Saving before signing out",
         logoutSavingHint: "Saving local changes. Please wait.",
         logoutSaveFailed: "Sign-out stopped because local changes are not saved. Recover or export your draft first.",
-        gatewayModels: "New API · {{count}} available models",
+        gatewayModels: "AIimg图网 · {{count}} available models",
         asyncImageUnsupported: "This model currently does not support background image tasks.",
         imageBatchIncompleteNotice: "The remaining requests are unconfirmed. Refreshing or closing this page may prevent their results from arriving. Do not resubmit them.",
         imageBatchPartialNotice: "Successful images were kept; {{failed}} requests failed and {{unknown}} have unknown outcomes. Do not resubmit unknown requests.",
@@ -204,7 +204,7 @@ export default {
         taskStorageFailed: "Storage recovery needed",
         taskFailed: "Finished without a result",
         taskPending: "Pending / processing",
-        connected: "Connected to New API",
+        connected: "Connected to AIimg图网",
         account: "Account: {{name}}. Requests use this account’s quota. Authorization and gateway settings are managed by the server.",
         refreshModels: "Refresh available models",
         modelsUpdated: "Model list updated",
@@ -228,7 +228,7 @@ export default {
     },
 
     meta: {
-        title: "Infinite Canvas",
+        title: "Aiimg图网For无限画布",
         description: "An infinite canvas creation tool",
     },
     theme: { toggle: "Toggle theme" },

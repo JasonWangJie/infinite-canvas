@@ -442,7 +442,7 @@ export async function refreshGatewayModels() {
             return { name: item.id, capability, capabilities, endpointTypes: endpoints, imageExecution: execution ? { sync: execution.sync, async: execution.async, syncEndpoint: execution.sync_endpoint } : undefined };
         });
     useConfigStore.setState((state) => {
-        const channel: ModelChannel = { id: "gateway", name: "New API", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai", models };
+        const channel: ModelChannel = { id: "gateway", name: "AIimg图网", baseUrl: "/api/ai", apiKey: "", apiFormat: "openai", models };
         const channels = [channel];
         const next = { ...state.config, channelMode: "remote" as const, baseUrl: "/api/ai", apiKey: "", apiFormat: "openai" as const, proxyEnabled: false, proxyUrl: "", channels, models: modelOptionsFromChannels(channels) };
         for (const [key, capability] of [

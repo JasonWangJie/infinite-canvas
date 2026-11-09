@@ -47,7 +47,7 @@ export default function CanvasPage() {
                 <header className="flex flex-wrap items-end justify-between gap-4 border-b border-stone-200 pb-6 dark:border-stone-800">
                     <div>
                         <p className="text-xs text-stone-500">{t("canvas.library")}</p>
-                        <h1 className="mt-3 text-3xl font-semibold">{t("canvas.title")}</h1>
+                        <h1 className="mt-3 text-3xl font-semibold">{t("meta.title")}</h1>
                         <p className="mt-2 max-w-xl text-sm text-muted-foreground">{t("browserStorage.localDataHint")}</p>
                     </div>
                     <div className="flex items-center gap-2">

@@ -63,7 +63,7 @@ export function AppConfigPanel(_props: { showDoneButton?: boolean; initialTab?: 
                                             <p>{t("managed.modelsLoading", { defaultValue: "正在读取可用模型…" })}</p>
                                         ) : !models.error ? (
                                             <>
-                                                <p>{t("managed.gatewayModels", { defaultValue: "New API · 当前可用模型 {{count}} 个", count: config.models.length })}</p>
+                                                <p>{t("managed.gatewayModels", { count: config.models.length })}</p>
                                                 <div className="flex flex-wrap gap-1">
                                                     {(["image", "text", "video", "audio"] as const).map((capability) => (
                                                         <Tag key={capability}>

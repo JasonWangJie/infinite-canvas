@@ -178,7 +178,7 @@ export default {
         logoutSaving: "正在保存并退出",
         logoutSavingHint: "正在保存本地修改，请稍候。",
         logoutSaveFailed: "本地修改尚未保存，已停止退出。请先恢复或导出草稿。",
-        gatewayModels: "New API · 当前可用模型 {{count}} 个",
+        gatewayModels: "AIimg图网 · 当前可用模型 {{count}} 个",
         asyncImageUnsupported: "所选模型当前不支持后台异步生图。",
         imageBatchIncompleteNotice: "剩余请求尚未确认；刷新或关闭页面后，可能无法继续接收结果，请勿重复提交",
         imageBatchPartialNotice: "已保留成功图片；{{failed}} 次失败，{{unknown}} 次结果未知，请勿重复提交未知请求",
@@ -204,7 +204,7 @@ export default {
         taskStorageFailed: "待恢复保存",
         taskFailed: "已结束：未成功",
         taskPending: "待确认 / 处理中",
-        connected: "已连接 New API",
+        connected: "已连接 AIimg图网",
         account: "当前账户：{{name}}。模型调用使用该账户额度；授权与网关配置由服务端管理。",
         refreshModels: "刷新可用模型",
         modelsUpdated: "模型列表已更新",
@@ -228,7 +228,7 @@ export default {
     },
 
     meta: {
-        title: "无限画布",
+        title: "Aiimg图网For无限画布",
         description: "一个无限画布创作工具",
     },
     theme: { toggle: "切换主题" },
